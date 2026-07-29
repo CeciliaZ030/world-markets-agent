@@ -1,6 +1,6 @@
 use std::{env, str::FromStr};
 
-use alloy_primitives::{Address, U256, hex};
+use alloy_primitives::{Address, I256, U256, hex};
 use alloy_sol_types::{SolCall, sol};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,10 @@ sol! {
         external view returns (address book, uint32 buyToken, uint32 payToken);
     function getLendOrderBook(uint32 tokenId) external view returns (address book);
     function getMarkPrice(uint32 tokenId) external view returns (uint64 price);
+    function readLendingAggregation(uint64 userId, uint32 tokenId)
+        external view returns (uint256 position);
+    function readPerpAggPosition(uint64 userId, uint32 tokenId)
+        external view returns (uint256 position, int256 owedBase);
     function bulkReadTokenConfigs_3423260018() external view returns (uint256[] configs);
     function bulkReadMaxUserId_5445644137() external view returns (uint64 maxUserId);
 }
@@ -71,8 +75,38 @@ pub(crate) struct Account {
     pub(crate) risk_adjusted_portfolio_value: String,
     pub(crate) eligible_for_liquidation: bool,
     pub(crate) balances: Vec<Balance>,
+    pub(crate) lending_positions: Vec<LendingPosition>,
+    pub(crate) perpetual_positions: Vec<PerpetualPosition>,
     pub(crate) debt_token_ids: Vec<u32>,
     pub(crate) non_debt_token_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct LendingPosition {
+    pub(crate) token_id: u32,
+    pub(crate) symbol: String,
+    pub(crate) lender_quantity_raw: u64,
+    pub(crate) lender_quantity: String,
+    pub(crate) borrower_quantity_raw: u64,
+    pub(crate) borrower_quantity: String,
+    pub(crate) highest_interest_rate_raw: u16,
+    pub(crate) highest_interest_rate: String,
+    pub(crate) highest_interest_rate_percent: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PerpetualPosition {
+    pub(crate) token_id: u32,
+    pub(crate) symbol: String,
+    pub(crate) quantity_raw: i64,
+    pub(crate) quantity: String,
+    pub(crate) side: String,
+    pub(crate) entry_price_raw: u64,
+    pub(crate) entry_price: String,
+    pub(crate) funding_start_time: u64,
+    pub(crate) owed_nom_raw: String,
+    pub(crate) owed_nom: String,
+    pub(crate) owed_base_raw: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -178,34 +212,60 @@ impl WorldClient {
         let debt_token_ids = token_ids_from_bits(bits.debt);
         let non_debt_token_ids = token_ids_from_bits(bits.noDebt);
         let mut balances = Vec::new();
+        let mut lending_positions = Vec::new();
+        let mut perpetual_positions = Vec::new();
 
         for asset in assets {
             let raw = self.call(&getBalanceCall {
                 user: account_id,
                 tokenId: asset.token_id,
             })?;
-            if raw.balance == 0 && raw.spotLendSequestered == 0 && raw.perpSequestered == 0 {
-                continue;
+            if raw.balance != 0 || raw.spotLendSequestered != 0 || raw.perpSequestered != 0 {
+                let reserved_position_raw = u128::from(raw.spotLendSequestered)
+                    .saturating_add(u128::from(raw.perpSequestered));
+                let decimal_delta =
+                    u32::from(asset.vault_decimals.saturating_sub(asset.position_decimals));
+                let reserved_vault_raw =
+                    reserved_position_raw.saturating_mul(10u128.saturating_pow(decimal_delta));
+                let available = raw.balance.saturating_sub(reserved_vault_raw);
+                balances.push(Balance {
+                    token_id: asset.token_id,
+                    symbol: asset.symbol.clone(),
+                    balance_raw: raw.balance.to_string(),
+                    balance: decimal(raw.balance, asset.vault_decimals),
+                    available_raw: available.to_string(),
+                    available: decimal(available, asset.vault_decimals),
+                    spot_lend_sequestered_raw: raw.spotLendSequestered.to_string(),
+                    spot_lend_sequestered: decimal(
+                        raw.spotLendSequestered,
+                        asset.position_decimals,
+                    ),
+                    perp_sequestered_raw: raw.perpSequestered.to_string(),
+                    perp_sequestered: decimal(raw.perpSequestered, asset.position_decimals),
+                });
             }
-            let reserved_position_raw =
-                u128::from(raw.spotLendSequestered).saturating_add(u128::from(raw.perpSequestered));
-            let decimal_delta =
-                u32::from(asset.vault_decimals.saturating_sub(asset.position_decimals));
-            let reserved_vault_raw =
-                reserved_position_raw.saturating_mul(10u128.saturating_pow(decimal_delta));
-            let available = raw.balance.saturating_sub(reserved_vault_raw);
-            balances.push(Balance {
-                token_id: asset.token_id,
-                symbol: asset.symbol.clone(),
-                balance_raw: raw.balance.to_string(),
-                balance: decimal(raw.balance, asset.vault_decimals),
-                available_raw: available.to_string(),
-                available: decimal(available, asset.vault_decimals),
-                spot_lend_sequestered_raw: raw.spotLendSequestered.to_string(),
-                spot_lend_sequestered: decimal(raw.spotLendSequestered, asset.position_decimals),
-                perp_sequestered_raw: raw.perpSequestered.to_string(),
-                perp_sequestered: decimal(raw.perpSequestered, asset.position_decimals),
-            });
+
+            let lending = self.call(&readLendingAggregationCall {
+                userId: account_id,
+                tokenId: asset.token_id,
+            })?;
+            if field(lending.position, 0, 64) != 0 || field(lending.position, 64, 64) != 0 {
+                lending_positions.push(LendingPosition::decode(asset, lending.position));
+            }
+
+            let perpetual = self.call(&readPerpAggPositionCall {
+                userId: account_id,
+                tokenId: asset.token_id,
+            })?;
+            let perp_quantity = signed_field(perpetual.position, 64, 64)?;
+            let perp_owed_nom = signed_field(perpetual.position, 128, 96)?;
+            if perp_quantity != 0 || perp_owed_nom != 0 || perpetual.owedBase != I256::ZERO {
+                perpetual_positions.push(PerpetualPosition::decode(
+                    asset,
+                    perpetual.position,
+                    perpetual.owedBase,
+                )?);
+            }
         }
 
         let base_decimals = assets
@@ -221,6 +281,8 @@ impl WorldClient {
             risk_adjusted_portfolio_value: signed_decimal(risk_raw, base_decimals),
             eligible_for_liquidation: risk_raw < 0,
             balances,
+            lending_positions,
+            perpetual_positions,
             debt_token_ids,
             non_debt_token_ids,
         })
@@ -406,6 +468,48 @@ impl Asset {
     }
 }
 
+impl LendingPosition {
+    fn decode(asset: &Asset, packed: U256) -> Self {
+        let borrower_quantity_raw = field(packed, 0, 64);
+        let lender_quantity_raw = field(packed, 64, 64);
+        let highest_interest_rate_raw = field(packed, 128, 16) as u16;
+        Self {
+            token_id: asset.token_id,
+            symbol: asset.symbol.clone(),
+            lender_quantity_raw,
+            lender_quantity: decimal(lender_quantity_raw, asset.position_decimals),
+            borrower_quantity_raw,
+            borrower_quantity: decimal(borrower_quantity_raw, asset.position_decimals),
+            highest_interest_rate_raw,
+            highest_interest_rate: decimal(highest_interest_rate_raw, 4),
+            highest_interest_rate_percent: decimal(u64::from(highest_interest_rate_raw), 2),
+        }
+    }
+}
+
+impl PerpetualPosition {
+    fn decode(asset: &Asset, packed: U256, owed_base: I256) -> Result<Self, String> {
+        let entry_price_raw = field(packed, 0, 64);
+        let quantity_raw = signed_field(packed, 64, 64)?;
+        let owed_nom_raw = signed_field(packed, 128, 96)?;
+        let funding_period = field(packed, 224, 32);
+        Ok(Self {
+            token_id: asset.token_id,
+            symbol: asset.symbol.clone(),
+            quantity_raw: i64::try_from(quantity_raw)
+                .map_err(|e| format!("[world-markets] perp quantity does not fit into i64: {e}"))?,
+            quantity: signed_decimal_i128(quantity_raw, asset.position_decimals),
+            side: if quantity_raw < 0 { "short" } else { "long" }.to_string(),
+            entry_price_raw,
+            entry_price: decode_price(entry_price_raw),
+            funding_start_time: 1_704_067_200 + funding_period.saturating_mul(28_800),
+            owed_nom_raw: owed_nom_raw.to_string(),
+            owed_nom: signed_decimal_i128(owed_nom_raw, asset.position_decimals.saturating_add(7)),
+            owed_base_raw: owed_base.to_string(),
+        })
+    }
+}
+
 pub(crate) fn asset_by_symbol(assets: &[Asset], symbol: &str) -> Result<Asset, String> {
     assets
         .iter()
@@ -417,6 +521,22 @@ pub(crate) fn asset_by_symbol(assets: &[Asset], symbol: &str) -> Result<Asset, S
 fn field(value: U256, offset: usize, bits: usize) -> u64 {
     let mask = (U256::from(1u8) << bits) - U256::from(1u8);
     ((value >> offset) & mask).to::<u64>()
+}
+
+fn signed_field(value: U256, offset: usize, bits: usize) -> Result<i128, String> {
+    if bits == 0 || bits > 127 {
+        return Err(format!(
+            "[world-markets] unsupported signed field width {bits}"
+        ));
+    }
+    let mask = (U256::from(1u8) << bits) - U256::from(1u8);
+    let raw = ((value >> offset) & mask).to::<u128>();
+    let sign_bit = 1u128 << (bits - 1);
+    if raw & sign_bit == 0 {
+        Ok(raw as i128)
+    } else {
+        Ok((raw as i128) - (1i128 << bits))
+    }
 }
 
 fn packed_string(value: U256) -> Result<String, String> {
@@ -446,7 +566,11 @@ fn decimal<T: ToString>(value: T, decimals: u8) -> String {
 }
 
 fn signed_decimal(value: i64, decimals: u8) -> String {
-    if value < 0 {
+    signed_decimal_i128(i128::from(value), decimals)
+}
+
+fn signed_decimal_i128(value: i128, decimals: u8) -> String {
+    if value.is_negative() {
         format!(
             "-{}",
             decimal_digits(value.unsigned_abs().to_string(), decimals)
@@ -482,7 +606,7 @@ fn decode_price(raw: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorldClient, decimal_digits, decode_price, packed_string};
+    use super::{WorldClient, decimal_digits, decode_price, packed_string, signed_field};
     use alloy_primitives::U256;
 
     #[test]
@@ -504,6 +628,15 @@ mod tests {
         bytes[31] = 4;
         let value = U256::from_be_bytes(bytes);
         assert_eq!(packed_string(value).unwrap(), "USDC");
+    }
+
+    #[test]
+    fn decodes_signed_packed_fields() {
+        let positive = U256::from(42u8) << 64;
+        assert_eq!(signed_field(positive, 64, 64).unwrap(), 42);
+
+        let negative_two = (U256::from(u64::MAX - 1) << 64) | U256::from(1u8);
+        assert_eq!(signed_field(negative_two, 64, 64).unwrap(), -2);
     }
 
     #[test]

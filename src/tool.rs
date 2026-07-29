@@ -87,7 +87,7 @@ impl DynAomiTool for GetWorldAccount {
     type App = WorldMarketsApp;
     type Args = GetWorldAccountArgs;
     const NAME: &'static str = "get_world_account";
-    const DESCRIPTION: &'static str = "Inspect a live World account: owner, balances, available amounts, reserved amounts, and risk-adjusted portfolio value.";
+    const DESCRIPTION: &'static str = "Inspect a live World account: owner, balances, available and reserved amounts, lending and borrowing aggregates, perpetual positions, and risk-adjusted portfolio value.";
 
     fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
         let account_id = args

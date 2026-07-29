@@ -9,8 +9,8 @@ on MegaETH.
 
 ## What you can do
 - Discover the live assets configured on World Markets.
-- Inspect a World account's owner, balances, buying-power inputs, and
-  risk-adjusted portfolio value.
+- Inspect a World account's owner, balances, active loans, lending positions,
+  perpetual exposure, buying-power inputs, and risk-adjusted portfolio value.
 - Resolve live spot, perpetual, and lending markets from the World exchange.
 - Prepare a deterministic, read-only trade preview from live account and market
   data.
