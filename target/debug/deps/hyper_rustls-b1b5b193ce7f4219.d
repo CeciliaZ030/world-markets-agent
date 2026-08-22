@@ -1,0 +1,11 @@
+/Users/lucas/Desktop/World/world-markets-agent/target/debug/deps/hyper_rustls-b1b5b193ce7f4219.d: /Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/lib.rs /Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/config.rs /Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/connector.rs /Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/connector/builder.rs /Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/stream.rs
+
+/Users/lucas/Desktop/World/world-markets-agent/target/debug/deps/libhyper_rustls-b1b5b193ce7f4219.rlib: /Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/lib.rs /Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/config.rs /Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/connector.rs /Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/connector/builder.rs /Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/stream.rs
+
+/Users/lucas/Desktop/World/world-markets-agent/target/debug/deps/libhyper_rustls-b1b5b193ce7f4219.rmeta: /Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/lib.rs /Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/config.rs /Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/connector.rs /Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/connector/builder.rs /Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/stream.rs
+
+/Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/lib.rs:
+/Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/config.rs:
+/Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/connector.rs:
+/Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/connector/builder.rs:
+/Users/lucas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hyper-rustls-0.27.9/src/stream.rs:
