@@ -32,3 +32,43 @@ cargo test
 cargo test reads_live_world -- --ignored --nocapture
 cargo build --release
 ```
+
+## Deploy a fork
+
+Install the CLI version required by the hosted runtime and log in to Aomi
+Build:
+
+```sh
+cargo install aomi-sdk --version 4.0.0 --features cli --locked
+aomi-build login
+```
+
+For a newly connected fork, create its platform-bound Project once from a
+checkout whose `origin` points to that fork. This refreshes the committed
+`.aomi/config.json` from the repository's tracked `aomi.toml` files:
+
+```sh
+aomi-build project create \
+  --repo <owner>/world-markets-agent \
+  --platform world-market-apps
+git add .aomi/config.json
+git commit -m "Add Aomi project configuration"
+git push
+```
+
+After every code update, validate and push the exact commit that should run.
+Then deploy, activate, and verify it:
+
+```sh
+cargo test
+cargo build --release
+git push
+
+aomi-build deploy preflight --repo <owner>/world-markets-agent
+aomi-build deploy run --repo <owner>/world-markets-agent
+aomi-build deploy activate
+aomi-build deploy status
+```
+
+Deployment uses the pushed Git commit, not uncommitted working-tree changes.
+`.aomi/deployment.json` is local lifecycle state and must not be committed.
