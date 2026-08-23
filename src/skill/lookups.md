@@ -71,4 +71,4 @@ Netting lines (`lookups.positions.netting`) appear only when the reporting layer
 
 ## Secondary
 
-funding → `get_world_market`: `[asset]` funding `[#]` per 8h. · orders → `get_world_open_orders`: `[#]` resting order(s) · `[#]` buys, `[#]` sells. · mark → `get_world_market`: `[asset]` mark `[#]`. · fills → when a fills tool exists: `[#]` fill(s) · [latest fill summary]. Missing data → one line, no padding.
+funding → `get_world_rates`: `[asset]` funding `[#]` per 8h. · orders → `get_world_open_orders`: `[#]` resting order(s) · `[#]` buys, `[#]` sells. · mark → `get_world_market`: `[asset]` mark `[#]`. · fills → when a fills tool exists: `[#]` fill(s) · [latest fill summary]. Missing data → one line, no padding.

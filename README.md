@@ -13,6 +13,8 @@ Live contract reads (mandate-aware, non-executable):
 - `list_world_assets`
 - `get_world_account`
 - `get_world_market`
+- `get_world_rates`
+- `get_world_loans`
 - `preview_world_trade`
 - `check_world_mandate`
 - `get_world_agent_permission`

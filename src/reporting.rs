@@ -227,11 +227,18 @@ pub(crate) struct UnwindPlan {
 /// §6.9 / R2 — the negative-carry regime state behind the pre-authorized plan.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct CarryState {
+    pub(crate) position_id: String,
+    pub(crate) entry_timestamp: String,
+    pub(crate) negative_carry_window_days: u32,
     pub(crate) days_negative: u32,
     pub(crate) trigger_days: u32,
     pub(crate) avg_daily_carry: Figure,
+    /// Latches true the first time `days_negative` reaches the window. Never resets.
+    pub(crate) fired: bool,
     /// True on the day the plan fires and the position is closed after the fact.
     pub(crate) plan_executed: bool,
+    /// Host runtime owns daily cadence; this plugin cannot schedule.
+    pub(crate) cadence_owner: &'static str,
 }
 
 /// Recommended first deposit + the honest reason it travels with (owner, round 3).
@@ -284,6 +291,7 @@ pub(crate) trait Reporting {
         preference: GuardianPreference,
         emergency_slippage_reachable: bool,
     ) -> UnwindPlan;
+    #[allow(dead_code)]
     fn carry_state(&self, position_id: &str) -> CarryState;
     /// Recommended first deposit for guest → funded conversion. Never a platform
     /// minimum. The renderer interpolates this; the model never types it.
@@ -522,10 +530,15 @@ impl Reporting for FixtureReporting {
 
     fn carry_state(&self, _position_id: &str) -> CarryState {
         CarryState {
+            position_id: _position_id.to_string(),
+            entry_timestamp: "0".to_string(),
+            negative_carry_window_days: 3,
             days_negative: 1,
             trigger_days: 3,
             avg_daily_carry: Figure::estimate("-0.31", "%"),
+            fired: false,
             plan_executed: false,
+            cadence_owner: "runtime",
         }
     }
 

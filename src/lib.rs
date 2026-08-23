@@ -1,12 +1,15 @@
 use aomi_sdk::*;
 
+mod carry;
 mod client;
 mod guest;
 mod liquidation_risk;
+mod loans;
 mod lookups;
 mod mandate;
 mod pnl;
 mod preamble;
+mod rates;
 mod reporting;
 mod tool;
 
@@ -19,6 +22,8 @@ dyn_aomi_app!(
         tool::ListWorldAssets,
         tool::GetWorldAccount,
         tool::GetWorldMarket,
+        tool::GetWorldRates,
+        tool::GetWorldLoans,
         tool::PreviewWorldTrade,
         tool::CheckWorldMandate,
         tool::GetWorldAgentPermission,

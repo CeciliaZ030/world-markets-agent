@@ -39,6 +39,12 @@ sol! {
         external view returns (uint256[] orders);
     function readFundingRateHistory_4648699482(uint64 startTime, uint64 endTime, uint32 tokenId)
         external view returns (uint64[] rates);
+    function bestBidOffer() external view returns (uint256 packed);
+    function retrieveBuyDepthChart(uint32 maxDepth) external view returns (uint256[] levels);
+    function retrieveSellDepthChart(uint32 maxDepth) external view returns (uint256[] levels);
+    function readLenderPositions(uint64 userId, uint32 tokenId) external view returns (uint256[] positions);
+    function readBorrowerPositions(uint64 userId, uint32 tokenId) external view returns (uint256[] positions);
+    function readLendingPosition(uint64 positionId) external view returns (uint256 position);
 }
 
 #[derive(Clone)]
@@ -251,6 +257,89 @@ impl WorldClient {
                 tokenId: token_id,
             })?
             .rates)
+    }
+
+    pub(crate) fn current_funding_rate_8h(&self, token_id: u32) -> Result<Option<String>, String> {
+        if token_id == BASE_TOKEN_ID {
+            return Ok(None);
+        }
+        let now = self.block_timestamp()?;
+        let from = now.saturating_sub(8 * 3600);
+        let rates = self.funding_rate_history(from, now, token_id)?;
+        Ok(rates.last().copied().map(decode_funding_rate))
+    }
+
+    pub(crate) fn lend_book_rates(&self, token_id: u32) -> Result<LendBookRates, String> {
+        let book = self.call(&getLendOrderBookCall { tokenId: token_id })?.book;
+        if book.is_zero() {
+            return Ok(LendBookRates {
+                lend_apr: None,
+                borrow_apr: None,
+            });
+        }
+        if let Ok(ret) = self.call_at(book, &bestBidOfferCall {}) {
+            let packed = ret.packed;
+            // Lend BBO packing (live UniFi): each 128-bit side is
+            // (64-bit 4-dp rate | 64-bit quantity). Buy/bid = low 128,
+            // sell/ask = high 128.
+            let bid = decode_book_rate(field(packed, 0, 64));
+            let ask = decode_book_rate(field(packed, 128, 64));
+            if bid.is_some() || ask.is_some() {
+                return Ok(LendBookRates {
+                    lend_apr: bid,
+                    borrow_apr: ask,
+                });
+            }
+        }
+        let buys = self
+            .call_at(book, &retrieveBuyDepthChartCall { maxDepth: 8 })
+            .ok()
+            .and_then(|ret| first_depth_rate(&ret.levels));
+        let sells = self
+            .call_at(book, &retrieveSellDepthChartCall { maxDepth: 8 })
+            .ok()
+            .and_then(|ret| first_depth_rate(&ret.levels));
+        Ok(LendBookRates {
+            lend_apr: buys,
+            borrow_apr: sells,
+        })
+    }
+
+    pub(crate) fn lender_position_ids(
+        &self,
+        user_id: u64,
+        token_id: u32,
+    ) -> Result<Vec<u64>, String> {
+        let words = self
+            .call(&readLenderPositionsCall {
+                userId: user_id,
+                tokenId: token_id,
+            })?
+            .positions;
+        Ok(decode_position_ids(&words))
+    }
+
+    pub(crate) fn borrower_position_ids(
+        &self,
+        user_id: u64,
+        token_id: u32,
+    ) -> Result<Vec<u64>, String> {
+        let words = self
+            .call(&readBorrowerPositionsCall {
+                userId: user_id,
+                tokenId: token_id,
+            })?
+            .positions;
+        Ok(decode_position_ids(&words))
+    }
+
+    pub(crate) fn lending_position(&self, position_id: u64) -> Result<PackedLoan, String> {
+        let packed = self
+            .call(&readLendingPositionCall {
+                positionId: position_id,
+            })?
+            .position;
+        Ok(PackedLoan::decode(position_id, packed))
     }
 
     pub(crate) fn block_number(&self) -> Result<u64, String> {
@@ -775,6 +864,99 @@ impl LendingPosition {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LendBookRates {
+    /// Best bid on this asset's lend book (taker-lend).
+    pub(crate) lend_apr: Option<String>,
+    /// Best ask on this asset's lend book (taker-borrow).
+    pub(crate) borrow_apr: Option<String>,
+}
+
+/// Individual lend/borrow position unpacked from `readLendingPosition`.
+/// Layout: bits 0–64 quantity, 64–64 counterparty user id, 128–16 interest
+/// (4 dp fraction), 144–32 start unix seconds, 176–1 do-not-return.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PackedLoan {
+    pub(crate) position_id: u64,
+    pub(crate) quantity_raw: u64,
+    pub(crate) counterparty_id: u64,
+    pub(crate) interest_rate: String,
+    pub(crate) started_at_unix: Option<u64>,
+    pub(crate) do_not_return: bool,
+}
+
+impl PackedLoan {
+    pub(crate) fn decode(position_id: u64, packed: U256) -> Self {
+        let quantity_raw = field(packed, 0, 64);
+        let counterparty_id = field(packed, 64, 64);
+        let rate_raw = field(packed, 128, 16) as u16;
+        let started = field(packed, 144, 32);
+        let started_at_unix = if (1_600_000_000..2_200_000_000).contains(&started) {
+            Some(started)
+        } else {
+            None
+        };
+        let do_not_return = field(packed, 176, 1) == 1;
+        Self {
+            position_id,
+            quantity_raw,
+            counterparty_id,
+            interest_rate: decimal(rate_raw, 4),
+            started_at_unix,
+            do_not_return,
+        }
+    }
+}
+
+fn decode_funding_rate(raw: u64) -> String {
+    decimal(raw, 7)
+}
+
+fn decode_book_rate(raw: u64) -> Option<String> {
+    if raw == 0 {
+        return None;
+    }
+    // Lend-book "price" is an APR. On UniFi it matches lending aggregation:
+    // 16-bit 4-decimal fraction (600 → 0.0600 = 6%). Packed-price encoding is
+    // the fallback for books that quote like spot.
+    if raw <= u64::from(u16::MAX) {
+        return Some(decimal(raw, 4));
+    }
+    let as_price = decode_price(raw);
+    if as_price != "0" {
+        return Some(as_price);
+    }
+    None
+}
+
+fn first_depth_rate(levels: &[U256]) -> Option<String> {
+    let word = levels.iter().find(|w| !w.is_zero())?;
+    decode_book_rate(field(*word, 0, 64)).or_else(|| decode_book_rate(field(*word, 64, 64)))
+}
+
+fn decode_position_ids(words: &[U256]) -> Vec<u64> {
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let returned = field(words[0], 0, 32) as usize;
+    if returned > 0 && returned < words.len() {
+        return words
+            .iter()
+            .skip(1)
+            .take(returned)
+            .filter(|w| !w.is_zero())
+            .map(|w| field(*w, 0, 64))
+            .filter(|id| *id != 0)
+            .collect();
+    }
+    words
+        .iter()
+        .filter(|w| !w.is_zero())
+        .filter(|w| w.bit_len() <= 64)
+        .map(|w| w.to::<u64>())
+        .collect()
+}
+
 impl PerpetualPosition {
     fn decode(asset: &Asset, packed: U256, owed_base: I256) -> Result<Self, String> {
         let entry_price_raw = field(packed, 0, 64);
@@ -895,8 +1077,8 @@ fn decode_price(raw: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_TOKEN_ID, WorldClient, decimal_digits, decode_open_orders, decode_price,
-        packed_string, signed_field,
+        BASE_TOKEN_ID, WorldClient, decimal_digits, decode_book_rate, decode_open_orders,
+        decode_price, packed_string, signed_field,
     };
     use alloy_primitives::U256;
 
@@ -913,6 +1095,13 @@ mod tests {
         assert_eq!(decimal_digits("123456".to_string(), 3), "123.456");
         assert_eq!(decimal_digits("5".to_string(), 6), "0.000005");
         assert_eq!(decimal_digits("1000".to_string(), 3), "1.0");
+    }
+
+    #[test]
+    fn decodes_lend_book_rate_as_four_decimal_fraction() {
+        assert_eq!(decode_book_rate(600).as_deref(), Some("0.06"));
+        assert_eq!(decode_book_rate(550).as_deref(), Some("0.055"));
+        assert_eq!(decode_book_rate(0), None);
     }
 
     #[test]
@@ -1010,5 +1199,50 @@ mod tests {
         assert!(permission.authorized);
         assert_eq!(permission.authorization, "owner");
         assert_eq!(orders.account_id, account_id);
+    }
+
+    #[test]
+    #[ignore = "requires live UniFi RPC"]
+    fn reads_live_world_rates_and_loans() {
+        let client = WorldClient::default();
+        let assets = client.assets().unwrap();
+        let weth = super::asset_by_symbol(&assets, "WETH").unwrap();
+        let usdt = super::asset_by_symbol(&assets, "USDT").unwrap();
+        let funding = client.current_funding_rate_8h(weth.token_id);
+        let weth_book = client.lend_book_rates(weth.token_id);
+        let usdt_book = client.lend_book_rates(usdt.token_id);
+        funding.expect("funding read");
+        let weth_book = weth_book.expect("weth lend book");
+        let usdt_book = usdt_book.expect("usdt lend book");
+        assert!(
+            weth_book
+                .lend_apr
+                .as_deref()
+                .is_some_and(|r| r.starts_with("0.")),
+            "weth lend apr should be a decimal fraction, got {weth_book:?}"
+        );
+        assert!(
+            usdt_book
+                .borrow_apr
+                .as_deref()
+                .is_some_and(|r| r.starts_with("0.")),
+            "usdt borrow apr should be a decimal fraction, got {usdt_book:?}"
+        );
+
+        let rates = crate::rates::snapshot(&client, Some(&["WETH".to_string()])).unwrap();
+        assert_eq!(rates.source, "world-markets-contract");
+        assert!(!rates.executable);
+        let row = rates
+            .rates
+            .iter()
+            .find(|row| row.base_symbol == "WETH")
+            .expect("WETH rates row");
+        assert!(row.funding_rate_8h.is_some());
+        assert!(row.funding_annualized.is_some());
+        assert_eq!(row.lend_apr.as_deref(), weth_book.lend_apr.as_deref());
+        assert_eq!(row.borrow_apr.as_deref(), usdt_book.borrow_apr.as_deref());
+        assert_eq!(row.native_yield_source, "none");
+        assert!(row.yield_basis_spread_apr.is_none());
+        assert!(row.basis_spread_apr.is_some());
     }
 }

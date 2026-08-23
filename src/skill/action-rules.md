@@ -18,7 +18,7 @@
 - Market vs sliced cost and money saved → `plan_large_order`.
 - Capital efficiency → `get_dollarpower`.
 - Guardian unwind order + costs → `simulate_guardian_unwind`.
-- Negative-carry regime state → `check_negative_carry`.
+- Rates → `get_world_rates`; loans → `get_world_loans`; carry → `check_negative_carry`.
 
 Reuse runtime-provided account and connected-wallet context; do not ask the user to repeat it. Quote a number only from the latest relevant tool result; if state may have changed, refresh it.
 

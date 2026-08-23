@@ -19,6 +19,8 @@ pub(crate) struct WorldMarketsApp {
     reporting: FixtureReporting,
     pnl_ledger: PnlLedger,
     guest_store: GuestStore,
+    carry_ledger: crate::carry::CarryLedger,
+    loan_origins: crate::loans::LoanOriginStore,
 }
 
 pub(crate) struct ListWorldAssets;
@@ -49,6 +51,56 @@ pub(crate) struct GetWorldMarketArgs {
     /// Quote asset symbol. Required for spot and perp, omitted for lend.
     #[serde(default)]
     pub(crate) quote_symbol: Option<String>,
+}
+
+pub(crate) struct GetWorldRates;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct GetWorldRatesArgs {
+    /// Base symbols to include (e.g. ["WETH","WBTC"]). Omit for every listed asset.
+    #[serde(default)]
+    pub(crate) assets: Option<Vec<String>>,
+}
+
+impl DynAomiTool for GetWorldRates {
+    type App = WorldMarketsApp;
+    type Args = GetWorldRatesArgs;
+    const NAME: &'static str = "get_world_rates";
+    const DESCRIPTION: &'static str = crate::rates::RATES_DESCRIPTION;
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, _ctx: DynToolCallCtx) -> Result<Value, String> {
+        let snapshot = crate::rates::snapshot(&app.client, args.assets.as_deref())?;
+        serde_json::to_value(&snapshot)
+            .map_err(|e| format!("[world-markets] failed to encode rates snapshot: {e}"))
+    }
+}
+
+pub(crate) struct GetWorldLoans;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct GetWorldLoansArgs {
+    /// World account ID. Optional when handover account context is available.
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    /// Expected owner wallet. This does not replace the acting wallet authorization check.
+    #[serde(default)]
+    pub(crate) wallet_address: Option<String>,
+}
+
+impl DynAomiTool for GetWorldLoans {
+    type App = WorldMarketsApp;
+    type Args = GetWorldLoansArgs;
+    const NAME: &'static str = "get_world_loans";
+    const DESCRIPTION: &'static str = "List this account's individual lend and borrow loans with fixed rate_apr, matures_at (unix seconds), time_remaining_seconds, extensible, and counterparty. get_world_account only exposes aggregated lend/borrow quantities, so this tool is required for roll timing. World loans are a 10-day term. When the contract does not expose start time, maturity is first-seen plus 10 days and extensible defaults true. Never executes.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let access = app.access(args.account_id, args.wallet_address.as_deref(), &ctx)?;
+        let assets = app.client.assets()?;
+        let account = app.client.account(access.account_id, &assets)?;
+        let snapshot = crate::loans::snapshot(&app.client, &app.loan_origins, &account, &assets)?;
+        serde_json::to_value(&snapshot)
+            .map_err(|e| format!("[world-markets] failed to encode loans snapshot: {e}"))
+    }
 }
 
 pub(crate) struct PreviewWorldTrade;
@@ -765,11 +817,22 @@ impl DynAomiTool for CheckNegativeCarry {
     const NAME: &'static str = "check_negative_carry";
     const DESCRIPTION: &'static str = "Return the negative-carry regime state for a basis position: days negative, the pre-authorized trigger window, average daily carry, and whether the plan has fired. Never executes.";
 
-    fn run(app: &WorldMarketsApp, args: Self::Args, _ctx: DynToolCallCtx) -> Result<Value, String> {
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let account_id = WorldMarketsApp::account_id(&ctx, None);
+        let carry_state = crate::carry::check(
+            &app.client,
+            &app.carry_ledger,
+            &args.position_id,
+            account_id,
+        )?;
         Ok(json!({
             "source": "world-markets-reporting",
-            "carry_state": app.reporting.carry_state(&args.position_id),
+            "chain_id": CHAIN_ID,
+            "exchange": app.client.exchange(),
+            "block_number": app.client.block_number()?,
+            "carry_state": carry_state,
             "executable": false,
+            "cadence_note": "This plugin persists carry state and returns it. The host runtime owns the daily cadence that invokes this check and the push when fired flips.",
         }))
     }
 }
