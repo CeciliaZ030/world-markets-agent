@@ -2,6 +2,9 @@
 
 An Aomi app for live World Markets context on the UniFi testnet.
 
+Collaborators: see [README-AOMI.md](README-AOMI.md) for the tested local and
+hosted development workflow.
+
 The app reads the World exchange contract directly and exposes typed tools in two
 groups.
 
@@ -58,56 +61,49 @@ compute every number a message interpolates. To chat with it locally:
 
 ```sh
 cargo build
-cargo run -p aomi-sdk --features dev-runtime --bin aomi-run -- \
-  target/debug/libworld_markets.dylib --env-file .env --provider openrouter
+aomi-run target/debug/libworld_markets.dylib \
+  --env-file .env --provider openrouter
 ```
 
 The dev runtime stubs the `evm-core` namespace and returns `None` for all state
-attributes, so the `handover_mandate` and account context are absent locally —
-`preview_world_trade` will fail closed (`missing_mandate`). Exercise the copy and
-tool selection with prompts like:
+attributes, so the `handover_mandate` and account context are absent locally.
+World tools will ask for an account ID or fail closed when they cannot prove the
+account or mandate. Exercise the copy and tool selection with prompts like:
 
 - "What can't you do?" → the §6.1 incapacity message (no numbers).
-- "Can I buy 1 WETH perp?" → the model calls `preview_world_trade`; with no
-  mandate bound it reports the fail-closed denial, not a fabricated verdict.
+- "Can I buy 1 WETH perp?" → the model calls the World policy tools; without
+  account context it asks for an account ID or fails closed, never fabricating
+  a verdict.
 - "How am I doing?" → the model calls `get_world_account` / `get_dollarpower`;
   every figure it states must appear in those tool results.
 
-Deploy against the real backend for live mandate context and executable staging.
+Deploy against the real backend for live handover and mandate context. This app
+release remains intentionally non-executable.
 
 ## Deploy
 
-Install the CLI version required by the hosted runtime and log in to Aomi
-Build:
+The complete collaborator flow, including the one-time organization-repository
+import, is in [README-AOMI.md](README-AOMI.md). After an owner/admin connects the
+Project in Aomi Build, install the current CLI and log in to staging:
 
 ```sh
-cargo install aomi-sdk --version 4.0.0 --features cli --locked
-aomi-build login
-```
-
-Connect this repository to the World Markets platform once. The command
-registers the Project and refreshes `.aomi/config.json` from the tracked
-`aomi.toml` files:
-
-```sh
-aomi-build project create \
-  --repo World-Markets-Inc/aomi \
-  --platform world-market-apps
-git add .aomi/config.json
-git commit -m "Add Aomi project configuration"
-git push
+cargo install --git https://github.com/aomi-labs/aomi-sdk \
+  --features cli,dev-runtime aomi-sdk
+aomi-build login \
+  --build-url https://build-staging.aomi.dev \
+  --backend https://api-staging.aomi.dev
 ```
 
 After each code update, validate, commit, and push the exact revision that
-should run. Then deploy, activate, and verify it:
+should run. Then let the full lifecycle deploy, activate, and verify it:
 
 ```sh
 cargo test
 cargo build --release
+git push
 
 aomi-build deploy preflight --repo World-Markets-Inc/aomi
-aomi-build deploy run --repo World-Markets-Inc/aomi
-aomi-build deploy activate
+aomi-build deploy --repo World-Markets-Inc/aomi
 aomi-build deploy status
 ```
 
