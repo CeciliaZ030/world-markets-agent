@@ -74,3 +74,42 @@ tool selection with prompts like:
   every figure it states must appear in those tool results.
 
 Deploy against the real backend for live mandate context and executable staging.
+
+## Deploy
+
+Install the CLI version required by the hosted runtime and log in to Aomi
+Build:
+
+```sh
+cargo install aomi-sdk --version 4.0.0 --features cli --locked
+aomi-build login
+```
+
+Connect this repository to the World Markets platform once. The command
+registers the Project and refreshes `.aomi/config.json` from the tracked
+`aomi.toml` files:
+
+```sh
+aomi-build project create \
+  --repo World-Markets-Inc/aomi \
+  --platform world-market-apps
+git add .aomi/config.json
+git commit -m "Add Aomi project configuration"
+git push
+```
+
+After each code update, validate, commit, and push the exact revision that
+should run. Then deploy, activate, and verify it:
+
+```sh
+cargo test
+cargo build --release
+
+aomi-build deploy preflight --repo World-Markets-Inc/aomi
+aomi-build deploy run --repo World-Markets-Inc/aomi
+aomi-build deploy activate
+aomi-build deploy status
+```
+
+Deployment uses the pushed Git commit, not uncommitted working-tree changes.
+`.aomi/deployment.json` is local lifecycle state and must not be committed.
