@@ -84,7 +84,12 @@ This repository already commits the V2 Project declaration:
 ```
 
 An owner or repository administrator must connect the GitHub repository once
-before any collaborator can deploy it:
+before any collaborator can deploy it. If the staging Aomi GitHub App is not
+installed for the organization yet, a GitHub organization owner must approve
+that installation first; scope it to `World-Markets-Inc/aomi`, not every
+organization repository.
+
+![Connect the World Markets repository to its Aomi platform](docs/images/aomi-build-connect.jpg)
 
 1. Open [staging Aomi Build](https://build-staging.aomi.dev/) and sign in with
    GitHub.
@@ -95,9 +100,10 @@ before any collaborator can deploy it:
 
 Repository write access is enough for normal pull requests, but the initial
 organization-repository import is intentionally restricted to a GitHub repo
-administrator. A collaborator should not try to work around that boundary with
-an activation token. After the Project exists, collaborators deploy through
-their own verified Builder login.
+administrator, and first-time GitHub App installation may require organization
+owner approval. A collaborator should not try to work around those boundaries
+with an activation token. After the Project exists, collaborators deploy
+through their own verified Builder login.
 
 ## 5. Deploy a pushed commit to staging
 
@@ -152,6 +158,9 @@ result.
 - **`403 Forbidden` while creating a Project**: the signed-in GitHub user is
   not a repository administrator, or the Aomi GitHub App is not authorized for
   this repo. Ask an owner/admin to perform the import.
+- **`Install requested` in Build**: a GitHub organization owner must approve
+  the pending `aomi-build-staging` installation before the Project can be
+  connected. Keep its repository access scoped to `World-Markets-Inc/aomi`.
 - **Commit is not on any remote**: push the exact `HEAD` you intend to deploy.
 - **SDK mismatch**: keep the exact registry pin required by the backend; run
   `aomi-build sdk check` for the expected version.
