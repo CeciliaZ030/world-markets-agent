@@ -1,0 +1,7 @@
+# Rust build output
+/target
+
+# Local secrets / dev-runtime env
+.env
+.env.*
+!.env.example

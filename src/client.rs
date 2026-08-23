@@ -6,9 +6,9 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-const DEFAULT_RPC_URL: &str = "https://mainnet.megaeth.com/rpc";
-const DEFAULT_EXCHANGE: &str = "0x5e3Ae52EbA0F9740364Bd5dd39738e1336086A8b";
-pub(crate) const CHAIN_ID: u64 = 4326;
+const DEFAULT_RPC_URL: &str = "https://testnet-unifi-rpc.puffer.fi/";
+const DEFAULT_EXCHANGE: &str = "0xf6b54e033bb45a583aa642924bcef78b804588ae";
+pub(crate) const CHAIN_ID: u64 = 2092151908;
 
 sol! {
     function getUserId(address userAddress) external view returns (uint64);
@@ -587,9 +587,9 @@ impl WorldClient {
             .json(&body)
             .send()
             .and_then(|response| response.error_for_status())
-            .map_err(|e| format!("[world-markets] MegaETH RPC request failed: {e}"))?
+            .map_err(|e| format!("[world-markets] World RPC request failed: {e}"))?
             .json()
-            .map_err(|e| format!("[world-markets] MegaETH RPC response was invalid: {e}"))
+            .map_err(|e| format!("[world-markets] World RPC response was invalid: {e}"))
     }
 
     fn rpc_error(&self, method: &str, error: Option<RpcError>) -> String {
@@ -866,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires live MegaETH RPC"]
+    #[ignore = "requires live UniFi RPC"]
     fn reads_live_world_assets() {
         let client = WorldClient::default();
         let block = client.block_number().unwrap();
@@ -885,13 +885,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires live MegaETH RPC"]
+    #[ignore = "requires live UniFi RPC"]
     fn reads_live_world_market_and_account() {
         let client = WorldClient::default();
         let assets = client.assets().unwrap();
         let weth = super::asset_by_symbol(&assets, "WETH").unwrap();
-        let usdm = super::asset_by_symbol(&assets, "USDm").unwrap();
-        let market = client.market("spot", weth, Some(usdm)).unwrap();
+        let usdt = super::asset_by_symbol(&assets, "USDT").unwrap();
+        let market = client.market("spot", weth, Some(usdt)).unwrap();
         let account_id = client.latest_account_id().unwrap();
         let account = client.account(account_id, &assets).unwrap();
         println!(
@@ -907,13 +907,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires live MegaETH RPC"]
+    #[ignore = "requires live UniFi RPC"]
     fn reads_live_world_permissions_and_open_orders() {
         let client = WorldClient::default();
         let assets = client.assets().unwrap();
         let weth = super::asset_by_symbol(&assets, "WETH").unwrap();
-        let usdm = super::asset_by_symbol(&assets, "USDm").unwrap();
-        let market = client.market("perp", weth, Some(usdm)).unwrap();
+        let usdt = super::asset_by_symbol(&assets, "USDT").unwrap();
+        let market = client.market("perp", weth, Some(usdt)).unwrap();
         let account_id = client.latest_account_id().unwrap();
         let owner = client.owner_for(account_id).unwrap();
         let permission = client

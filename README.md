@@ -1,8 +1,11 @@
 # World Markets Agent
 
-An Aomi app for live World Markets context on MegaETH mainnet.
+An Aomi app for live World Markets context on the UniFi testnet.
 
-The app reads the World exchange contract directly and exposes seven typed tools:
+The app reads the World exchange contract directly and exposes typed tools in two
+groups.
+
+Live contract reads (mandate-aware, non-executable):
 
 - `list_world_assets`
 - `get_world_account`
@@ -11,6 +14,18 @@ The app reads the World exchange contract directly and exposes seven typed tools
 - `check_world_mandate`
 - `get_world_agent_permission`
 - `get_world_open_orders`
+
+Reporting-service tools (the honest-numbers layer — deterministic derived figures
+so the message layer never authors a number; see `src/skill/` and the
+`TELEGRAM-MESSAGING-UX-SPEC`):
+
+- `preview_account_effect`
+- `compute_resize`
+- `preview_exit`
+- `plan_large_order`
+- `get_dollarpower`
+- `simulate_guardian_unwind`
+- `check_negative_carry`
 
 Version 0.3 is mandate-aware and intentionally non-executable. It verifies the
 active actor as the World account owner or an on-chain permitted trader, parses
@@ -32,3 +47,30 @@ cargo test
 cargo test reads_live_world -- --ignored --nocapture
 cargo build --release
 ```
+
+## Interactive sanity (aomi-run)
+
+The Aomi runtime — not this plugin — owns the Telegram transport, edited-message
+live leg-state, proactive pushes, the Sunday-digest schedule, and the
+simulation-first signing pipeline. This plugin ships only the skill sections (the
+copy + behavioral contract the model follows) and the deterministic tools that
+compute every number a message interpolates. To chat with it locally:
+
+```sh
+cargo build
+cargo run -p aomi-sdk --features dev-runtime --bin aomi-run -- \
+  target/debug/libworld_markets.dylib --env-file .env --provider openrouter
+```
+
+The dev runtime stubs the `evm-core` namespace and returns `None` for all state
+attributes, so the `handover_mandate` and account context are absent locally —
+`preview_world_trade` will fail closed (`missing_mandate`). Exercise the copy and
+tool selection with prompts like:
+
+- "What can't you do?" → the §6.1 incapacity message (no numbers).
+- "Can I buy 1 WETH perp?" → the model calls `preview_world_trade`; with no
+  mandate bound it reports the fail-closed denial, not a fabricated verdict.
+- "How am I doing?" → the model calls `get_world_account` / `get_dollarpower`;
+  every figure it states must appear in those tool results.
+
+Deploy against the real backend for live mandate context and executable staging.

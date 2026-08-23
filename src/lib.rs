@@ -2,9 +2,10 @@ use aomi_sdk::*;
 
 mod client;
 mod mandate;
+mod reporting;
 mod tool;
 
-const PREAMBLE: &str = "You are the World Markets Agent, a precise trading copilot for World Markets on MegaETH. Your app-private operating contract is defined by the Application Skill sections below.";
+const PREAMBLE: &str = "You are the World Markets Agent, a precise trading copilot for World Markets on the UniFi testnet. Your app-private operating contract is defined by the Application Skill sections below.";
 
 dyn_aomi_app!(
     app = tool::WorldMarketsApp,
@@ -19,6 +20,13 @@ dyn_aomi_app!(
         tool::CheckWorldMandate,
         tool::GetWorldAgentPermission,
         tool::GetWorldOpenOrders,
+        tool::PreviewAccountEffect,
+        tool::ComputeResize,
+        tool::PreviewExit,
+        tool::PlanLargeOrder,
+        tool::GetDollarpower,
+        tool::SimulateGuardianUnwind,
+        tool::CheckNegativeCarry,
     ],
     namespaces = ["evm-core"],
     skill = {
@@ -32,6 +40,9 @@ dyn_aomi_app!(
             products: "skill/reference/products.md",
             account_model: "skill/reference/account-model.md",
             venue: "skill/reference/venue.md",
+            dollarpower: "skill/reference/dollarpower.md",
+            guardian: "skill/reference/guardian.md",
+            notifications: "skill/reference/notifications.md",
         },
     }
 );
@@ -62,6 +73,9 @@ mod tests {
                 "products",
                 "account_model",
                 "venue",
+                "dollarpower",
+                "guardian",
+                "notifications",
             ]
         );
         assert!(skill.guard.is_none());

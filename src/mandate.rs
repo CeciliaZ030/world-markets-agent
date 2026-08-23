@@ -315,10 +315,10 @@ mod tests {
     fn mandate() -> Mandate {
         Mandate::parse(Some(&json!({
             "version": 1,
-            "markets": [{ "product": "perp", "base": "WETH", "quote": "USDm" }],
-            "max_position_notional": { "amount": "25000", "quote": "USDm" },
+            "markets": [{ "product": "perp", "base": "WETH", "quote": "USDT" }],
+            "max_position_notional": { "amount": "25000", "quote": "USDT" },
             "max_leverage": "3",
-            "min_risk_adjusted_portfolio_value": { "amount": "5000", "quote": "USDm" },
+            "min_risk_adjusted_portfolio_value": { "amount": "5000", "quote": "USDT" },
             "halt_if_eligible_for_liquidation": true,
             "can_withdraw": false
         })))
@@ -330,7 +330,7 @@ mod tests {
             product: "perp",
             side: "buy",
             base: "WETH",
-            quote: "USDm",
+            quote: "USDT",
             quantity: Decimal::new(1, 0),
             mark_price: Decimal::new(2_000, 0),
             current_position_quantity: Decimal::ZERO,
@@ -350,9 +350,9 @@ mod tests {
         let value = json!({
             "version": 1,
             "markets": [],
-            "max_position_notional": { "amount": "25000", "quote": "USDm" },
+            "max_position_notional": { "amount": "25000", "quote": "USDT" },
             "max_leverage": "3",
-            "min_risk_adjusted_portfolio_value": { "amount": "5000", "quote": "USDm" },
+            "min_risk_adjusted_portfolio_value": { "amount": "5000", "quote": "USDT" },
             "halt_if_eligible_for_liquidation": true,
             "can_withdraw": false,
             "max_daily_loss": "10"
@@ -420,10 +420,10 @@ mod tests {
     fn interim_account_and_brief_are_transport_only() {
         let value = json!({
             "version": 1,
-            "markets": [{ "product": "perp", "base": "WETH", "quote": "USDm" }],
-            "max_position_notional": { "amount": "25000", "quote": "USDm" },
+            "markets": [{ "product": "perp", "base": "WETH", "quote": "USDT" }],
+            "max_position_notional": { "amount": "25000", "quote": "USDT" },
             "max_leverage": "3",
-            "min_risk_adjusted_portfolio_value": { "amount": "5000", "quote": "USDm" },
+            "min_risk_adjusted_portfolio_value": { "amount": "5000", "quote": "USDT" },
             "halt_if_eligible_for_liquidation": true,
             "can_withdraw": false,
             "account": { "id": 42 },
