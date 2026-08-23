@@ -44,7 +44,11 @@ impl Figure {
         }
     }
 
-    fn decimal(value: Decimal, unit: impl Into<String>, is_estimate: bool) -> Self {
+    pub(crate) fn exact(value: Decimal, unit: impl Into<String>) -> Self {
+        Self::decimal(value, unit, false)
+    }
+
+    pub(crate) fn decimal(value: Decimal, unit: impl Into<String>, is_estimate: bool) -> Self {
         Self {
             value: value.normalize().to_string(),
             unit: unit.into(),

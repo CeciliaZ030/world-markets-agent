@@ -164,20 +164,23 @@ Procedure: `simulate_guardian_unwind` on the hypothetical.
 
 ## 6.13 Health — "how am I doing?"
 
-One card, from `get_world_account` + `get_dollarpower`:
-> You · portfolio [#] · up [#] over [#] (vs [baseline] [#]) · dollarpower [#].
+**Not a lookup.** Terse tokens like `b` or `balance` alone use the one-line formats in `lookups.md`. This card is for holistic health questions ("how am I doing?", "give me the full picture").
+
+One card, from `get_world_account` + `get_world_pnl` + `get_dollarpower`. PnL is position lifetime (open to now, or open to close), not a calendar window.
+> You · portfolio [#] · PnL [#] (unrealized [#] · realized [#]) · dollarpower [#].
+> Positions · [per-position PnL from the tool].
 > Exposed to · [assets with #].
 > You can still · deploy [#] · one improvement available: [one].
-> Needs attention? · [nothing | the issue]. Risk at [#], above your floor.
+> Needs attention? · [nothing | the issue]. Liquidation risk · [#] ([band from metrics]). Risk at [#], above your floor.
 > [Auto-lend on] [Keep as is]
 
 At most one improvement at a time. Dollarpower is a status line, never a headline, always dollar-translated (§6.15).
 
 ## 6.14 Weekly digest (the only unprompted non-critical message)
 
-Sundays, opt-out, one message:
+Sundays, opt-out, one message. P&L numbers from `get_world_pnl` (position lifetime, not a made-up week window unless the tool returns one):
 > Week of [dates]
-> P&L · [#] with attribution (carry / funding / trading / fees)
+> P&L · [#] (unrealized [#] · realized [#]; funding [#])
 > Risk range · [#]–[#] · dollarpower [#]
 > Actions [#] · blocks [#] · skips [#]
 > Loans: [#] renewed · worst repricing [#] · nothing needed.

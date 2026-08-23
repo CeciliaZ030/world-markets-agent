@@ -35,6 +35,8 @@ sol! {
         external view returns (uint256[] orders);
     function searchSellOrders(uint64 userId, uint32 maxDepth, uint32 maxOrders, uint64 restartPosition)
         external view returns (uint256[] orders);
+    function readFundingRateHistory_4648699482(uint64 startTime, uint64 endTime, uint32 tokenId)
+        external view returns (uint64[] rates);
 }
 
 #[derive(Clone)]
@@ -173,6 +175,12 @@ struct RpcResponse {
 }
 
 #[derive(Deserialize)]
+struct RpcValueResponse {
+    result: Option<Value>,
+    error: Option<RpcError>,
+}
+
+#[derive(Deserialize)]
 struct RpcError {
     code: i64,
     message: String,
@@ -196,6 +204,46 @@ impl Default for WorldClient {
 impl WorldClient {
     pub(crate) fn exchange(&self) -> String {
         format!("{:#x}", self.exchange)
+    }
+
+    /// Mark price for an asset, independent of a specific order book.
+    pub(crate) fn mark_price(&self, token_id: u32) -> Result<(u64, String), String> {
+        let raw = self.call(&getMarkPriceCall { tokenId: token_id })?.price;
+        Ok((raw, decode_price(raw)))
+    }
+
+    pub(crate) fn block_timestamp(&self) -> Result<u64, String> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getBlockByNumber",
+            "params": ["latest", false],
+        });
+        let response = self.rpc_value(body)?;
+        let block = response
+            .result
+            .ok_or_else(|| self.rpc_error("eth_getBlockByNumber", response.error))?;
+        let timestamp = block
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "[world-markets] block payload missing timestamp".to_string())?;
+        u64::from_str_radix(timestamp.trim_start_matches("0x"), 16)
+            .map_err(|e| format!("[world-markets] invalid block timestamp: {e}"))
+    }
+
+    pub(crate) fn funding_rate_history(
+        &self,
+        from_sec: u64,
+        to_sec: u64,
+        token_id: u32,
+    ) -> Result<Vec<u64>, String> {
+        Ok(self
+            .call(&readFundingRateHistory_4648699482Call {
+                startTime: from_sec,
+                endTime: to_sec,
+                tokenId: token_id,
+            })?
+            .rates)
     }
 
     pub(crate) fn block_number(&self) -> Result<u64, String> {
@@ -582,6 +630,17 @@ impl WorldClient {
     }
 
     fn rpc(&self, body: Value) -> Result<RpcResponse, String> {
+        self.http
+            .post(&self.rpc_url)
+            .json(&body)
+            .send()
+            .and_then(|response| response.error_for_status())
+            .map_err(|e| format!("[world-markets] World RPC request failed: {e}"))?
+            .json()
+            .map_err(|e| format!("[world-markets] World RPC response was invalid: {e}"))
+    }
+
+    fn rpc_value(&self, body: Value) -> Result<RpcValueResponse, String> {
         self.http
             .post(&self.rpc_url)
             .json(&body)

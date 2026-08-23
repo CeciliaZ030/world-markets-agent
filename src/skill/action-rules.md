@@ -2,7 +2,10 @@
 
 ## Tool → claim mapping (never state a fact without its tool)
 
-- Account/balance/PnL/RAPV/liquidation claims → `get_world_account`.
+- Account/balance/RAPV/liquidation eligibility claims → `get_world_account`.
+- Liquidation risk score (0–10) and NAV → `get_world_account` (`metrics` field).
+- Terse lookups (`b`/`p`/`r`/`a`/`d` and paraphrases) → `lookups.md` for tools, one-line formats, and refusal rules.
+- Account-level or position-level PnL → `get_world_pnl`.
 - Grant live/revoked → `get_world_agent_permission`.
 - Asset identity/symbols/decimals → `list_world_assets`.
 - Market existence, book, live mark → `get_world_market`.

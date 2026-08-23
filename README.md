@@ -22,6 +22,7 @@ Reporting-service tools (the honest-numbers layer — deterministic derived figu
 so the message layer never authors a number; see `src/skill/` and the
 `TELEGRAM-MESSAGING-UX-SPEC`):
 
+- `get_world_pnl`
 - `preview_account_effect`
 - `compute_resize`
 - `preview_exit`
@@ -74,8 +75,12 @@ account or mandate. Exercise the copy and tool selection with prompts like:
 - "Can I buy 1 WETH perp?" → the model calls the World policy tools; without
   account context it asks for an account ID or fails closed, never fabricating
   a verdict.
-- "How am I doing?" → the model calls `get_world_account` / `get_dollarpower`;
-  every figure it states must appear in those tool results.
+- "How am I doing?" → the model calls `get_world_account` / `get_world_pnl` /
+  `get_dollarpower`; every figure it states must appear in those tool results.
+
+PnL persistence (until Aomi host storage is agreed): realized and closed-position
+figures are written under `WORLD_PNL_DIR`, else
+`$XDG_DATA_HOME/aomi/world-markets/pnl`. Open PnL is live from the contract.
 
 Deploy against the real backend for live handover and mandate context. This app
 release remains intentionally non-executable.

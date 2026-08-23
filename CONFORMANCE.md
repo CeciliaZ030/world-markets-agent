@@ -47,10 +47,25 @@ they are not unit-testable in this repo.
 
 | Contract | Status |
 |---|---|
-| **Risk-score mapping** (0–10 vs RAPV floor) | NOT invented. Risk transitions and floors are carried in the engine's units (RAPV) as strings; `AccountEffect.risk` / `ResizeSolution.floor` label them `RAPV`. Copy cites the engine value in engine units until the mapping exists. |
+| **Risk-score mapping** (0–10 vs RAPV floor) | `liquidation_risk` in `get_world_account` → `metrics` is computed by `src/liquidation_risk.rs` using the same `Portfolio.calculateLiquidationRisk` algorithm as the Composite frontend (`@composite/sdk`). Mandate floors remain in RAPV units via `compute_resize`. |
 | **Reporting-service field list** (net carry/day, resize solver, exit-cost at live books, time-to-flat p90, liquidation-path check) | Defined as the `Reporting` trait in `src/reporting.rs`; `FixtureReporting` supplies deterministic values today. Swap the impl for the real service without changing tool signatures. |
 | **Guardian unwind algorithm** (R4, cheapest-safe) | Implemented as `guardian_cheapest_safe` (pure fn) with the five per-candidate terms, greedy Δscore/exit-cost selection, protected veto, worse-residual refusal, ProtectEth override + honest reporting, and the degraded (`reached_target: false`) state. Unit-tested. |
 | **Dollarpower** | Behind `Reporting::dollarpower` / `get_dollarpower` tool; ratio + committed + effective, always dollar-translatable. Never derived by the model. |
+| **PnL** | Behind `get_world_pnl`. Open perp PnL is mark versus contract entry minus unpaid funding (live contract reads; no store). Realized / closed-position PnL is kept in an app-local JSON ledger (`WORLD_PNL_DIR` or `$XDG_DATA_HOME/aomi/world-markets/pnl`) until Aomi host persistence is agreed. Window is position lifetime, not an arbitrary calendar range. Coverage is perpetual positions only. |
+
+## Concision & lookup layer (`CONCISION-AND-COMMANDS.md` v2.0)
+
+| Wire checklist item | Where satisfied | Test |
+|---|---|---|
+| Lookup vs action split | `instructions.md` voice carve-out; `lookups.md` §Lookup vs action | `skill_conformance::concision_split_stated` |
+| Core-five + secondary lookup formats | `lookups.md` one-line templates | `skill_conformance::lookup_formats_present` |
+| Risk three forms (0–10, higher = worse) | `lookups.md` §`r` / risk; `liquidation_risk.rs` | `skill_conformance::risk_lookup_forms_present`, `liquidation_risk::risk_bands_match_composite_ui` |
+| `liquidationRisk` + NAV consumed, not re-derived | `get_world_account` → `metrics` | `liquidation_risk` unit tests |
+| Terse-token whole-intent match | `lookups.md` §Terse tokens | `skill_conformance::terse_token_whole_message_rule` |
+| Top exposures by USDT notional (top 3) | `get_world_account` → `lookups.top_exposures` | `lookups::ranks_and_truncates_top_three` |
+| `available_to_deploy` — exact only | Omitted until reporting service ships; `lookups.md` §`a` | `lookups::account_lookups_omit_available_to_deploy` |
+| Enriched `/b` window P&L | Deferred — reducible `Portfolio [#].` only | `lookups.md` §`b` |
+| Shortcut registry | Explicitly deferred — not built | — |
 
 ## Honest-numbers enforcement (defense in depth)
 

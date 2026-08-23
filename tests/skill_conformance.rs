@@ -63,6 +63,7 @@ fn no_banned_vocabulary() {
     ];
     for file in [
         "instructions.md",
+        "lookups.md",
         "workflows.md",
         "action-rules.md",
         "safety.md",
@@ -244,4 +245,90 @@ fn notification_budget_stated() {
     );
     assert!(n.to_lowercase().contains("silent"));
     assert!(n.to_lowercase().contains("exempt from"));
+}
+
+/// Concision spec — lookup vs action split is stated in instructions + lookups.
+#[test]
+fn concision_split_stated() {
+    let instructions = skill("instructions.md");
+    assert!(
+        instructions.contains("Lookups") && instructions.contains("one line"),
+        "instructions must carve out one-line lookups"
+    );
+    assert!(
+        instructions.contains("Action messages"),
+        "instructions must preserve full anatomy for actions"
+    );
+    let lookups = skill("lookups.md");
+    assert!(
+        lookups.contains("one line") && lookups.contains("full anatomy"),
+        "lookups must define the split"
+    );
+}
+
+/// Concision spec — core lookup one-line formats present verbatim.
+#[test]
+fn lookup_formats_present() {
+    let lookups = skill("lookups.md");
+    for phrase in [
+        "Portfolio [#].",
+        "Liquidation risk [#]/10.",
+        "Liquidation risk [#]/10 — high.",
+        "Eligible for liquidation — liquidation risk [#]/10.",
+        "Dollarpower [#]× — your [#] is doing the work of [#].",
+        "Available to deploy [#].",
+    ] {
+        assert!(lookups.contains(phrase), "missing lookup format: {phrase}");
+    }
+}
+
+/// Concision spec — risk score direction and no gamification in lookup copy.
+#[test]
+fn risk_lookup_forms_present() {
+    let lookups = skill("lookups.md");
+    assert!(
+        lookups.contains("higher = worse"),
+        "risk lookup must state score direction"
+    );
+    assert!(
+        lookups.contains("Never gamify"),
+        "risk lookup must forbid gamification"
+    );
+    assert!(
+        !lookups.to_lowercase().contains("rapv floor") || lookups.contains("blocks only"),
+        "risk lookup must not conflate with floor"
+    );
+}
+
+/// Concision spec — terse tokens fire only on whole-message intent.
+#[test]
+fn terse_token_whole_message_rule() {
+    let lookups = skill("lookups.md");
+    assert!(
+        lookups.contains("whole intent") || lookups.contains("whole-message"),
+        "terse token rule must require whole-message match"
+    );
+    assert!(
+        lookups.contains("Inside prose"),
+        "terse token rule must warn about prose false positives"
+    );
+}
+
+/// Concision spec — `a` lookup refuses when available_to_deploy is absent.
+#[test]
+fn available_lookup_deferred_without_exact_figure() {
+    let lookups = skill("lookups.md");
+    assert!(
+        lookups.contains("available_to_deploy"),
+        "lookups must name the tool field for available"
+    );
+    assert!(
+        lookups.contains("isn't available") || lookups.contains("is not available"),
+        "lookups must refuse when field absent"
+    );
+    let rules = skill("action-rules.md");
+    assert!(
+        rules.contains("lookups.md"),
+        "action-rules must point terse lookups to lookups.md"
+    );
 }

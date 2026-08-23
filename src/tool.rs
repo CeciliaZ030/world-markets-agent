@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use crate::client::{Account, AccountAccess, CHAIN_ID, WorldClient, asset_by_symbol};
 use crate::mandate::{Mandate, TradeFacts, Verdict, parse_decimal};
+use crate::pnl::PnlLedger;
 use crate::reporting::{
     AccountEffectInput, FixtureReporting, GuardianPreference, Reporting, ResizeInput, SliceInput,
     UnwindCandidate,
@@ -15,6 +16,7 @@ use crate::reporting::{
 pub(crate) struct WorldMarketsApp {
     client: WorldClient,
     reporting: FixtureReporting,
+    pnl_ledger: PnlLedger,
 }
 
 pub(crate) struct ListWorldAssets;
@@ -98,6 +100,22 @@ pub(crate) struct GetWorldOpenOrdersArgs {
     /// Optional expected owner wallet.
     #[serde(default)]
     pub(crate) wallet_address: Option<String>,
+}
+
+pub(crate) struct GetWorldPnl;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct GetWorldPnlArgs {
+    /// World account ID. Handover account context is used when omitted.
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    /// Optional expected owner wallet.
+    #[serde(default)]
+    pub(crate) wallet_address: Option<String>,
+    /// Optional position filter: symbol (e.g. "WETH") or id (e.g. "perp:WETH").
+    /// Omit for the full account, including recently closed positions this app observed.
+    #[serde(default)]
+    pub(crate) position: Option<String>,
 }
 
 impl WorldMarketsApp {
@@ -268,14 +286,26 @@ impl DynAomiTool for GetWorldAccount {
         let access = app.access(args.account_id, args.wallet_address.as_deref(), &ctx)?;
         let assets = app.client.assets()?;
         let account = app.client.account(access.account_id, &assets)?;
+        let block_number = app.client.block_number()?;
+        let metrics =
+            crate::liquidation_risk::compute_metrics(&app.client, &account, &assets, block_number)?;
+        let lookups = crate::lookups::compute_lookups(
+            &app.client,
+            &account,
+            &assets,
+            &metrics.net_asset_value,
+            block_number,
+        )?;
         Ok(json!({
             "source": "world-markets-contract",
             "chain_id": CHAIN_ID,
             "exchange": app.client.exchange(),
-            "block_number": app.client.block_number()?,
+            "block_number": block_number,
             "standing_brief": WorldMarketsApp::brief(&ctx),
             "access": access,
             "account": account,
+            "metrics": metrics,
+            "lookups": lookups,
         }))
     }
 }
@@ -394,6 +424,34 @@ impl DynAomiTool for GetWorldOpenOrders {
             "block_number": app.client.block_number()?,
             "access": access,
             "open_orders": app.client.open_orders(&market, access.account_id)?,
+        }))
+    }
+}
+
+impl DynAomiTool for GetWorldPnl {
+    type App = WorldMarketsApp;
+    type Args = GetWorldPnlArgs;
+    const NAME: &'static str = "get_world_pnl";
+    const DESCRIPTION: &'static str = "Compute account-level and per-position perpetual PnL. Open PnL is mark versus contract entry minus unpaid funding. Position PnL covers that position's lifetime (open to now, or open to close). Realized figures are captured when this app observes a true-up or close. Not a calendar-range report; never executes.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let access = app.access(args.account_id, args.wallet_address.as_deref(), &ctx)?;
+        let assets = app.client.assets()?;
+        let account = app.client.account(access.account_id, &assets)?;
+        let pnl = crate::pnl::report(
+            &app.client,
+            &app.pnl_ledger,
+            &account,
+            args.position.as_deref(),
+        )?;
+        Ok(json!({
+            "source": "world-markets-reporting",
+            "chain_id": CHAIN_ID,
+            "exchange": app.client.exchange(),
+            "block_number": app.client.block_number()?,
+            "access": access,
+            "executable": false,
+            "pnl": pnl,
         }))
     }
 }

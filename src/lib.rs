@@ -1,7 +1,10 @@
 use aomi_sdk::*;
 
 mod client;
+mod liquidation_risk;
+mod lookups;
 mod mandate;
+mod pnl;
 mod reporting;
 mod tool;
 
@@ -20,6 +23,7 @@ dyn_aomi_app!(
         tool::CheckWorldMandate,
         tool::GetWorldAgentPermission,
         tool::GetWorldOpenOrders,
+        tool::GetWorldPnl,
         tool::PreviewAccountEffect,
         tool::ComputeResize,
         tool::PreviewExit,
@@ -33,6 +37,7 @@ dyn_aomi_app!(
         id: "world-markets/trading",
         sections: {
             instructions: "skill/instructions.md",
+            lookups: "skill/lookups.md",
             workflows: "skill/workflows.md",
             action_rules: "skill/action-rules.md",
             safety: "skill/safety.md",
@@ -66,6 +71,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "instructions",
+                "lookups",
                 "workflows",
                 "action_rules",
                 "safety",
