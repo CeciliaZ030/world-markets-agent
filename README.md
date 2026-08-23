@@ -68,8 +68,8 @@ On Linux use `libworld_markets.so`. `/help` inside the REPL lists only host
 commands (`/quit`, `/reset`, …) — not agent lookup tokens. Terse lookups (`b`,
 `p`, `r`, …) are plain messages, not slash commands.
 
-Set `WORLD_ACCOUNT_ID` in `.env` so account lookups work locally (see
-[README-AOMI.md](README-AOMI.md) §3). The dev runtime stubs `evm-core` and
+Set `WORLD_ACCOUNT_ID` in `.env` (not only on the shell command line) so the
+plugin process inherits it via `--env-file`.
 returns `None` for all handover state attributes per the
 [aomi-run docs](https://aomi.dev/docs/build/toolchain/aomi-run#what-the-dev-runtime-stubs).
 

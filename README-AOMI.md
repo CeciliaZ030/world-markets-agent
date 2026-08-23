@@ -89,7 +89,15 @@ aomi-run target/debug/libworld_markets.dylib \
 ### What to expect at startup
 
 A healthy boot shows `world-markets v0.3.0`, **15** plugin tools, and
-`evm-core (stubbed)`. Inside the REPL, `/help` lists **host** commands only
+`evm-core (stubbed)`.
+
+**Important:** `aomi-run` sends only `manifest.preamble` to the LLM — not the
+`skill` block separately ([aomi-run docs](https://aomi.dev/docs/build/toolchain/aomi-run)).
+This plugin therefore embeds all skill sections into the composed preamble at
+build time (`src/preamble.rs`) so local behavior matches staging. Rebuild after
+any skill edit.
+
+Inside the REPL, `/help` lists **host** commands only
 (`/quit`, `/reset`, `/history`, `/help`) — not agent lookup tokens. Terse
 lookups are plain messages:
 

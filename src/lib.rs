@@ -5,23 +5,15 @@ mod liquidation_risk;
 mod lookups;
 mod mandate;
 mod pnl;
+mod preamble;
 mod reporting;
 mod tool;
-
-const PREAMBLE: &str = "You are the World Markets Agent on UniFi testnet. \
-**Terse lookups (whole message only):** when the user sends exactly one token — \
-`b`, `p`, `r`, `a`, `d`, or the words balance, positions, risk, available, dollarpower \
-(case-insensitive, nothing else) — it is a read-only lookup, not a typo. \
-Call the tool from the lookups skill section immediately and reply with **exactly one line** \
-from the format table. Never ask what they meant. Never list capabilities. Never greet. \
-`/help` is the host REPL (quit/reset); you do not register slash commands. \
-All other behavior is in the Application Skill sections below.";
 
 dyn_aomi_app!(
     app = tool::WorldMarketsApp,
     name = "world-markets",
     version = "0.3.0",
-    preamble = PREAMBLE,
+    preamble = preamble::COMPOSED,
     tools = [
         tool::ListWorldAssets,
         tool::GetWorldAccount,
@@ -62,6 +54,22 @@ dyn_aomi_app!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composed_preamble_includes_lookup_rules() {
+        assert!(
+            preamble::COMPOSED.contains("Terse lookups"),
+            "composed preamble must include instructions lookups section"
+        );
+        assert!(
+            preamble::COMPOSED.contains("Portfolio [#]."),
+            "composed preamble must include balance lookup format"
+        );
+        assert!(
+            preamble::COMPOSED.len() > preamble::ROLE_LEN + 5000,
+            "composed preamble must embed skill sections for aomi-run"
+        );
+    }
 
     #[test]
     fn app_skill_is_valid_and_mandate_aware() {
