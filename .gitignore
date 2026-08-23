@@ -1,6 +1,12 @@
 # Rust build output
 /target
 
+# Artifacts — local dev docs; version only the listed files
+/dev_artifacts/*
+!/dev_artifacts/README.md
+!/dev_artifacts/CONFORMANCE.md
+!/dev_artifacts/README-AOMI.md
+
 # Local secrets / dev-runtime env
 .env
 .env.*

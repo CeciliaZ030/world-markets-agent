@@ -2,7 +2,7 @@
 
 An Aomi app for live World Markets context on the UniFi testnet.
 
-Collaborators: see [README-AOMI.md](README-AOMI.md) for the tested local and
+Collaborators: see [README-AOMI.md](dev_artifacts/README-AOMI.md) for the tested local and
 hosted development workflow.
 
 The app reads the World exchange contract directly and exposes typed tools in two
@@ -89,7 +89,7 @@ release remains intentionally non-executable.
 
 ## Deploy
 
-The complete collaborator flow is in [README-AOMI.md](README-AOMI.md). After an
+The complete collaborator flow is in [README-AOMI.md](dev_artifacts/README-AOMI.md). After an
 owner/admin connects the Project in Aomi Build:
 
 ```sh
