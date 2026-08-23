@@ -59,7 +59,7 @@ runtime: it loads this plugin, calls a real LLM, and shows which tools the model
 selects. It is **not** the hosted Telegram backend.
 
 ```sh
-cargo build   # rebuild after every skill or tool change
+cargo build   # rebuild after every skill or tool change — aomi-run loads the dylib from disk
 aomi-run target/debug/libworld_markets.dylib \
   --env-file .env --provider openrouter
 ```

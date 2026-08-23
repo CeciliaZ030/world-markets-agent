@@ -309,8 +309,21 @@ fn terse_token_whole_message_rule() {
         "terse token rule must require whole-message match"
     );
     assert!(
-        lookups.contains("Inside prose"),
+        lookups.contains("Inside prose") || lookups.contains("inside prose"),
         "terse token rule must warn about prose false positives"
+    );
+    assert!(
+        lookups.contains("never clarify"),
+        "lookups must forbid clarification on terse tokens"
+    );
+    let instructions = skill("instructions.md");
+    assert!(
+        instructions.contains("highest priority"),
+        "instructions must prioritize terse lookups"
+    );
+    assert!(
+        instructions.contains("Never:") || instructions.contains("Forbidden"),
+        "instructions must list forbidden lookup responses"
     );
 }
 

@@ -4,6 +4,10 @@ Read-only facts → **one line, answer only.** Actions keep full anatomy in `wor
 
 Numbers from tools only. Never explain formulas. Never gamify risk scores.
 
+## Hard rules
+
+Whole-message terse token → lookup; never clarify; never capability menus. Tool first, then one line.
+
 ## Lookup vs action
 
 | kind | examples | response |

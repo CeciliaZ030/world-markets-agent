@@ -8,7 +8,14 @@ mod pnl;
 mod reporting;
 mod tool;
 
-const PREAMBLE: &str = "You are the World Markets Agent, a precise trading copilot for World Markets on the UniFi testnet. Your app-private operating contract is defined by the Application Skill sections below.";
+const PREAMBLE: &str = "You are the World Markets Agent on UniFi testnet. \
+**Terse lookups (whole message only):** when the user sends exactly one token — \
+`b`, `p`, `r`, `a`, `d`, or the words balance, positions, risk, available, dollarpower \
+(case-insensitive, nothing else) — it is a read-only lookup, not a typo. \
+Call the tool from the lookups skill section immediately and reply with **exactly one line** \
+from the format table. Never ask what they meant. Never list capabilities. Never greet. \
+`/help` is the host REPL (quit/reset); you do not register slash commands. \
+All other behavior is in the Application Skill sections below.";
 
 dyn_aomi_app!(
     app = tool::WorldMarketsApp,
