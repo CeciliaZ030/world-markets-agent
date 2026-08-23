@@ -207,12 +207,14 @@ fn on_chain_marks_only_policy_facts() {
     );
 }
 
-/// §10.6 — "Keep current position" and "View on World ↗" appear as first-class
-/// controls in the workflow copy.
+/// §10.6 — keep-position and View on World controls appear in workflow copy.
 #[test]
 fn required_controls_present() {
     let wf = skill("workflows.md");
-    assert!(wf.contains("Keep current position"), "missing Keep control");
+    assert!(
+        wf.contains("Keep as is") || wf.contains("Keep the"),
+        "missing keep-position control"
+    );
     assert!(
         wf.contains("View on World ↗"),
         "missing View on World control"
@@ -266,17 +268,21 @@ fn concision_split_stated() {
     );
 }
 
-/// Concision spec — core lookup one-line formats present verbatim.
+/// Message design v2 — core lookup one-line formats present.
 #[test]
 fn lookup_formats_present() {
     let lookups = skill("lookups.md");
     for phrase in [
-        "Portfolio [#].",
-        "Liquidation risk [#]/10.",
-        "Liquidation risk [#]/10 — high.",
-        "Eligible for liquidation — liquidation risk [#]/10.",
-        "Dollarpower [#]× — your [#] is doing the work of [#].",
-        "Available to deploy [#].",
+        "Portfolio",
+        "Liquidation risk",
+        "/10.",
+        "— high.",
+        "Eligible for liquidation",
+        "Dollarpower",
+        "Available to deploy",
+        "Holdings",
+        "Perps",
+        "No open positions",
     ] {
         assert!(lookups.contains(phrase), "missing lookup format: {phrase}");
     }
@@ -324,6 +330,65 @@ fn terse_token_whole_message_rule() {
     assert!(
         instructions.contains("Never:") || instructions.contains("Forbidden"),
         "instructions must list forbidden lookup responses"
+    );
+}
+
+/// Concision spec — strategy brain states operator doctrine and anti-patterns.
+#[test]
+fn strategy_brain_operator_doctrine_stated() {
+    let brain = skill("reference/strategy-brain.md");
+    for phrase in [
+        "Operate, don't menu",
+        "Continuous yield",
+        "Counterparties roll",
+        "PB-DEPLOY",
+        "PB-LEND",
+        "false binary",
+    ] {
+        assert!(
+            brain.contains(phrase),
+            "strategy-brain missing doctrine/playbook: {phrase}"
+        );
+    }
+}
+
+/// Message design v2 — F4a suppression and button naming stated.
+#[test]
+fn preview_suppression_and_button_rules_stated() {
+    let wf = skill("workflows.md");
+    assert!(
+        wf.contains("unchanged"),
+        "workflows must state F4a unchanged suppression"
+    );
+    let rules = skill("action-rules.md");
+    assert!(
+        rules.contains("Confirm") && rules.contains("prohibited"),
+        "action-rules must prohibit generic Confirm buttons"
+    );
+    let instructions = skill("instructions.md");
+    assert!(
+        instructions.contains("unchanged: true") || instructions.contains("`unchanged: true`"),
+        "instructions must state F4a suppression rule"
+    );
+}
+
+/// Message design v2 — class-grouped position lookup (F1).
+#[test]
+fn position_lookup_class_grouping_stated() {
+    let lookups = skill("lookups.md");
+    for class in ["Holdings", "Perps", "Lent", "Borrowed"] {
+        assert!(
+            lookups.contains(class),
+            "lookups must name position class {class}"
+        );
+    }
+    assert!(
+        lookups.contains("lookups.positions"),
+        "lookups must reference positions field"
+    );
+    assert!(
+        lookups.contains("missing_mark_symbols"),
+        "lookups must handle partial mark data"
     );
 }
 

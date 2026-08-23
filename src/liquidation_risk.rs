@@ -12,10 +12,10 @@ use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::FromPrimitive;
 use serde::Serialize;
 
-use crate::client::{Account, Asset, Balance, PerpetualPosition, WorldClient};
+use crate::client::{
+    decimal_digits, Account, Asset, Balance, PerpetualPosition, WorldClient, BASE_TOKEN_ID,
+};
 use crate::mandate::parse_decimal;
-
-pub(crate) const BASE_TOKEN_ID: u32 = 1;
 const LEND_DURATION_DAYS: u32 = 10;
 const LENDER_HAIRCUT: i64 = 980;
 const PERMILLE_SCALE: i64 = 1000;
@@ -344,10 +344,21 @@ fn calc_perp_risk_bounds(
 }
 
 fn owed_base_decimal(raw: &str, from_decimals: u8, to_decimals: u8) -> Result<Decimal, String> {
-    let value =
-        Decimal::from_str(raw).map_err(|e| format!("[world-markets] invalid owed_base: {e}"))?;
-    let scaled = value / Decimal::from(10i64.pow(u32::from(from_decimals) + 31));
-    Ok(truncate_dp(scaled, u32::from(to_decimals)))
+    if raw == "0" || raw == "-0" {
+        return Ok(Decimal::ZERO);
+    }
+    let negative = raw.starts_with('-');
+    let digits = raw.trim_start_matches('-');
+    let scale = u8::try_from(u32::from(from_decimals) + 31)
+        .map_err(|_| "[world-markets] owed_base scale exceeds u8".to_string())?;
+    let scaled = if negative {
+        format!("-{}", decimal_digits(digits.to_string(), scale))
+    } else {
+        decimal_digits(digits.to_string(), scale)
+    };
+    let value = Decimal::from_str(&scaled)
+        .map_err(|e| format!("[world-markets] invalid owed_base scaled: {e}"))?;
+    Ok(truncate_dp(value, u32::from(to_decimals)))
 }
 
 fn scale_risk_capped(risk_percent: f64, risk_multiplier: f64) -> f64 {
@@ -482,6 +493,12 @@ mod tests {
         assert_eq!(risk_band(8.0), "high");
         assert_eq!(risk_band(9.9), "high");
         assert_eq!(risk_band(10.0), "liquidation");
+    }
+
+    #[test]
+    fn owed_base_decimal_scales_without_integer_overflow() {
+        let scaled = owed_base_decimal("1000000000000000000", 7, 4).unwrap();
+        assert!(scaled >= Decimal::ZERO);
     }
 
     #[test]

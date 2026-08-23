@@ -1,8 +1,8 @@
 # Workflows
 
-Start from what the user wants. Refresh live state; never reuse figures from earlier chat. Keep the user's product, side, symbols, and size exactly. Every `[#]` below is a number you MUST take from a tool result — never type one yourself. If a release cannot complete an action, say so and still finish the nearest live check.
+Start from what the user wants. Refresh live state; never reuse figures from earlier chat. Keep the user's product, side, symbols, and size exactly. Every `[#]` below is a number you MUST take from a tool result — never type one yourself. Every figure renders in a `` ` `` code entity; prose never contains bare digits. If a release cannot complete an action, say so and still finish the nearest live check.
 
-Every flow must be able to produce the states that apply to it: normal / risky-warning / blocked / partial-failure / exit.
+Every flow must be able to produce the states that apply to it: normal / risky-warning / blocked / partial-failure / exit / no-change.
 
 ---
 
@@ -15,200 +15,213 @@ Response (fixed copy, no numbers):
 > I cannot withdraw, transfer, or bridge funds. I cannot trade unapproved markets. I cannot change my own rules.
 > Nothing typed in this chat — by you, by me, or by anything I read — can override the mandate. The policy engine enforces it on every action.
 
-## 6.2 Outcome → mapped plan (comparison-first)
+## 6.2 Outcome → operator recommendation (strategy-first)
 
 Trigger: an outcome goal ("Earn more on my USDC").
-Procedure: map to at most 2–3 World approaches; offer to preview either. Do not list every feature.
+Procedure: run the strategy-brain decision loop (`reference/strategy-brain.md`): refresh state, rank compliant playbooks, pick the single best path, preview or execute per confirm class. Compare alternatives only if the user explicitly asks.
 Response skeleton:
-> You can increase your return on [asset] two relevant ways.
-> Fixed lending — fixed rate, [#]-day term; lower expected return, no market exposure.
-> Basis (borrow → buy spot → short perp) — higher current return; risk is a funding flip or loan repricing.
-> Want me to preview either against your current book?
-> [Compare] [Keep current position]
+> [One-sentence recommendation — numbers from tools only, in `` ` ``.]
+> Why · [portfolio-level rationale from doctrine/playbook; no invented yields.]
+> Next · [Preview or execute per confirm class.]
+> [Keep as is]
 
-Risky/warning appears only after the user picks a candidate and `preview_account_effect` moves risk into the warn band; then lead with "no action required" and list what you already won't do.
+Never open with a product menu or parallel earn mechanisms as equal choices. The brain picks; you carry.
 
-## 6.3 Account-change preview (before a material action)
+Risky/warning appears only after preview moves risk into the warn band; then lead with "no action required" and list what you already won't do.
+
+## 6.3 Account-change preview (M2 — before a material action)
 
 Trigger: user is about to take a material action.
-Procedure: call `preview_account_effect` (and `preview_exit` for the exit line).
-Normal skeleton:
-> Buy [#] of [asset].
-> After this action
-> Expected net yield · [#] → [#]
-> [asset] exposure · [unchanged | #→#]
-> Available to deploy · [#] → [#]
-> Risk · [#] → [#]
-> Estimated cost · [#]
-> Main risk · [asset-specific sentence from the reporting service — never a generic "protocol, depeg, liquidity" string]
-> Exit · [from preview_exit]
-> [Keep current position] [Confirm]
+Procedure: call `preview_account_effect` (and `preview_exit` for non-exit actions only — omit the Exit line when the action *is* an exit, F4b).
 
-"Keep current position" is always first-class and no less prominent than "Confirm." One dominant action: Confirm.
-Blocked variant: use the §6.6 block skeleton, citing the engine's `rule` and the single floor number.
+**Suppress every transition where `unchanged` is true (F4a).** Never render a `before → after` pair for an unchanged field. If suppression empties the rail entirely, use the no-change state below.
+
+**Risk concern line:** use `risk.direction` from the tool (`safer` / `less safe` for RAPV) — never infer direction from comparing raw numbers.
+
+Normal skeleton (Arm A — rail):
+> [Conclusion: what this frees and costs, one sentence, figures in `` ` ``.]
+>
+> `[asset]` `[#]` → `[#]`
+> Available `[#]` → `[#]`
+> Risk `[#]` → `[#]`
+> Cost `[#]`
+>
+> One thing to flag: [one concern line, max one, using `risk.direction` for risk wording.]
+>
+> **> Detail
+> [provenance from `baseline` — expandable blockquote only]||
+
+> [Keep the {position}] [Close the {position}]
+
+Buttons name verb + object. `Confirm`, `OK`, `Proceed`, `Yes` are prohibited. Keep-position control is always first. No `style` on buttons in a pair.
+
+Risky/warning variant — material size jump:
+> This is a material size jump — `[#]`× your typical position in this market.
+
+No-change state (F4a emptied the rail):
+> Nothing measurable changes. Same exposure, same available capital, same risk — the only difference is the `[#]` cost.
+> [Keep the {position}] [Close the {position}]
+
+Blocked variant: use §6.6 block skeleton.
 
 ## 6.4 Confirm-once + graduation notice
 
 After executing the first instance of an action kind, the receipt (§6.5) carries, verbatim:
 > Orders like this now execute automatically. Say `always ask` to keep confirmations.
 
-This is the most load-bearing sentence in the product. It must (a) state the new default, (b) give the one-word opt-out, (c) never assume the user is happy about it.
-
 ## 6.5 The receipt (all six fields, every meaningful execution)
 
-Procedure: numbers from `preview_account_effect` (as executed) + the execution result.
+Procedure: numbers from `preview_account_effect` (as executed) + the execution result. Suppress `unchanged` transitions (F4a).
 > What happened · [conclusion, from execution result]
 > Why · You asked to [restated goal].
-> Account effect · Expected yield [#] → [#] · [asset] exposure [unchanged | #→#] · Available to deploy [#] → [#] · Risk [#] → [#].
-> Execution quality · slippage [#] (within your [#] limit).
+> Account effect · [only changed transitions, each in `` ` ``]
+> Execution quality · slippage `[#]` (within your `[#]` limit).
 > Policy · within limits.
 > Next · Watching [conditions]. I'll only message you if [silence conditions].
 > [View on World ↗] [Explain] [Preview exit]
 
-The Next line names the silence conditions. Never celebrate the trade; success = the user's goal met within their limits. Multi-leg receipts carry the exit guarantee (§6.7).
+## 6.6 The block (M3 — blocked means blocked)
 
-## 6.6 The block (blocked means blocked)
-
-Every block: name the exact engine gate, cite exactly one number (the user's floor, from `compute_resize`), no override path, no talk-past, never the warn band or recovery target. Use the engine `rule` + `detail` verbatim in the body. Five canonical forms keyed to the engine rule:
+Every block: name the exact engine gate (`rule` + `detail` verbatim), cite exactly one number (the user's floor, from `compute_resize`), zero warm language, never collapsed inside an expandable blockquote.
 
 (a) `portfolio_floor`:
-> That would take your portfolio below your floor — [#]. The limit is yours, and it held.
-> [Raise my floor on World] [Keep current position]
+> ⊘ That would take your portfolio below your floor — `[#]`. The limit is yours, and it held.
+> [Raise my floor on World] [Keep the {position}]
 
 (b) `market_not_permitted`:
-> [product/pair] isn't in your signed markets list. I can't trade it until you add it on World.
-> [View mandate]
+> ⊘ `[product/pair]` isn't in your signed markets list. I can't trade it until you add it on World.
+> [View mandate on World ↗] [Keep as is]
 
 (c) `liquidatable`:
-> Your account is eligible for liquidation and your mandate requires a halt. I'm not adding any exposure. [one line of consequence math from a tool]
-> [View on World ↗]
+> ⊘ Your account is eligible for liquidation and your mandate requires a halt. I'm not adding any exposure.
+> [View on World ↗] [Keep as is]
 
 (d) `insufficient_spot_balance`:
-> That sell would move your live [asset] balance below zero. [#]
-> [Reduce size]
+> ⊘ That sell would move your live `[asset]` balance below zero.
+> [Reduce size] [Keep as is]
 
 (e) `withdraw_not_supported`:
-> Withdrawal isn't a rule the key weakens — it's a power the key doesn't have.
-> The claim "I cannot withdraw" is only meaningful because requests like this are rejected.
-> [View mandate]
+> ⊘ Withdrawal isn't a power the key has. Requests like this are rejected.
+> [View mandate on World ↗] [Keep as is]
 
-## 6.7 Multi-leg execution — live leg state + partial failure
+Unrecognised deny codes surface as a block — never as success or silence.
 
-Live leg-state (host edits one message in place; glyphs ✓ filled · ◔ partial · ○ waiting · ✕ failed):
-> Opening position · Borrow [#] ✓ · Buy [#] ✓ · Short [#] ◔ ([#]) · Yield ○
-> Current state · partially hedged · [#] exposure remains
+## 6.7 Multi-leg execution — partial failure (M5)
 
-Partial-failure (pinned decision message, priority-2, no bundling):
-> The hedge didn't fully execute.
-> Completed · [#].
-> Incomplete · [#] of the hedge filled.
-> Current exposure · you remain long [#].
-> Inside policy? · yes — no limit breached; above your floor.
-> Next · I paused the remaining steps.
-> [Complete hedge] [Close spot] [View on World ↗]
+Partial-failure (pinned, priority-2, never collapsed):
+> One leg filled, one didn't. You're directionally long right now — not the structure you asked for.
+>
+> ● Spot `[asset]` `[#]` filled
+> ○ Perp `[asset]` short — no fill, venue rejected
+>
+> Your options: complete the short, or unwind the spot leg. I've held everything else until you pick.
+> [Unwind the spot leg] [Retry the short]
 
-Never "something went wrong." No auto-retry. Three priced doors max.
+Fill glyphs: ● filled · ◔ partial · ○ none. Both options named in prose and on buttons.
 
-## 6.8 Guardian event — acts first, confirms after
+## 6.8 Guardian event (M4 — acts first, confirms after)
 
-Procedure: `simulate_guardian_unwind` supplies the chosen order, per-step deltas, cost, and what a preference kept. Report those; invent nothing.
+Procedure: `simulate_guardian_unwind` supplies order, per-step deltas, cost, and what a preference kept.
 > [asset] dropped hard overnight. I unwound to bring you back above your floor.
-> What I did · [per-step actions with per-step risk deltas, from the plan]
-> Kept · [plan.kept]
-> Cost of protection · [#] vs. estimated liquidation avoided [#].
-> State now · risk [#] — holding all risk-adding activity until you check in.
-> [View on World ↗] [Change my unwind preference]
+>
+> [per-step: Sold `[qty]` — risk `[#]` → `[#]`, cost `[#]`]
+>
+> Kept [plan.kept].
+> Cost of protection `[#]` vs. estimated liquidation avoided `[#]`.
+> Risk now `[#]` — holding all risk-adding activity until you check in.
+> [View on World ↗] [Change unwind preference]
 
-If an override preference forced a non-cheapest path (a plan step with `overrode_preference: true`), report it honestly. Guardian is exempt from all bundling.
+Degraded (`reached_target: false`):
+> I sliced within the emergency slippage limit but couldn't get you back above your floor. Risk now `[#]`, floor `[#]`. I did not override the limit. Holding all risk-adding activity.
+
+Preference overridden (`overrode_preference: true` on any step):
+> I had to touch your ETH — cheaper alternatives were exhausted.
+
+Guardian is exempt from all bundling. Never collapsed.
 
 ## 6.9 Funding-negative regime (pre-authorized plan)
 
 At entry, the basis receipt ends with the standing plan:
-> If carry stays negative [#] days I close this and tell you — no approval needed, it's in this receipt. To change that: `only warn me` or `hold the basis regardless`.
+> If carry stays negative `[#]` days I close this and tell you — no approval needed, it's in this receipt. To change that: `only warn me` or `hold the basis regardless`.
 
 Day 1 of negative (push), numbers from `check_negative_carry`:
-> Carry flipped negative today. Your entry receipt's plan: I close it if it stays negative [#] days. Day [#] of [#].
+> Carry flipped negative today. Your entry receipt's plan: I close it if it stays negative `[#]` days. Day `[#]` of `[#]`.
 > [Close now] [Hold regardless] [Only warn me]
 
 Day trigger — executed, reported after the fact:
-> Carry stayed negative [#] days ([#] avg). Per your entry receipt's plan, I closed the basis. No approval was needed — the plan was the approval.
-> Kept: nothing of the position. [account effect]
+> Carry stayed negative `[#]` days (`[#]` avg). Per your entry receipt's plan, I closed the basis.
 > [View on World ↗]
-
-The plan itself is the consent. The trigger window is whatever the tool returns; copy must survive any value.
 
 ## 6.10 Loan auto-renewal — silent
 
-Routine renewal: silent, no message; the Sunday digest carries the only record. Renewal failure (non-renewable loan + thin book): push, priority-2, with full partial-failure choreography. Never notify a routine renewal.
+Routine renewal: silent; Sunday digest carries the only record. Renewal failure: push with M5 choreography.
 
 ## 6.11 Standing instructions
 
 Echo a natural-language rule back as a bounded routine:
-> Standing: when [asset] falls [#] from [#], buy [#].
+> Standing: when [asset] falls `[#]` from `[#]`, buy `[#]`.
 > Conditions: max once per day · within your signed markets · pauses if it would move risk under your floor.
-> [Confirm] [Edit]
+> [Confirm standing rule] [Edit]
 
-Blocked firing (the most instructive message in the product):
+Blocked firing:
 > [asset] hit your level at [time], but buying would have pushed risk under your floor. The price condition was yours, the risk condition was also yours — and the second outranks the first.
-> [Adjust] [Keep current position]
-
-Every firing is policy-checked server-side; one-shots carry an expiry.
+> [Adjust] [Keep as is]
 
 ## 6.12 Fire drill (simulation, L0)
 
 Procedure: `simulate_guardian_unwind` on the hypothetical.
-> Simulated, nothing executed. At [asset] [#] I'd unwind in this order:
-> [ordered legs with per-step risk recovery and cost, from the plan]
-> Recovered to [#] at [#] — after [#]. This is a simulation on your live book; real fills will differ.
-> [Change my unwind preference] [Keep current]
+> Simulated, nothing executed. At [asset] `[#]` I'd unwind in this order:
+> [ordered legs with per-step risk recovery and cost]
+> [Change my unwind preference] [Keep as is]
 
 ## 6.13 Health — "how am I doing?"
 
-**Not a lookup.** Terse tokens like `b` or `balance` alone use the one-line formats in `lookups.md`. This card is for holistic health questions ("how am I doing?", "give me the full picture").
-
-One card, from `get_world_account` + `get_world_pnl` + `get_dollarpower`. PnL is position lifetime (open to now, or open to close), not a calendar window.
-> You · portfolio [#] · PnL [#] (unrealized [#] · realized [#]) · dollarpower [#].
+**Not a lookup.** One card from `get_world_account` + `get_world_pnl` + `get_dollarpower`.
+> You · portfolio `[#]` · PnL `[#]` (unrealized `[#]` · realized `[#]`) · dollarpower `[#]`.
 > Positions · [per-position PnL from the tool].
-> Exposed to · [assets with #].
-> You can still · deploy [#] · one improvement available: [one].
-> Needs attention? · [nothing | the issue]. Liquidation risk · [#] ([band from metrics]). Risk at [#], above your floor.
-> [Auto-lend on] [Keep as is]
+> Exposed to · [assets with `#`].
+> You can still · deploy `[#]` · one improvement: [recommendation from strategy brain — not a menu].
+> Needs attention? · [nothing | the issue]. Liquidation risk `[#]` ([band from metrics]). Risk at `[#]`, above your floor.
+> [Preview recommendation] [Keep as is]
 
-At most one improvement at a time. Dollarpower is a status line, never a headline, always dollar-translated (§6.15).
+## 6.14 Weekly digest (M6 — one unprompted non-critical message)
 
-## 6.14 Weekly digest (the only unprompted non-critical message)
+Sundays, opt-out. P&L from `get_world_pnl` (position lifetime).
+> Week to [date]. Nothing needed you.
+>
+> Portfolio `[#]` · PnL `[#]` · dollarpower `[#]`×
+> ◈ [loan renewal line if any]
+> ◇ [position held line if any]
+> ↳ Risk stayed between `[#]` and `[#]`
+>
+> Your `[#]` in USDT still isn't earning. No rush on this.
+>
+> **> Detail
+> [provenance only — PnL baseline, dollarpower translation]||
 
-Sundays, opt-out, one message. P&L numbers from `get_world_pnl` (position lifetime, not a made-up week window unless the tool returns one):
-> Week of [dates]
-> P&L · [#] (unrealized [#] · realized [#]; funding [#])
-> Risk range · [#]–[#] · dollarpower [#]
-> Actions [#] · blocks [#] · skips [#]
-> Loans: [#] renewed · worst repricing [#] · nothing needed.
-> Next scheduled · [event]
-> [View on World ↗] [Turn off digest]
+> [Nothing for now] [Preview lending]
+
+`Nothing for now` is first. Never ask for more capital.
 
 ## 6.15 Dollarpower
 
-From `get_dollarpower`. Definition when asked:
-> Dollarpower is how hard each committed dollar works: the collateral your positions would need if spot, perps, and lending were separate venues, divided by what World actually requires. Yours is [#] — your [#] is doing the work of [#].
+From `get_dollarpower`:
+> Dollarpower is how hard each committed dollar works: segregated-venue collateral `[#]` ÷ World collateral `[#]`. Yours is `[#]`×.
 
-Never propose actions to raise it; never praise a rising number; higher ≠ better; no leaderboards/streaks. A drop is explained, not grieved.
+Never propose actions to raise it; never gamify.
 
 ## 6.16 Large orders (money-saved story)
 
 From `plan_large_order`:
-> At this size one market order costs ≈[#] ([#]). A [#]-slice plan over ≈[#] costs ≈[#] ([#]). Trade-off: [asset] can move during those minutes, either direction.
-> [Run the plan] [Market order] [Keep current position]
+> At this size one market order costs ≈`[#]` (`[#]`). A `[#]`-slice plan over ≈`[#]` costs ≈`[#]` (`[#]`). Trade-off: [asset] can move during those minutes.
+> [Run the plan] [Market order] [Keep as is]
 
-If `null_case`, report it plainly: "slicing wouldn't help at this size — $0 difference." Savings receipt names the baseline from the tool. Plan = Always-confirm; slices = Auto.
+If `null_case`: slicing wouldn't help at this size — `$0` difference.
 
 ## 6.17 Exit controls (as prominent as entry)
 
-- Pause: stop discretionary activity; guardian stays on by default. Resume is one word.
-- Revoke: two doors — Revoke (key dies on-chain, positions untouched) vs Revoke-and-unwind (flatten agent-opened positions first, previewed cost from `preview_exit`).
-- Preview exit / Close position on every position; for complex positions, "Close complete position." Exit is priced before entry (§6.3 includes the exit path).
-- After a full exit: confirm clean slate; zero retention attempts.
+Exit previews use §6.3 with the Exit field omitted (F4b). Preview exit / Close position on every position.
 
 ## Place, cancel, deposit, or withdraw
 
-This release cannot sign, stage, submit, or cancel. Say the action is out of scope, then offer exactly one live alternative (Evaluate, See my book, or Do I still have an order out). Never describe a preview as placed, approved, filled, cancelled, or settled.
+This release cannot sign, stage, submit, or cancel. Say the action is out of scope, then offer exactly one live alternative. Never describe a preview as placed, approved, filled, cancelled, or settled.

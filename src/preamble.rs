@@ -39,6 +39,8 @@ pub(crate) const COMPOSED: &str = concat!(
     include_str!("skill/reference/guardian.md"),
     "\n\n---\n\n",
     include_str!("skill/reference/notifications.md"),
+    "\n\n---\n\n",
+    include_str!("skill/reference/strategy-brain.md"),
 );
 
 #[cfg(test)]

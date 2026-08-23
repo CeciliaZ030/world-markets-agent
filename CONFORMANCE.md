@@ -57,6 +57,7 @@ they are not unit-testable in this repo.
 
 | Wire checklist item | Where satisfied | Test |
 |---|---|---|
+| Strategy brain (operator-first) | `reference/strategy-brain.md`; `workflows.md` §6.2 | `skill_conformance::strategy_brain_operator_doctrine_stated` |
 | Lookup vs action split | `instructions.md` voice carve-out; `lookups.md` §Lookup vs action | `skill_conformance::concision_split_stated` |
 | Core-five + secondary lookup formats | `lookups.md` one-line templates | `skill_conformance::lookup_formats_present` |
 | Risk three forms (0–10, higher = worse) | `lookups.md` §`r` / risk; `liquidation_risk.rs` | `skill_conformance::risk_lookup_forms_present`, `liquidation_risk::risk_bands_match_composite_ui` |

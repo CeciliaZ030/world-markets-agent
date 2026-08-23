@@ -9,6 +9,8 @@ use serde_json::{Value, json};
 const DEFAULT_RPC_URL: &str = "https://testnet-unifi-rpc.puffer.fi/";
 const DEFAULT_EXCHANGE: &str = "0xf6b54e033bb45a583aa642924bcef78b804588ae";
 pub(crate) const CHAIN_ID: u64 = 2092151908;
+/// Quote token (USDT). On-chain `getMarkPrice` reverts for this id — treat as 1.0.
+pub(crate) const BASE_TOKEN_ID: u32 = 1;
 
 sol! {
     function getUserId(address userAddress) external view returns (uint64);
@@ -208,6 +210,11 @@ impl WorldClient {
 
     /// Mark price for an asset, independent of a specific order book.
     pub(crate) fn mark_price(&self, token_id: u32) -> Result<(u64, String), String> {
+        if token_id == BASE_TOKEN_ID {
+            // Quote token has no on-chain mark; USDT notionals are already in quote units.
+            const ONE_RAW: u64 = 1 << 5;
+            return Ok((ONE_RAW, decode_price(ONE_RAW)));
+        }
         let raw = self.call(&getMarkPriceCall { tokenId: token_id })?.price;
         Ok((raw, decode_price(raw)))
     }
@@ -861,7 +868,7 @@ fn signed_decimal_i128(value: i128, decimals: u8) -> String {
     }
 }
 
-fn decimal_digits(mut digits: String, decimals: u8) -> String {
+pub(crate) fn decimal_digits(mut digits: String, decimals: u8) -> String {
     let decimals = usize::from(decimals);
     if decimals == 0 {
         return digits;
@@ -888,9 +895,18 @@ fn decode_price(raw: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        WorldClient, decimal_digits, decode_open_orders, decode_price, packed_string, signed_field,
+        WorldClient, BASE_TOKEN_ID, decimal_digits, decode_open_orders, decode_price, packed_string,
+        signed_field,
     };
     use alloy_primitives::U256;
+
+    #[test]
+    fn base_token_mark_price_is_one_without_rpc() {
+        let client = WorldClient::default();
+        let (raw, mark) = client.mark_price(BASE_TOKEN_ID).unwrap();
+        assert_eq!(raw, 1 << 5);
+        assert_eq!(mark, "1");
+    }
 
     #[test]
     fn formats_decimal_values() {

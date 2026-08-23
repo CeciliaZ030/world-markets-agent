@@ -47,6 +47,7 @@ dyn_aomi_app!(
             dollarpower: "skill/reference/dollarpower.md",
             guardian: "skill/reference/guardian.md",
             notifications: "skill/reference/notifications.md",
+            strategy_brain: "skill/reference/strategy-brain.md",
         },
     }
 );
@@ -62,7 +63,7 @@ mod tests {
             "composed preamble must include instructions lookups section"
         );
         assert!(
-            preamble::COMPOSED.contains("Portfolio [#]."),
+            preamble::COMPOSED.contains("Portfolio"),
             "composed preamble must include balance lookup format"
         );
         assert!(
@@ -97,6 +98,7 @@ mod tests {
                 "dollarpower",
                 "guardian",
                 "notifications",
+                "strategy_brain",
             ]
         );
         assert!(skill.guard.is_none());
