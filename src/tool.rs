@@ -108,6 +108,22 @@ impl WorldMarketsApp {
             .or_else(|| value_u64(ctx.attribute_path(&["platform_account_ref"])))
             .or_else(|| value_u64(ctx.attribute_path(&["handover_account_ref"])))
             .or_else(|| ctx.attribute_u64(&["handover_mandate", "account", "id"]))
+            // Final fallback: a session-persistent account id supplied via the
+            // environment (WORLD_ACCOUNT_ID). Every runtime handover path above
+            // wins over it, so a live handover is never overridden; this only
+            // fills the gap in dev/CLI mode, where the runtime stubs all state
+            // attributes to None and the account id would otherwise have to be
+            // re-supplied by the model on every single tool call.
+            .or_else(Self::account_id_from_env)
+    }
+
+    /// Parse a session-persistent account id from the `WORLD_ACCOUNT_ID`
+    /// environment variable. Mirrors the `WORLD_RPC_URL` / `WORLD_EXCHANGE_ADDRESS`
+    /// override pattern in `client.rs`. Accepts a bare integer or the same
+    /// `world-<id>` prefixed form the handover reference paths accept.
+    fn account_id_from_env() -> Option<u64> {
+        let raw = std::env::var("WORLD_ACCOUNT_ID").ok()?;
+        value_u64(Some(&Value::String(raw)))
     }
 
     fn brief(ctx: &DynToolCallCtx) -> Option<Value> {
@@ -750,6 +766,53 @@ mod tests {
         assert_eq!(value_u64(Some(&json!("42"))), Some(42));
         assert_eq!(value_u64(Some(&json!("world-42"))), Some(42));
         assert_eq!(value_u64(Some(&json!("other-42"))), None);
+    }
+
+    fn ctx_with(attributes: Value) -> DynToolCallCtx {
+        DynToolCallCtx {
+            session_id: "account-id-resolution".to_string(),
+            tool_name: "get_world_account".to_string(),
+            call_id: "account-id-resolution-1".to_string(),
+            state_attributes: attributes.as_object().unwrap().clone(),
+            secrets: Default::default(),
+        }
+    }
+
+    /// (3) A session-persistent `WORLD_ACCOUNT_ID` resolves when the runtime
+    /// stubs all state attributes to None (dev/CLI mode), yet never overrides an
+    /// explicit arg or a live handover attribute. Env-var mutation is process
+    /// global, so the whole precedence ladder is asserted inside one test to keep
+    /// it serial and leak-free.
+    #[test]
+    fn env_account_id_is_last_resort_and_never_overrides_context() {
+        // SAFETY: single-threaded within this test; restored before returning.
+        unsafe { std::env::set_var("WORLD_ACCOUNT_ID", "world-777") };
+
+        // Empty context + no explicit arg → the env fallback fills the gap.
+        let empty = ctx_with(json!({}));
+        assert_eq!(
+            WorldMarketsApp::account_id(&empty, None),
+            Some(777),
+            "env var should resolve when no handover/context account is present"
+        );
+
+        // The prefixed `world-<id>` form parses like the handover paths do.
+        assert_eq!(WorldMarketsApp::account_id_from_env(), Some(777));
+
+        // An explicit tool arg always wins over the env var.
+        assert_eq!(WorldMarketsApp::account_id(&empty, Some(42)), Some(42));
+
+        // A live handover attribute always wins over the env var.
+        let handover = ctx_with(json!({ "world": { "account_id": 1234 } }));
+        assert_eq!(
+            WorldMarketsApp::account_id(&handover, None),
+            Some(1234),
+            "a real handover account must never be overridden by the env fallback"
+        );
+
+        // Unset → no phantom account; resolution fails closed as before.
+        unsafe { std::env::remove_var("WORLD_ACCOUNT_ID") };
+        assert_eq!(WorldMarketsApp::account_id(&empty, None), None);
     }
 
     #[test]
