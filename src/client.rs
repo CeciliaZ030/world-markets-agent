@@ -387,6 +387,10 @@ impl WorldClient {
         })
     }
 
+    fn dev_owner_read_enabled() -> bool {
+        std::env::var("WORLD_ACCOUNT_ID").is_ok()
+    }
+
     pub(crate) fn resolve_account(
         &self,
         account_id: Option<u64>,
@@ -430,27 +434,35 @@ impl WorldClient {
             ));
         }
 
-        let actor = actor.or(owner_wallet).ok_or_else(|| {
-            "[world-markets] no acting wallet is bound; connect the owner wallet or use an active handover"
-                .to_string()
-        })?;
-        let (authorized, authorization) = if actor == owner {
-            (true, "owner")
+        let actor = actor.or(owner_wallet);
+        let (actor, authorization) = if let Some(actor) = actor {
+            let (authorized, authorization) = if actor == owner {
+                (true, "owner")
+            } else {
+                let traders = self.traders_for(id)?;
+                (traders.contains(&actor), "delegated_trader")
+            };
+            if !authorized {
+                return Err(format!(
+                    "[world-markets] actor {actor:#x} is neither the owner {owner:#x} nor a permitted trader for account {id}; the grant may be missing or revoked"
+                ));
+            }
+            (actor, authorization.to_string())
+        } else if account_id.is_some() && Self::dev_owner_read_enabled() {
+            // aomi-run stubs evm-core; WORLD_ACCOUNT_ID scopes read-only dev lookups.
+            (owner, "dev_owner_read".to_string())
         } else {
-            let traders = self.traders_for(id)?;
-            (traders.contains(&actor), "delegated_trader")
+            return Err(
+                "[world-markets] no acting wallet is bound; connect the owner wallet or use an active handover"
+                    .to_string(),
+            );
         };
-        if !authorized {
-            return Err(format!(
-                "[world-markets] actor {actor:#x} is neither the owner {owner:#x} nor a permitted trader for account {id}; the grant may be missing or revoked"
-            ));
-        }
 
         Ok(AccountAccess {
             account_id: id,
             owner: format!("{owner:#x}"),
             actor: format!("{actor:#x}"),
-            authorization: authorization.to_string(),
+            authorization,
         })
     }
 

@@ -65,10 +65,10 @@ cargo install --git https://github.com/aomi-labs/aomi-sdk \
 ```
 
 Copy `.env.example` → `.env`. Set a provider key (`OPENROUTER_API_KEY`,
-`ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`). For account lookups locally, also set
-`WORLD_ACCOUNT_ID` to a UniFi testnet World account id — the dev runtime returns
-`None` for all handover state attributes (mandate, wallet, brief), so this env var
-is the supported dev workaround until you deploy to staging.
+`ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`). Set `WORLD_ACCOUNT_ID` to your UniFi
+testnet World account id. The dev runtime stubs the wallet (`evm-core` returns no
+actor), so when `WORLD_ACCOUNT_ID` is set the plugin authorizes **read-only**
+account tools against the on-chain owner (`authorization: dev_owner_read`).
 
 **Rebuild after every skill or tool change** — `aomi-run` loads the dylib from
 disk; markdown edits are not picked up until `cargo build`.
