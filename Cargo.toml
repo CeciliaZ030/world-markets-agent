@@ -10,7 +10,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 alloy-primitives = "=0.8.25"
 alloy-sol-types = "=0.8.25"
-aomi-sdk = { git = "https://github.com/aomi-labs/aomi-sdk", rev = "d994f1c7" }
+aomi-sdk = "=4.0.0"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rust_decimal = "1.37"
 schemars = "1.0.4"
