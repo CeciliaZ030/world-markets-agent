@@ -1,6 +1,7 @@
 use aomi_sdk::*;
 
 mod client;
+mod guest;
 mod liquidation_risk;
 mod lookups;
 mod mandate;
@@ -30,6 +31,9 @@ dyn_aomi_app!(
         tool::GetDollarpower,
         tool::SimulateGuardianUnwind,
         tool::CheckNegativeCarry,
+        tool::RenderShare,
+        tool::RenderGuestSurface,
+        tool::ApplyGuestUpgrade,
     ],
     namespaces = ["evm-core"],
     skill = {

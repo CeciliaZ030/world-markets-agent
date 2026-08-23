@@ -70,6 +70,8 @@ fn no_banned_vocabulary() {
         "reference/dollarpower.md",
         "reference/guardian.md",
         "reference/notifications.md",
+        "guest.md",
+        "share.md",
     ] {
         let response_copy: String = skill(file)
             .lines()
@@ -92,21 +94,22 @@ fn no_banned_vocabulary() {
 /// Every figure in a `>` line must be a `[#]` placeholder or live in a fence.
 #[test]
 fn workflows_contain_no_bare_response_numbers() {
-    let prose = prose_only(&skill("workflows.md"));
-    for (i, line) in prose.lines().enumerate() {
-        let trimmed = line.trim();
-        // Only response-skeleton lines (Telegram copy) are subject to the law.
-        if !trimmed.starts_with('>') {
-            continue;
+    for file in ["workflows.md", "guest.md", "share.md"] {
+        let prose = prose_only(&skill(file));
+        for (i, line) in prose.lines().enumerate() {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('>') {
+                continue;
+            }
+            let scrubbed = strip_section_refs(trimmed);
+            let has_digit = scrubbed.chars().any(|c| c.is_ascii_digit());
+            assert!(
+                !has_digit,
+                "bare number in {file} response line {}: {:?}",
+                i + 1,
+                line
+            );
         }
-        let scrubbed = strip_section_refs(trimmed);
-        let has_digit = scrubbed.chars().any(|c| c.is_ascii_digit());
-        assert!(
-            !has_digit,
-            "bare number in workflows.md response line {}: {:?}",
-            i + 1,
-            line
-        );
     }
 }
 

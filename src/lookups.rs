@@ -6,11 +6,11 @@
 use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
-use rust_decimal::prelude::Signed;
 use rust_decimal::RoundingStrategy;
+use rust_decimal::prelude::Signed;
 use serde::Serialize;
 
-use crate::client::{Account, Asset, WorldClient, BASE_TOKEN_ID};
+use crate::client::{Account, Asset, BASE_TOKEN_ID, WorldClient};
 use crate::mandate::parse_decimal;
 
 const QUOTE: &str = "USDT";
@@ -241,16 +241,16 @@ fn position_lookup(
     perps.sort_by(|a, b| {
         let net_a = perp_rank_net.get(&a.symbol).copied().unwrap_or(a.notional);
         let net_b = perp_rank_net.get(&b.symbol).copied().unwrap_or(b.notional);
-        net_b
-            .cmp(&net_a)
-            .then_with(|| a.label.cmp(&b.label))
+        net_b.cmp(&net_a).then_with(|| a.label.cmp(&b.label))
     });
 
     sort_class_rows(&mut holdings);
     sort_class_rows(&mut lent);
     sort_class_rows(&mut borrowed);
 
-    let has_risk_positions = !perps.is_empty() || !lent.is_empty() || !borrowed.is_empty()
+    let has_risk_positions = !perps.is_empty()
+        || !lent.is_empty()
+        || !borrowed.is_empty()
         || holdings.iter().any(|h| h.symbol != QUOTE);
     let state = if !has_risk_positions {
         if cash_total.is_zero() {
@@ -372,8 +372,14 @@ fn compute_netting(holdings: &[ClassRow], perps: &[ClassRow]) -> Vec<NettingLine
     let threshold = Decimal::new(1, 2); // $0.01
     let mut out = Vec::new();
     for symbol in symbols {
-        let spot = spot_by_symbol.get(&symbol).copied().unwrap_or(Decimal::ZERO);
-        let perp = perp_by_symbol.get(&symbol).copied().unwrap_or(Decimal::ZERO);
+        let spot = spot_by_symbol
+            .get(&symbol)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        let perp = perp_by_symbol
+            .get(&symbol)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
         if spot.is_zero() || perp.is_zero() {
             continue;
         }
@@ -474,7 +480,11 @@ fn format_int_commas(int_part: &str) -> String {
     let negative = int_part.starts_with('-');
     let digits: String = int_part.chars().filter(|c| c.is_ascii_digit()).collect();
     if digits.is_empty() {
-        return if negative { "-0".to_string() } else { "0".to_string() };
+        return if negative {
+            "-0".to_string()
+        } else {
+            "0".to_string()
+        };
     }
     let mut groups: Vec<&str> = Vec::new();
     let chars: Vec<char> = digits.chars().collect();

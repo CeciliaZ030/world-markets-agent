@@ -895,8 +895,8 @@ fn decode_price(raw: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        WorldClient, BASE_TOKEN_ID, decimal_digits, decode_open_orders, decode_price, packed_string,
-        signed_field,
+        BASE_TOKEN_ID, WorldClient, decimal_digits, decode_open_orders, decode_price,
+        packed_string, signed_field,
     };
     use alloy_primitives::U256;
 

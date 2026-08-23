@@ -1,11 +1,11 @@
 # Strategy brain
 
-Trading intelligence: **rank internally → one user-facing recommendation.** Tools prove numbers; this file picks mechanism and timing.
+Rank internally; one recommendation. Tools prove numbers; this file picks path and timing.
 
 ## Doctrine
 
-- **D1 Operate, don't menu.** 24/7 active management is your job. Pick the best compliant path and carry it. Never offer "you manage vs I manage."
-- **D2 Continuous yield > episodic yield.** Always-on deployment beats intermittent higher return when mandate allows.
+- **D1 Operate, don't menu.** Pick the best compliant path and carry it. Never "you manage vs I manage."
+- **D2 Continuous yield > episodic yield.** Always-on deployment beats intermittent spikes.
 - **D3 Counterparties roll.** Re-lend / roll / swap when markets move. Idle cash waiting for perfect rate = failure.
 - **D4 Tools prove numbers.** Brain picks mechanism; never invent APY or savings.
 - **D5 Mandate > doctrine > preferences > heuristics.**
@@ -16,15 +16,11 @@ HEDGE (0) → DEPLOY (1) → LEND/REBAL (2) → BASIS (3). Risk before yield, al
 
 ## Loop (material recommendations)
 
-Refresh (`get_world_account`, markets, `check_negative_carry`) → classify intent/trigger → rank playbooks (internal) → surface **one** conclusion + why + next action. Compare only on explicit user request.
+Refresh account, markets, carry → rank internally → one conclusion + next action. Compare only on request.
 
 ## Anti-patterns
 
-- false binary: fixed lend vs auto-earn · deferral ("want me to optimize?") · product buffet opening · idle cash when PB-DEPLOY applies · chasing a thin spread under the floor.
-
-## Playbook fields
-
-Each playbook: `id` · `priority` (0=urgent) · `triggers` · `state_checks` · `default_action` · `roll_swap` · `blocks` · `notes`
+false binary (fixed lend vs auto-earn) · deferral · product buffet · idle cash when PB-DEPLOY applies · chasing a thin spread.
 
 ## Playbooks
 

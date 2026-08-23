@@ -65,17 +65,46 @@ pub(crate) struct Transition {
     pub(crate) before: String,
     pub(crate) after: String,
     pub(crate) unit: String,
-    /// True when nothing changed; lets copy say "unchanged" instead of "X → X".
+    /// True when nothing changed; the message layer must suppress this line (F4a).
     pub(crate) unchanged: bool,
+    /// Direction word from the reporting layer — never inferred from raw numbers in copy.
+    /// RAPV risk: `safer` / `less safe`. Other fields: `rises` / `falls` / `unchanged`.
+    pub(crate) direction: String,
 }
 
 impl Transition {
-    fn new(before: Decimal, after: Decimal, unit: impl Into<String>) -> Self {
+    fn new(before: Decimal, after: Decimal, unit: impl Into<String>, field: &str) -> Self {
+        let unchanged = before == after;
+        let direction = direction_word(before, after, field);
         Self {
             before: before.normalize().to_string(),
             after: after.normalize().to_string(),
             unit: unit.into(),
-            unchanged: before == after,
+            unchanged,
+            direction,
+        }
+    }
+}
+
+fn direction_word(before: Decimal, after: Decimal, field: &str) -> String {
+    if before == after {
+        return "unchanged".to_string();
+    }
+    let rises = after > before;
+    match field {
+        "risk" => {
+            if rises {
+                "safer".to_string()
+            } else {
+                "less safe".to_string()
+            }
+        }
+        _ => {
+            if rises {
+                "rises".to_string()
+            } else {
+                "falls".to_string()
+            }
         }
     }
 }
@@ -205,6 +234,40 @@ pub(crate) struct CarryState {
     pub(crate) plan_executed: bool,
 }
 
+/// Recommended first deposit + the honest reason it travels with (owner, round 3).
+/// A recommendation, not a gate. The message layer never hardcodes the amount.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct RecommendedDeposit {
+    pub(crate) amount: Figure,
+    pub(crate) rationale: String,
+}
+
+/// Canonical demo-book snapshot. Every showcase / drill figure is a field here.
+/// The renderer interpolates; it never invents a number.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct DemoBook {
+    pub(crate) committed: Figure,
+    pub(crate) borrowed: Figure,
+    pub(crate) spot: Figure,
+    pub(crate) short: Figure,
+    pub(crate) borrow_apr: Figure,
+    pub(crate) daily_carry_net: Figure,
+    pub(crate) worst_week_daily: Figure,
+    pub(crate) negative_carry_close_days: Figure,
+    pub(crate) dollarpower: Dollarpower,
+    pub(crate) drill_move: Figure,
+    pub(crate) drill_step1_label: String,
+    pub(crate) drill_step1_freed: Figure,
+    pub(crate) drill_step1_cost: Figure,
+    pub(crate) drill_step2_label: String,
+    pub(crate) drill_step2_repay: Figure,
+    pub(crate) drill_step2_cost: Figure,
+    pub(crate) drill_total_cost: Figure,
+    pub(crate) drill_seconds: Figure,
+    /// True when figures came from live market tools on the demo book.
+    pub(crate) rates_live: bool,
+}
+
 /// The deterministic reporting service. The message layer reads numbers from
 /// here; it never derives them itself.
 pub(crate) trait Reporting {
@@ -222,6 +285,12 @@ pub(crate) trait Reporting {
         emergency_slippage_reachable: bool,
     ) -> UnwindPlan;
     fn carry_state(&self, position_id: &str) -> CarryState;
+    /// Recommended first deposit for guest → funded conversion. Never a platform
+    /// minimum. The renderer interpolates this; the model never types it.
+    fn recommended_first_deposit(&self) -> RecommendedDeposit;
+    /// Canonical illustrative book the guest showcase and fire drill run against.
+    /// Production must populate this from live tools; the fixture is a stand-in.
+    fn demo_book(&self) -> Result<DemoBook, String>;
 }
 
 /// Inputs are structs (not bare scalars) so the engine-wiring step can populate
@@ -364,18 +433,25 @@ pub(crate) struct FixtureReporting;
 impl Reporting for FixtureReporting {
     fn account_effect(&self, input: &AccountEffectInput) -> AccountEffect {
         AccountEffect {
-            expected_net_yield: Transition::new(input.yield_before, input.yield_after, "%"),
+            expected_net_yield: Transition::new(
+                input.yield_before,
+                input.yield_after,
+                "%",
+                "yield",
+            ),
             directional_exposure: Transition::new(
                 input.exposure_before,
                 input.exposure_after,
                 input.quote.clone(),
+                "exposure",
             ),
             available_to_deploy: Transition::new(
                 input.available_before,
                 input.available_after,
                 input.quote.clone(),
+                "available",
             ),
-            risk: Transition::new(input.risk_before, input.risk_after, "RAPV"),
+            risk: Transition::new(input.risk_before, input.risk_after, "RAPV", "risk"),
             estimated_cost: Figure::decimal(input.estimated_cost, input.quote.clone(), true),
             baseline: input.baseline.clone(),
         }
@@ -452,6 +528,102 @@ impl Reporting for FixtureReporting {
             plan_executed: false,
         }
     }
+
+    fn recommended_first_deposit(&self) -> RecommendedDeposit {
+        RecommendedDeposit {
+            amount: Figure::estimate("20", "USDT"),
+            rationale: "clears transaction minimums".to_string(),
+        }
+    }
+
+    fn demo_book(&self) -> Result<DemoBook, String> {
+        Ok(fixture_demo_book(false))
+    }
+}
+
+/// Canonical demo-book shape. `zero_edge` forces every carry/cost delta to 0 so
+/// null-result copy can be tested without inventing a gain.
+pub(crate) fn fixture_demo_book(zero_edge: bool) -> DemoBook {
+    let z = |nonzero: &str, unit: &str| {
+        if zero_edge {
+            Figure::estimate("0", unit)
+        } else {
+            Figure::estimate(nonzero, unit)
+        }
+    };
+    DemoBook {
+        committed: Figure::estimate("100", "USDT"),
+        borrowed: Figure::estimate("900", "USDT"),
+        spot: Figure::estimate("1000", "USDT"),
+        short: Figure::estimate("1000", "USDT"),
+        borrow_apr: Figure::estimate("5.4", "%"),
+        daily_carry_net: z("2.10", "USDT"),
+        worst_week_daily: z("-4.80", "USDT"),
+        negative_carry_close_days: Figure::estimate("3", "days"),
+        dollarpower: Dollarpower {
+            ratio: Figure::estimate("9.8", "×"),
+            committed: Figure::estimate("100", "USDT"),
+            effective: Figure::estimate("1000", "USDT"),
+        },
+        drill_move: Figure::estimate("-20", "%"),
+        drill_step1_label: "Close the short".to_string(),
+        drill_step1_freed: z("612", "USDT"),
+        drill_step1_cost: z("1.40", "USDT"),
+        drill_step2_label: "Repay the loan".to_string(),
+        drill_step2_repay: Figure::estimate("900", "USDT"),
+        drill_step2_cost: z("0.90", "USDT"),
+        drill_total_cost: z("2.30", "USDT"),
+        drill_seconds: Figure::estimate("40", "s"),
+        rates_live: false,
+    }
+}
+
+/// Reporting stand-in that returns a zero-edge demo book (null-result tests).
+#[allow(dead_code)]
+#[derive(Clone, Default)]
+pub(crate) struct ZeroEdgeReporting;
+
+impl Reporting for ZeroEdgeReporting {
+    fn account_effect(&self, input: &AccountEffectInput) -> AccountEffect {
+        FixtureReporting.account_effect(input)
+    }
+    fn resize_solution(&self, input: &ResizeInput) -> ResizeSolution {
+        FixtureReporting.resize_solution(input)
+    }
+    fn exit_cost(&self, position_id: &str) -> ExitCost {
+        FixtureReporting.exit_cost(position_id)
+    }
+    fn slice_plan(&self, input: &SliceInput) -> SlicePlan {
+        FixtureReporting.slice_plan(input)
+    }
+    fn dollarpower(&self, portfolio_id: &str) -> Dollarpower {
+        FixtureReporting.dollarpower(portfolio_id)
+    }
+    fn guardian_unwind(
+        &self,
+        candidates: &[UnwindCandidate],
+        current_score: Decimal,
+        recovery_target: Decimal,
+        preference: GuardianPreference,
+        emergency_slippage_reachable: bool,
+    ) -> UnwindPlan {
+        FixtureReporting.guardian_unwind(
+            candidates,
+            current_score,
+            recovery_target,
+            preference,
+            emergency_slippage_reachable,
+        )
+    }
+    fn carry_state(&self, position_id: &str) -> CarryState {
+        FixtureReporting.carry_state(position_id)
+    }
+    fn recommended_first_deposit(&self) -> RecommendedDeposit {
+        FixtureReporting.recommended_first_deposit()
+    }
+    fn demo_book(&self) -> Result<DemoBook, String> {
+        Ok(fixture_demo_book(true))
+    }
 }
 
 #[cfg(test)]
@@ -492,6 +664,16 @@ mod tests {
         });
         assert!(plan.null_case);
         assert_eq!(plan.saved.value, "0");
+    }
+
+    #[test]
+    fn transition_direction_for_rapv_risk() {
+        let t = Transition::new(Decimal::new(7400, 0), Decimal::new(6800, 0), "RAPV", "risk");
+        assert_eq!(t.direction, "less safe");
+        assert!(!t.unchanged);
+        let flat = Transition::new(Decimal::ONE, Decimal::ONE, "%", "yield");
+        assert_eq!(flat.direction, "unchanged");
+        assert!(flat.unchanged);
     }
 
     // A "saving" can never be reported as negative.

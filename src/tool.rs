@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::client::{Account, AccountAccess, CHAIN_ID, WorldClient, asset_by_symbol};
+use crate::guest::{self, Funnel, FunnelConfig, GuestStore};
 use crate::mandate::{Mandate, TradeFacts, Verdict, parse_decimal};
 use crate::pnl::PnlLedger;
 use crate::reporting::{
@@ -17,6 +18,7 @@ pub(crate) struct WorldMarketsApp {
     client: WorldClient,
     reporting: FixtureReporting,
     pnl_ledger: PnlLedger,
+    guest_store: GuestStore,
 }
 
 pub(crate) struct ListWorldAssets;
@@ -772,6 +774,81 @@ impl DynAomiTool for CheckNegativeCarry {
     }
 }
 
+pub(crate) struct RenderShare;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct RenderShareArgs {}
+
+impl DynAomiTool for RenderShare {
+    type App = WorldMarketsApp;
+    type Args = RenderShareArgs;
+    const NAME: &'static str = "render_share";
+    const DESCRIPTION: &'static str = "Share card caption + guest deep link. Send `message` verbatim. Never invent a deposit amount. Never executes.";
+
+    fn run(
+        app: &WorldMarketsApp,
+        _args: Self::Args,
+        _ctx: DynToolCallCtx,
+    ) -> Result<Value, String> {
+        let funnel = Funnel::new(&app.reporting, &app.guest_store, FunnelConfig::default());
+        // PNG renderer is a host dependency (see docs/FUTURE-WORK.md).
+        let image_available = std::env::var("WORLD_SHARE_CARD_RENDERER")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let surface = funnel.share(image_available);
+        Ok(guest::to_tool_json(&surface))
+    }
+}
+
+pub(crate) struct RenderGuestSurface;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct RenderGuestSurfaceArgs {
+    /// Guest session id (Telegram identity or g_<token> start payload).
+    pub(crate) guest_id: String,
+    /// Surface name (greeting, showcase, paper, upgrade, …).
+    pub(crate) surface: String,
+}
+
+impl DynAomiTool for RenderGuestSurface {
+    type App = WorldMarketsApp;
+    type Args = RenderGuestSurfaceArgs;
+    const NAME: &'static str = "render_guest_surface";
+    const DESCRIPTION: &'static str = "Guest/paper message. Send `message` verbatim. Never invent numbers. Never a policy verdict. Never executes.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, _ctx: DynToolCallCtx) -> Result<Value, String> {
+        let guest_id =
+            guest::guest_id_from_start(&args.guest_id).unwrap_or_else(|| args.guest_id.clone());
+        let funnel = Funnel::new(&app.reporting, &app.guest_store, FunnelConfig::default());
+        let surface = funnel.render(&guest_id, &args.surface)?;
+        Ok(guest::to_tool_json(&surface))
+    }
+}
+
+pub(crate) struct ApplyGuestUpgrade;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct ApplyGuestUpgradeArgs {
+    /// Guest session id after grant-key on world.inc.
+    pub(crate) guest_id: String,
+}
+
+impl DynAomiTool for ApplyGuestUpgrade {
+    type App = WorldMarketsApp;
+    type Args = ApplyGuestUpgradeArgs;
+    const NAME: &'static str = "apply_guest_upgrade";
+    const DESCRIPTION: &'static str =
+        "In-place upgrade after grant-key; freeze paper read-only. Once. Never executes.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, _ctx: DynToolCallCtx) -> Result<Value, String> {
+        let guest_id =
+            guest::guest_id_from_start(&args.guest_id).unwrap_or_else(|| args.guest_id.clone());
+        let funnel = Funnel::new(&app.reporting, &app.guest_store, FunnelConfig::default());
+        let surface = funnel.render(&guest_id, "upgrade")?;
+        Ok(guest::to_tool_json(&surface))
+    }
+}
+
 fn value_u64(value: Option<&Value>) -> Option<u64> {
     value.and_then(|value| {
         value.as_u64().or_else(|| {
@@ -988,6 +1065,12 @@ mod tests {
             effect["account_effect"]["directional_exposure"]["unchanged"],
             true
         );
+        assert_eq!(
+            effect["account_effect"]["expected_net_yield"]["unchanged"],
+            false
+        );
+        assert_eq!(effect["account_effect"]["risk"]["direction"], "less safe");
+        assert_eq!(effect["account_effect"]["risk"]["unchanged"], false);
 
         let dp = GetDollarpower::run(
             &app,

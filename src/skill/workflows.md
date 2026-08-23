@@ -225,3 +225,8 @@ Exit previews use §6.3 with the Exit field omitted (F4b). Preview exit / Close 
 ## Place, cancel, deposit, or withdraw
 
 This release cannot sign, stage, submit, or cancel. Say the action is out of scope, then offer exactly one live alternative. Never describe a preview as placed, approved, filled, cancelled, or settled.
+
+## 6.18 Guest / share
+
+No account → `render_guest_surface`. `share` → `render_share`. Paste verbatim. No invented numbers, policy verdict, or referral code.
+

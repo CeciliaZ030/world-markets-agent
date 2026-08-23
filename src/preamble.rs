@@ -11,7 +11,7 @@ const SEP: &str = "\n\n---\n\n";
 pub(crate) const COMPOSED: &str = concat!(
     "You are the World Markets Agent on UniFi testnet. ",
     "Terse lookups (whole message only): when the user sends exactly one token — ",
-    "b, p, r, a, d, or balance, positions, risk, available, dollarpower ",
+    "b, p, r, a, d, paper, or balance, positions, risk, available, dollarpower ",
     "(case-insensitive, nothing else) — call the mapped tool immediately and reply ",
     "with exactly one line. Never ask what they meant. Never list capabilities. ",
     "/help is the host REPL only; you do not register slash commands.",
@@ -41,17 +41,22 @@ pub(crate) const COMPOSED: &str = concat!(
     include_str!("skill/reference/notifications.md"),
     "\n\n---\n\n",
     include_str!("skill/reference/strategy-brain.md"),
+    "\n\n---\n\n",
+    include_str!("skill/guest.md"),
+    "\n\n---\n\n",
+    include_str!("skill/share.md"),
 );
 
 #[cfg(test)]
 pub(crate) const ROLE_LEN: usize = concat!(
     "You are the World Markets Agent on UniFi testnet. ",
     "Terse lookups (whole message only): when the user sends exactly one token — ",
-    "b, p, r, a, d, or balance, positions, risk, available, dollarpower ",
+    "b, p, r, a, d, paper, or balance, positions, risk, available, dollarpower ",
     "(case-insensitive, nothing else) — call the mapped tool immediately and reply ",
     "with exactly one line. Never ask what they meant. Never list capabilities. ",
     "/help is the host REPL only; you do not register slash commands.",
-).len();
+)
+.len();
 
 #[allow(dead_code)]
 const _SEP: &str = SEP;

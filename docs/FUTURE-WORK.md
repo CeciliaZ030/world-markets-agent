@@ -56,6 +56,30 @@ The plugin would call this service from `get_world_account` (or a dedicated tool
 
 ---
 
+## Guest referral, paper book, and deposit funnel
+
+### Current state
+
+The plugin owns copy and numbers: `render_share`, `render_guest_surface`, and `apply_guest_upgrade` return a fully filled `message` + `controls`. The model pastes them verbatim. Paper sessions persist as JSON (same interim pattern as the PnL ledger: `WORLD_GUEST_DIR`, else XDG). Showcase/drill figures currently come from `FixtureReporting::demo_book` (and `ZeroEdgeReporting` for null-result tests). Share images are off unless `WORLD_SHARE_CARD_RENDERER=1`, which still does not produce a PNG — it only flips the status field.
+
+Door order (`WORLD_FUNNEL_DOOR_ORDER`) and conversion timing (`WORLD_FUNNEL_CONVERSION_TIMING`) are switchable. Defaults: basis-first, day-N window of 3, paper start `$100`, recommended first deposit `$20` / "clears transaction minimums".
+
+### Missing host / product dependencies (do not fake these)
+
+- **TODO:** Telegram `?start=g_<token>` routing. The Aomi host must deliver the start payload (or chat identity) into `render_guest_surface.guest_id`. Aggregate funnel attribution only — no referrer on any user-visible surface.
+- **TODO:** 1200×1200 share-card PNG renderer (house style: `#0a0a0c`, IBM Plex Sans, JetBrains Mono, accent `#b388ff`, tabular figures, QR = guest deep link). Until it exists, the tool returns the link-only fallback.
+- **TODO:** Canonical live demo book (`WORLD_DEMO_ACCOUNT_ID` or equivalent) so showcase and fire drill run the real tools at live rates. Fixture figures are a stand-in; if live tools fail, render `demo_unavailable` — never fabricate.
+- **TODO:** Guest session persistence in the Aomi host store. File JSON is interim, same as PnL.
+- **TODO:** Inline keyboards from structured `controls` (label + action). Keep-looking must be send-nothing, not a follow-up.
+- **TODO:** `upgrade_event` from world.inc grant-key completion + `tg_chat` handoff, calling `apply_guest_upgrade` exactly once in the existing thread.
+- **TODO:** world.inc `/?from=guest` first-deposit step (web team). Deposit mechanics (assets, gas, true minimums) are unverified at spec time; copy names a recommendation, not a gate.
+
+### When to revisit
+
+When Telegram start-payload routing, the share-card renderer, or the live demo-book account land. Do not ship unlabeled fixture rates as live.
+
+---
+
 ## Template for new entries
 
 ```markdown

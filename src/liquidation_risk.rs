@@ -13,7 +13,7 @@ use rust_decimal::prelude::FromPrimitive;
 use serde::Serialize;
 
 use crate::client::{
-    decimal_digits, Account, Asset, Balance, PerpetualPosition, WorldClient, BASE_TOKEN_ID,
+    Account, Asset, BASE_TOKEN_ID, Balance, PerpetualPosition, WorldClient, decimal_digits,
 };
 use crate::mandate::parse_decimal;
 const LEND_DURATION_DAYS: u32 = 10;
