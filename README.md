@@ -54,29 +54,31 @@ cargo build --release
 
 ## Interactive sanity (aomi-run)
 
-The Aomi runtime — not this plugin — owns the Telegram transport, edited-message
-live leg-state, proactive pushes, the Sunday-digest schedule, and the
-simulation-first signing pipeline. This plugin ships only the skill sections (the
-copy + behavioral contract the model follows) and the deterministic tools that
-compute every number a message interpolates. To chat with it locally:
+[`aomi-run`](https://aomi.dev/docs/build/toolchain/aomi-run) is the local dev
+runtime: it loads this plugin, calls a real LLM, and shows which tools the model
+selects. It is **not** the hosted Telegram backend.
 
 ```sh
-cargo build
+cargo build   # rebuild after every skill or tool change
 aomi-run target/debug/libworld_markets.dylib \
   --env-file .env --provider openrouter
 ```
 
-The dev runtime stubs the `evm-core` namespace and returns `None` for all state
-attributes, so the `handover_mandate` and account context are absent locally.
-World tools will ask for an account ID or fail closed when they cannot prove the
-account or mandate. Exercise the copy and tool selection with prompts like:
+On Linux use `libworld_markets.so`. `/help` inside the REPL lists only host
+commands (`/quit`, `/reset`, …) — not agent lookup tokens. Terse lookups (`b`,
+`p`, `r`, …) are plain messages, not slash commands.
 
-- "What can't you do?" → the §6.1 incapacity message (no numbers).
-- "Can I buy 1 WETH perp?" → the model calls the World policy tools; without
-  account context it asks for an account ID or fails closed, never fabricating
-  a verdict.
-- "How am I doing?" → the model calls `get_world_account` / `get_world_pnl` /
-  `get_dollarpower`; every figure it states must appear in those tool results.
+Set `WORLD_ACCOUNT_ID` in `.env` so account lookups work locally (see
+[README-AOMI.md](README-AOMI.md) §3). The dev runtime stubs `evm-core` and
+returns `None` for all handover state attributes per the
+[aomi-run docs](https://aomi.dev/docs/build/toolchain/aomi-run#what-the-dev-runtime-stubs).
+
+Smoke prompts:
+
+- `b` → one line: `Portfolio [#].` (calls `get_world_account`)
+- "What can't you do?" → §6.1 incapacity message (no numbers)
+- "How am I doing?" → multi-line health card via `get_world_account` /
+  `get_world_pnl` / `get_dollarpower`
 
 PnL persistence (until Aomi host storage is agreed): realized and closed-position
 figures are written under `WORLD_PNL_DIR`, else
@@ -87,9 +89,8 @@ release remains intentionally non-executable.
 
 ## Deploy
 
-The complete collaborator flow, including the one-time organization-repository
-import, is in [README-AOMI.md](README-AOMI.md). After an owner/admin connects the
-Project in Aomi Build, install the current CLI and log in to staging:
+The complete collaborator flow is in [README-AOMI.md](README-AOMI.md). After an
+owner/admin connects the Project in Aomi Build:
 
 ```sh
 cargo install --git https://github.com/aomi-labs/aomi-sdk \
@@ -100,7 +101,7 @@ aomi-build login \
 ```
 
 After each code update, validate, commit, and push the exact revision that
-should run. Then let the full lifecycle deploy, activate, and verify it:
+should run:
 
 ```sh
 cargo test

@@ -52,28 +52,62 @@ cargo test -- --ignored --nocapture
 
 ## 3. Exercise the plugin locally
 
-Choose one provider and export its key in your shell. `aomi-run` recognizes
-`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `OPENROUTER_API_KEY`. Never commit a
-key or put one in a command example.
+[`aomi-run`](https://aomi.dev/docs/build/toolchain/aomi-run) loads the compiled
+plugin, stubs host namespaces, and opens a REPL connected to a real LLM. It does
+not require a backend or deployment. Official flags: `--provider`, `--model`,
+`--prompt` (one shot, no REPL), `--env-file`, `--max-turns`, `--verbose`.
 
-On macOS:
+Install (once):
+
+```sh
+cargo install --git https://github.com/aomi-labs/aomi-sdk \
+  --features cli,dev-runtime aomi-sdk
+```
+
+Copy `.env.example` → `.env`. Set a provider key (`OPENROUTER_API_KEY`,
+`ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`). For account lookups locally, also set
+`WORLD_ACCOUNT_ID` to a UniFi testnet World account id — the dev runtime returns
+`None` for all handover state attributes (mandate, wallet, brief), so this env var
+is the supported dev workaround until you deploy to staging.
+
+**Rebuild after every skill or tool change** — `aomi-run` loads the dylib from
+disk; markdown edits are not picked up until `cargo build`.
+
+```sh
+cargo build
+aomi-run target/debug/libworld_markets.dylib \
+  --env-file .env --provider openrouter
+```
+
+On Linux use `target/debug/libworld_markets.so`. One-shot smoke:
 
 ```sh
 aomi-run target/debug/libworld_markets.dylib \
-  --provider anthropic \
-  --prompt "What can't you do?"
+  --env-file .env --provider openrouter --prompt "b"
 ```
 
-On Linux, use `target/debug/libworld_markets.so`. Omit `--prompt` for an
-interactive chat. If the plugin needs additional non-secret configuration, put
-it in a local ignored dotenv file and add `--env-file .env`.
+### What to expect at startup
 
-A healthy startup identifies `world-markets v0.3.0`, registers 14 World tools,
-and reports `evm-core` as stubbed. The local runtime deliberately has no hosted
-handover state, wallet execution, or persisted account context. A trade prompt
-may therefore ask for a World account ID and must fail closed when it cannot
-prove the account or mandate. Use hosted deployment for real handover and
-account context; do not treat a local stub response as an execution test.
+A healthy boot shows `world-markets v0.3.0`, **15** plugin tools, and
+`evm-core (stubbed)`. Inside the REPL, `/help` lists **host** commands only
+(`/quit`, `/reset`, `/history`, `/help`) — not agent lookup tokens. Terse
+lookups are plain messages:
+
+| message | expected behavior |
+|---|---|
+| `b` | one line · `get_world_account` → `Portfolio [#].` |
+| `p` | one line · top exposures |
+| `r` | one line · liquidation risk score |
+| `a` | one line · available to deploy or explicit refusal |
+| `d` | one line · dollarpower |
+
+The model must **not** ask "what did you mean?" or list capabilities for these.
+
+Without `WORLD_ACCOUNT_ID`, account tools fail closed with a one-line error
+(e.g. "No World account connected") — that is correct dev-runtime behavior.
+
+Trade previews still lack mandate context locally; use hosted deployment for
+real handover. See [what the dev runtime stubs](https://aomi.dev/docs/build/toolchain/aomi-run#what-the-dev-runtime-stubs).
 
 ## 4. One-time Project connection (owner/admin)
 
@@ -164,7 +198,11 @@ result.
 - **Commit is not on any remote**: push the exact `HEAD` you intend to deploy.
 - **SDK mismatch**: keep the exact registry pin required by the backend; run
   `aomi-build sdk check` for the expected version.
-- **Local tool says account context is missing**: expected with `aomi-run` until
-  an account is supplied; hosted handover state is not emulated locally.
+- **Local tool says account context is missing**: expected with `aomi-run` —
+  [state attributes always return `None`](https://aomi.dev/docs/build/toolchain/aomi-run#what-the-dev-runtime-stubs).
+  Set `WORLD_ACCOUNT_ID` in `.env` for account lookups; deploy for mandate/handover.
+- **`b` / `p` / `r` get a capability menu instead of one line**: rebuild the
+  plugin (`cargo build`) and confirm you are loading `target/debug/libworld_markets.dylib`
+  from this repo, not an older build.
 - **Activation is still building**: rerun `aomi-build deploy status`, then
   `aomi-build deploy activate` after release CI is ready.
