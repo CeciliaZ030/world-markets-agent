@@ -89,13 +89,31 @@ impl Verdict {
     }
 }
 
+/// Canonical detail for the mandate-absent family. One string; the message
+/// layer renders it verbatim and does not choose among variants.
+pub(crate) const MANDATE_ABSENT_DETAIL: &str = "No mandate is bound to this account.";
+
+#[allow(dead_code)]
+pub(crate) const MANDATE_ABSENT_RULES: [&str; 4] = [
+    "missing_mandate",
+    "unknown_mandate_key",
+    "invalid_mandate",
+    "unsupported_mandate_version",
+];
+
+#[allow(dead_code)]
+pub(crate) fn is_mandate_absent(rule: &str) -> bool {
+    MANDATE_ABSENT_RULES.contains(&rule)
+}
+
+fn mandate_absent(rule: &'static str) -> Verdict {
+    Verdict::deny(rule, MANDATE_ABSENT_DETAIL)
+}
+
 impl Mandate {
     pub(crate) fn parse(value: Option<&Value>) -> Result<Self, Verdict> {
         let Some(value) = value else {
-            return Err(Verdict::deny(
-                "missing_mandate",
-                "No handover_mandate is bound to this turn.",
-            ));
+            return Err(mandate_absent("missing_mandate"));
         };
         serde_json::from_value(value.clone()).map_err(|error| {
             let detail = error.to_string();
@@ -104,19 +122,13 @@ impl Mandate {
             } else {
                 "invalid_mandate"
             };
-            Verdict::deny(rule, detail)
+            mandate_absent(rule)
         })
     }
 
     pub(crate) fn evaluate(&self, facts: &TradeFacts<'_>) -> Verdict {
         if self.version != 1 {
-            return Verdict::deny(
-                "unsupported_mandate_version",
-                format!(
-                    "Mandate version {} is not supported; expected version 1.",
-                    self.version
-                ),
-            );
+            return mandate_absent("unsupported_mandate_version");
         }
         if self.can_withdraw {
             return Verdict::deny(
@@ -343,6 +355,45 @@ mod tests {
     #[test]
     fn allows_trade_inside_every_limit() {
         assert!(mandate().evaluate(&facts()).is_allow());
+    }
+
+    #[test]
+    fn mandate_absent_family_shares_canonical_detail() {
+        let missing = Mandate::parse(None).unwrap_err();
+        assert_eq!(missing.rule, "missing_mandate");
+        assert_eq!(missing.detail, MANDATE_ABSENT_DETAIL);
+
+        let unknown = Mandate::parse(Some(&json!({
+            "version": 1,
+            "markets": [],
+            "max_position_notional": { "amount": "25000", "quote": "USDT" },
+            "max_leverage": "3",
+            "min_risk_adjusted_portfolio_value": { "amount": "5000", "quote": "USDT" },
+            "halt_if_eligible_for_liquidation": true,
+            "can_withdraw": false,
+            "max_daily_loss": "10"
+        })))
+        .unwrap_err();
+        assert_eq!(unknown.rule, "unknown_mandate_key");
+        assert_eq!(unknown.detail, MANDATE_ABSENT_DETAIL);
+
+        let invalid = Mandate::parse(Some(&json!("nope"))).unwrap_err();
+        assert_eq!(invalid.rule, "invalid_mandate");
+        assert_eq!(invalid.detail, MANDATE_ABSENT_DETAIL);
+
+        let mut mandate = mandate();
+        mandate.version = 2;
+        let version = mandate.evaluate(&facts());
+        assert_eq!(version.rule, "unsupported_mandate_version");
+        assert_eq!(version.detail, MANDATE_ABSENT_DETAIL);
+
+        assert!(
+            !MANDATE_ABSENT_DETAIL.chars().any(|c| c.is_ascii_digit()),
+            "mandate-absent detail must carry zero numbers"
+        );
+        for rule in MANDATE_ABSENT_RULES {
+            assert!(is_mandate_absent(rule), "{rule}");
+        }
     }
 
     #[test]

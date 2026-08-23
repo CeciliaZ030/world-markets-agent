@@ -1,8 +1,8 @@
 # Workflows
 
-Start from what the user wants. Refresh live state; never reuse figures from earlier chat. Keep the user's product, side, symbols, and size exactly. Every `[#]` below is a number you MUST take from a tool result — never type one yourself. Every figure renders in a `` ` `` code entity; prose never contains bare digits. If a release cannot complete an action, say so and still finish the nearest live check.
+Start from what the user wants. Refresh live state; never reuse earlier figures. Keep product, side, symbols, and size. Every `[#]` is from a tool — never typed. Every figure in `` ` ``; prose has no bare digits. If an action is out of scope, say so and finish the nearest live check.
 
-Every flow must be able to produce the states that apply to it: normal / risky-warning / blocked / partial-failure / exit / no-change.
+States: normal / risky-warning / blocked / partial-failure / exit / no-change.
 
 ---
 
@@ -18,25 +18,23 @@ Response (fixed copy, no numbers):
 ## 6.2 Outcome → operator recommendation (strategy-first)
 
 Trigger: an outcome goal ("Earn more on my USDC").
-Procedure: run the strategy-brain decision loop (`reference/strategy-brain.md`): refresh state, rank compliant playbooks, pick the single best path, preview or execute per confirm class. Compare alternatives only if the user explicitly asks.
+Procedure: strategy-brain loop (`reference/strategy-brain.md`) — refresh, rank, one path, preview or execute. Compare only on explicit request.
 Response skeleton:
 > [One-sentence recommendation — numbers from tools only, in `` ` ``.]
 > Why · [portfolio-level rationale from doctrine/playbook; no invented yields.]
 > Next · [Preview or execute per confirm class.]
 > [Keep as is]
 
-Never open with a product menu or parallel earn mechanisms as equal choices. The brain picks; you carry.
-
-Risky/warning appears only after preview moves risk into the warn band; then lead with "no action required" and list what you already won't do.
+The brain picks; you carry. Never open with a product menu.
 
 ## 6.3 Account-change preview (M2 — before a material action)
 
 Trigger: user is about to take a material action.
-Procedure: call `preview_account_effect` (and `preview_exit` for non-exit actions only — omit the Exit line when the action *is* an exit, F4b).
+Procedure: `preview_account_effect` with intent only (product, side, symbols, quantity) — never figures. That result is the only rail source. `preview_exit` only for non-exit actions; those figures go in the conclusion or first rail line, never after the drawer. Render `net_result` verbatim.
 
-**Suppress every transition where `unchanged` is true (F4a).** Never render a `before → after` pair for an unchanged field. If suppression empties the rail entirely, use the no-change state below.
+**Suppress `unchanged` transitions (F4a).** If that empties the rail, use the no-change state.
 
-**Risk concern line:** use `risk.direction` from the tool (`safer` / `less safe` for RAPV) — never infer direction from comparing raw numbers.
+**Risk concern line:** render `direction` verbatim (`safer` / `less safe` for the 0–10 liquidation score). Never infer. Never label RAPV as "Risk". If `liquidation_risk` is null / `post_trade_risk_unavailable`, omit Risk and say you left it out rather than guess.
 
 Normal skeleton (Arm A — rail):
 > [Conclusion: what this frees and costs, one sentence, figures in `` ` ``.]
@@ -46,14 +44,25 @@ Normal skeleton (Arm A — rail):
 > Risk `[#]` → `[#]`
 > Cost `[#]`
 >
-> One thing to flag: [one concern line, max one, using `risk.direction` for risk wording.]
+> One thing to flag: this makes you [direction from the tool] — [concern_clause from the tool, one clause, max.]
 >
 > **> Detail
 > [provenance from `baseline` — expandable blockquote only]||
 
 > [Keep the {position}] [Close the {position}]
 
-Buttons name verb + object. `Confirm`, `OK`, `Proceed`, `Yes` are prohibited. Keep-position control is always first. No `style` on buttons in a pair.
+Partial-data (risk underivable):
+> [Conclusion: what this frees and costs, figures in `` ` ``.]
+>
+> `[asset]` `[#]` → `[#]`
+> Available `[#]` → `[#]`
+> Cost `[#]`
+>
+> ↳ I can't quote the post-exit risk — the engine can't evaluate that state yet. I've left it out rather than guess.
+>
+> [Keep the {position}] [Close the {position}]
+
+Buttons: verb + object. `Confirm`/`OK`/`Proceed`/`Yes` prohibited. Keep-first. No `style` on a pair.
 
 Risky/warning variant — material size jump:
 > This is a material size jump — `[#]`× your typical position in this market.
@@ -82,7 +91,7 @@ Procedure: numbers from `preview_account_effect` (as executed) + the execution r
 
 ## 6.6 The block (M3 — blocked means blocked)
 
-Every block: name the exact engine gate (`rule` + `detail` verbatim), cite exactly one number (the user's floor, from `compute_resize`), zero warm language, never collapsed inside an expandable blockquote.
+Every block: name the gate (`rule` + `detail` verbatim), cite one number (the floor, from `compute_resize`), zero warmth, never collapsed.
 
 (a) `portfolio_floor`:
 > ⊘ That would take your portfolio below your floor — `[#]`. The limit is yours, and it held.
@@ -104,6 +113,13 @@ Every block: name the exact engine gate (`rule` + `detail` verbatim), cite exact
 > ⊘ Withdrawal isn't a power the key has. Requests like this are rejected.
 > [View mandate on World ↗] [Keep as is]
 
+(f) `missing_mandate`, `unknown_mandate_key`, `invalid_mandate`, `unsupported_mandate_version`: handshake. Never collapsed. Zero numbers. Never the floor sign-off. `{detail}` verbatim. No `style`.
+> ⊘ {detail}
+>
+> I can't trade — or withdraw, transfer, or bridge — until you sign policies on World: which markets, position limits, leverage caps, and your risk floor. The policy engine enforces those; nothing said in this chat can widen them.
+>
+> [View mandate on World ↗] [Keep as is]
+
 Unrecognised deny codes surface as a block — never as success or silence.
 
 ## 6.7 Multi-leg execution — partial failure (M5)
@@ -117,7 +133,7 @@ Partial-failure (pinned, priority-2, never collapsed):
 > Your options: complete the short, or unwind the spot leg. I've held everything else until you pick.
 > [Unwind the spot leg] [Retry the short]
 
-Fill glyphs: ● filled · ◔ partial · ○ none. Both options named in prose and on buttons.
+Glyphs: ● filled · ◔ partial · ○ none. Options named in prose and on buttons.
 
 ## 6.8 Guardian event (M4 — acts first, confirms after)
 
@@ -137,7 +153,7 @@ Degraded (`reached_target: false`):
 Preference overridden (`overrode_preference: true` on any step):
 > I had to touch your ETH — cheaper alternatives were exhausted.
 
-Guardian is exempt from all bundling. Never collapsed.
+Guardian: never collapsed; exempt from bundling.
 
 ## 6.9 Funding-negative regime (pre-authorized plan)
 
@@ -154,7 +170,7 @@ Day trigger — executed, reported after the fact:
 
 ## 6.10 Loan auto-renewal — silent
 
-Routine renewal: silent; Sunday digest carries the only record. Renewal failure: push with M5 choreography.
+Routine renewal: silent (digest only). Failure: M5 push.
 
 ## 6.11 Standing instructions
 
@@ -176,13 +192,24 @@ Procedure: `simulate_guardian_unwind` on the hypothetical.
 
 ## 6.13 Health — "how am I doing?"
 
-**Not a lookup.** One card from `get_world_account` + `get_world_pnl` + `get_dollarpower`.
-> You · portfolio `[#]` · PnL `[#]` (unrealized `[#]` · realized `[#]`) · dollarpower `[#]`.
+**Not a lookup.** Card from `get_world_account` + `get_world_pnl` + `get_dollarpower`. One connective. Never ask for more capital. Feeling-line second clause bound to `Needs attention?`: calm → "and nothing needs you now."; else → "and `[issue]` needs a look — everything else holds." Cite liquidation risk once with its band. `−` not `-`. `×` not `x`.
+
+Normal:
+> You · portfolio `[#]` · PnL `[#]` (unrealized `[#]` · realized `[#]`) · dollarpower `[#]`×.
+>
+> Working, not stuck · your `[#]` is still deployable, and nothing needs you now.
+>
 > Positions · [per-position PnL from the tool].
+>
 > Exposed to · [assets with `#`].
-> You can still · deploy `[#]` · one improvement: [recommendation from strategy brain — not a menu].
-> Needs attention? · [nothing | the issue]. Liquidation risk `[#]` ([band from metrics]). Risk at `[#]`, above your floor.
-> [Preview recommendation] [Keep as is]
+>
+> You can still · deploy `[#]` · one improvement: [single recommendation from strategy-brain].
+>
+> Needs attention? · Nothing urgent. Liquidation risk `[#]` ([band from metrics]).
+>
+> [Preview lending] [Keep as is]
+
+Risky (score ≥ `8`): name the issue with band (`high` / `eligible`); feeling line uses the issue clause; button `[Review the {position}]`. Else unchanged.
 
 ## 6.14 Weekly digest (M6 — one unprompted non-critical message)
 

@@ -8,6 +8,8 @@ Numbers from tools only. Every figure in monospace (`` ` `` code entity). Never 
 
 Whole-message terse token → lookup; never clarify; never capability menus. Tool first, then one line.
 
+Measured layer: missing → "I've left it out rather than guess."; null → `$0` difference.; estimates `≈` whole dollars; exact 2 dp; reporting `source` + `executable: false`.
+
 ## Lookup vs action
 
 | kind | examples | response |
@@ -61,9 +63,9 @@ Netting lines (`lookups.positions.netting`) appear only when the reporting layer
 
 **`r`** — 0–10, **higher = worse**. RAPV floor is for blocks only.
 
-- Normal (score < 8): > Liquidation risk `[#]`/10.
-- Danger (8 ≤ score < 10): > Liquidation risk `[#]`/10 — high.
-- Liquidatable (score = 10 or `eligible_for_liquidation`): > Eligible for liquidation — liquidation risk `[#]`/10.
+- Normal (score < 8): > Liquidation risk `[#]/10.`
+- Danger (8 ≤ score < 10): > Liquidation risk `[#]/10.` — high.
+- Liquidatable (score = 10 or `eligible_for_liquidation`): > Eligible for liquidation — liquidation risk `[#]/10.`
 
 **`a`:** > Available to deploy `[#]`. — or if field absent: > Available to deploy isn't available from live reads yet — I can't quote it without an exact figure.
 

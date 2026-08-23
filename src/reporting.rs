@@ -68,12 +68,19 @@ pub(crate) struct Transition {
     /// True when nothing changed; the message layer must suppress this line (F4a).
     pub(crate) unchanged: bool,
     /// Direction word from the reporting layer — never inferred from raw numbers in copy.
-    /// RAPV risk: `safer` / `less safe`. Other fields: `rises` / `falls` / `unchanged`.
+    /// `liquidation_risk` (0–10, higher = worse): `safer` / `less safe`.
+    /// `rapv` (engine-internal, higher = safer): `safer` / `less safe`.
+    /// Other fields: `rises` / `falls` / `unchanged`.
     pub(crate) direction: String,
 }
 
 impl Transition {
-    fn new(before: Decimal, after: Decimal, unit: impl Into<String>, field: &str) -> Self {
+    pub(crate) fn new(
+        before: Decimal,
+        after: Decimal,
+        unit: impl Into<String>,
+        field: &str,
+    ) -> Self {
         let unchanged = before == after;
         let direction = direction_word(before, after, field);
         Self {
@@ -86,13 +93,24 @@ impl Transition {
     }
 }
 
-fn direction_word(before: Decimal, after: Decimal, field: &str) -> String {
+/// One polarity mapping per risk field. Do not put RAPV and the 0–10 score
+/// under the same `risk` key — they invert.
+pub(crate) fn direction_word(before: Decimal, after: Decimal, field: &str) -> String {
     if before == after {
         return "unchanged".to_string();
     }
     let rises = after > before;
     match field {
-        "risk" => {
+        // 0–10 liquidation score: higher = worse. A fall is safer.
+        "liquidation_risk" => {
+            if rises {
+                "less safe".to_string()
+            } else {
+                "safer".to_string()
+            }
+        }
+        // RAPV: higher = safer. Engine-internal; never the user-facing Risk line.
+        "rapv" => {
             if rises {
                 "safer".to_string()
             } else {
@@ -110,16 +128,22 @@ fn direction_word(before: Decimal, after: Decimal, field: &str) -> String {
 }
 
 /// §6.3 / §6.5 — the account-change bundle behind a preview or receipt.
+/// User-facing Risk is the 0–10 liquidation score, never RAPV.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct AccountEffect {
-    pub(crate) expected_net_yield: Transition,
+    pub(crate) expected_net_yield: Option<Transition>,
     pub(crate) directional_exposure: Transition,
+    pub(crate) exposure_symbol: String,
     pub(crate) available_to_deploy: Transition,
-    /// Risk in the engine's units (RAPV). NOT a 0–10 score until the §11 mapping
-    /// exists. The copy must cite it in engine units.
-    pub(crate) risk: Transition,
-    pub(crate) estimated_cost: Figure,
-    /// The single baseline sentence a counterfactual is measured against.
+    /// 0–10 liquidation score. `None` when post-trade risk cannot be proven.
+    pub(crate) liquidation_risk: Option<Transition>,
+    pub(crate) estimated_cost: Option<Figure>,
+    /// Concern-line direction for the score, verbatim. Absent when risk is omitted.
+    pub(crate) direction: Option<String>,
+    /// One portfolio-level clause. Never invented by the model.
+    pub(crate) concern_clause: String,
+    pub(crate) missing_mark_symbols: Vec<String>,
+    pub(crate) post_trade_risk_unavailable: bool,
     pub(crate) baseline: String,
 }
 
@@ -278,7 +302,7 @@ pub(crate) struct DemoBook {
 /// The deterministic reporting service. The message layer reads numbers from
 /// here; it never derives them itself.
 pub(crate) trait Reporting {
-    fn account_effect(&self, input: &AccountEffectInput) -> AccountEffect;
+    fn account_effect(&self, plan: &EffectPlan) -> AccountEffect;
     fn resize_solution(&self, input: &ResizeInput) -> ResizeSolution;
     fn exit_cost(&self, position_id: &str) -> ExitCost;
     fn slice_plan(&self, input: &SliceInput) -> SlicePlan;
@@ -301,21 +325,63 @@ pub(crate) trait Reporting {
     fn demo_book(&self) -> Result<DemoBook, String>;
 }
 
-/// Inputs are structs (not bare scalars) so the engine-wiring step can populate
-/// them from live reads without changing the tool signatures.
+/// Snapshot + intent evaluation the reporting layer formats. Every figure is
+/// computed in Rust from live state (or a test fixture). The model never
+/// supplies a before/after number.
 #[derive(Debug, Clone)]
-pub(crate) struct AccountEffectInput {
-    pub(crate) yield_before: Decimal,
-    pub(crate) yield_after: Decimal,
+pub(crate) struct EffectPlan {
+    pub(crate) exposure_symbol: String,
     pub(crate) exposure_before: Decimal,
     pub(crate) exposure_after: Decimal,
     pub(crate) available_before: Decimal,
     pub(crate) available_after: Decimal,
-    pub(crate) risk_before: Decimal,
-    pub(crate) risk_after: Decimal,
-    pub(crate) estimated_cost: Decimal,
     pub(crate) quote: String,
+    pub(crate) liquidation_risk_before: Option<Decimal>,
+    pub(crate) liquidation_risk_after: Option<Decimal>,
+    pub(crate) estimated_cost: Option<Decimal>,
+    pub(crate) missing_mark_symbols: Vec<String>,
+    pub(crate) post_trade_risk_unavailable: bool,
+    pub(crate) concern_clause: String,
     pub(crate) baseline: String,
+}
+
+/// Format a derived plan. Yield is omitted until a live oracle exists.
+pub(crate) fn derive_account_effect(plan: &EffectPlan) -> AccountEffect {
+    let exposure = Transition::new(
+        plan.exposure_before,
+        plan.exposure_after,
+        plan.quote.clone(),
+        "exposure",
+    );
+    let available = Transition::new(
+        plan.available_before,
+        plan.available_after,
+        plan.quote.clone(),
+        "available",
+    );
+    let liquidation_risk = match (plan.liquidation_risk_before, plan.liquidation_risk_after) {
+        (Some(before), Some(after)) if !plan.post_trade_risk_unavailable => {
+            Some(Transition::new(before, after, "", "liquidation_risk"))
+        }
+        _ => None,
+    };
+    let direction = liquidation_risk.as_ref().map(|t| t.direction.clone());
+    AccountEffect {
+        expected_net_yield: None,
+        directional_exposure: exposure,
+        exposure_symbol: plan.exposure_symbol.clone(),
+        available_to_deploy: available,
+        liquidation_risk,
+        estimated_cost: plan
+            .estimated_cost
+            .map(|c| Figure::decimal(c, plan.quote.clone(), true)),
+        direction,
+        concern_clause: plan.concern_clause.clone(),
+        missing_mark_symbols: plan.missing_mark_symbols.clone(),
+        post_trade_risk_unavailable: plan.post_trade_risk_unavailable
+            || plan.liquidation_risk_after.is_none(),
+        baseline: plan.baseline.clone(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -439,30 +505,8 @@ pub(crate) fn guardian_cheapest_safe(
 pub(crate) struct FixtureReporting;
 
 impl Reporting for FixtureReporting {
-    fn account_effect(&self, input: &AccountEffectInput) -> AccountEffect {
-        AccountEffect {
-            expected_net_yield: Transition::new(
-                input.yield_before,
-                input.yield_after,
-                "%",
-                "yield",
-            ),
-            directional_exposure: Transition::new(
-                input.exposure_before,
-                input.exposure_after,
-                input.quote.clone(),
-                "exposure",
-            ),
-            available_to_deploy: Transition::new(
-                input.available_before,
-                input.available_after,
-                input.quote.clone(),
-                "available",
-            ),
-            risk: Transition::new(input.risk_before, input.risk_after, "RAPV", "risk"),
-            estimated_cost: Figure::decimal(input.estimated_cost, input.quote.clone(), true),
-            baseline: input.baseline.clone(),
-        }
+    fn account_effect(&self, plan: &EffectPlan) -> AccountEffect {
+        derive_account_effect(plan)
     }
 
     fn resize_solution(&self, input: &ResizeInput) -> ResizeSolution {
@@ -597,8 +641,8 @@ pub(crate) fn fixture_demo_book(zero_edge: bool) -> DemoBook {
 pub(crate) struct ZeroEdgeReporting;
 
 impl Reporting for ZeroEdgeReporting {
-    fn account_effect(&self, input: &AccountEffectInput) -> AccountEffect {
-        FixtureReporting.account_effect(input)
+    fn account_effect(&self, plan: &EffectPlan) -> AccountEffect {
+        FixtureReporting.account_effect(plan)
     }
     fn resize_solution(&self, input: &ResizeInput) -> ResizeSolution {
         FixtureReporting.resize_solution(input)
@@ -680,13 +724,86 @@ mod tests {
     }
 
     #[test]
-    fn transition_direction_for_rapv_risk() {
-        let t = Transition::new(Decimal::new(7400, 0), Decimal::new(6800, 0), "RAPV", "risk");
-        assert_eq!(t.direction, "less safe");
-        assert!(!t.unchanged);
+    fn transition_direction_for_rapv_is_higher_safer() {
+        let fall = Transition::new(Decimal::new(7400, 0), Decimal::new(6800, 0), "RAPV", "rapv");
+        assert_eq!(fall.direction, "less safe");
+        let rise = Transition::new(Decimal::new(6800, 0), Decimal::new(7400, 0), "RAPV", "rapv");
+        assert_eq!(rise.direction, "safer");
         let flat = Transition::new(Decimal::ONE, Decimal::ONE, "%", "yield");
         assert_eq!(flat.direction, "unchanged");
         assert!(flat.unchanged);
+    }
+
+    #[test]
+    fn transition_direction_for_liquidation_score_is_lower_safer() {
+        let fall = Transition::new(
+            Decimal::new(38, 1),
+            Decimal::new(21, 1),
+            "",
+            "liquidation_risk",
+        );
+        assert_eq!(fall.direction, "safer");
+        assert_eq!(fall.before, "3.8");
+        assert_eq!(fall.after, "2.1");
+        let rise = Transition::new(
+            Decimal::new(21, 1),
+            Decimal::new(38, 1),
+            "",
+            "liquidation_risk",
+        );
+        assert_eq!(rise.direction, "less safe");
+    }
+
+    fn close_short_plan(risk_after: Option<Decimal>) -> EffectPlan {
+        EffectPlan {
+            exposure_symbol: "WBTC".to_string(),
+            exposure_before: Decimal::new(270_785, 2),
+            exposure_after: Decimal::ZERO,
+            available_before: Decimal::new(49_115, 2),
+            available_after: Decimal::new(330_891, 2),
+            quote: "USDT".to_string(),
+            liquidation_risk_before: Some(Decimal::new(38, 1)),
+            liquidation_risk_after: risk_after,
+            estimated_cost: Some(Decimal::new(840, 2)),
+            missing_mark_symbols: Vec::new(),
+            post_trade_risk_unavailable: risk_after.is_none(),
+            concern_clause: "the open WBTC short was your main directional exposure".to_string(),
+            baseline: "live account snapshot versus this intent".to_string(),
+        }
+    }
+
+    #[test]
+    fn derive_rail_matches_snapshot_plus_evaluation() {
+        let effect = derive_account_effect(&close_short_plan(Some(Decimal::new(21, 1))));
+        assert_eq!(effect.exposure_symbol, "WBTC");
+        assert_eq!(effect.directional_exposure.before, "2707.85");
+        assert_eq!(effect.directional_exposure.after, "0");
+        assert_eq!(effect.available_to_deploy.before, "491.15");
+        assert_eq!(effect.available_to_deploy.after, "3308.91");
+        let risk = effect.liquidation_risk.expect("score present");
+        assert_eq!(risk.before, "3.8");
+        assert_eq!(risk.after, "2.1");
+        assert_eq!(risk.direction, "safer");
+        assert_eq!(effect.direction.as_deref(), Some("safer"));
+        assert_eq!(
+            effect.estimated_cost.as_ref().map(|f| f.value.as_str()),
+            Some("8.4")
+        );
+        assert!(!effect.post_trade_risk_unavailable);
+        assert!(effect.expected_net_yield.is_none());
+    }
+
+    #[test]
+    fn derive_omits_risk_when_post_trade_unavailable() {
+        let effect = derive_account_effect(&close_short_plan(None));
+        assert!(effect.liquidation_risk.is_none());
+        assert!(effect.direction.is_none());
+        assert!(effect.post_trade_risk_unavailable);
+        assert_eq!(effect.directional_exposure.after, "0");
+        assert_eq!(
+            effect.estimated_cost.as_ref().map(|f| f.value.as_str()),
+            Some("8.4")
+        );
     }
 
     // A "saving" can never be reported as negative.

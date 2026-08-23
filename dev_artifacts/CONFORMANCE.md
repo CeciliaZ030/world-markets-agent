@@ -47,7 +47,7 @@ they are not unit-testable in this repo.
 
 | Contract | Status |
 |---|---|
-| **Risk-score mapping** (0–10 vs RAPV floor) | `liquidation_risk` in `get_world_account` → `metrics` is computed by `src/liquidation_risk.rs` using the same `Portfolio.calculateLiquidationRisk` algorithm as the Composite frontend (`@composite/sdk`). Mandate floors remain in RAPV units via `compute_resize`. |
+| **Risk-score mapping** (0–10 vs RAPV floor) | User-facing "Risk" is `metrics.liquidation_risk` (0–10, higher = worse) from `src/liquidation_risk.rs` (`Portfolio.calculateLiquidationRisk`, same as Composite `@composite/sdk`). RAPV is engine-internal and appears only as the `$[floor]` in blocks via `compute_resize`. `direction_word` maps the score with inverted polarity (fall → safer). |
 | **Reporting-service field list** (net carry/day, resize solver, exit-cost at live books, time-to-flat p90, liquidation-path check) | Defined as the `Reporting` trait in `src/reporting.rs`; `FixtureReporting` supplies deterministic values today. Swap the impl for the real service without changing tool signatures. |
 | **Guardian unwind algorithm** (R4, cheapest-safe) | Implemented as `guardian_cheapest_safe` (pure fn) with the five per-candidate terms, greedy Δscore/exit-cost selection, protected veto, worse-residual refusal, ProtectEth override + honest reporting, and the degraded (`reached_target: false`) state. Unit-tested. |
 | **Dollarpower** | Behind `Reporting::dollarpower` / `get_dollarpower` tool; ratio + committed + effective, always dollar-translatable. Never derived by the model. |

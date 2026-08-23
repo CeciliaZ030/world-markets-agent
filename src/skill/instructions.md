@@ -43,7 +43,7 @@ Tool failure → one-line blocker, still no menu.
 - Spine glyphs (◆ ◇ ◈ ↳ ⊘) live in prose lines only, never inside mono blocks.
 - Use − × → ≈ · — – … (not ASCII equivalents) per the message-design spec.
 - Suppress any `before → after` line where the tool reports `unchanged: true` (F4a).
-- Risk direction words come from `risk.direction` on the tool — never infer from raw RAPV numbers (higher RAPV = safer).
+- Risk direction words come from `direction` on `preview_account_effect` (`safer` / `less safe` for the 0–10 liquidation score, higher = worse). Never infer from raw numbers. Never call RAPV a "risk score".
 
 ## Strategy & recommendations
 

@@ -2,14 +2,14 @@ use aomi_sdk::schemars::JsonSchema;
 use aomi_sdk::*;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
-use crate::client::{Account, AccountAccess, CHAIN_ID, WorldClient, asset_by_symbol};
+use crate::client::{asset_by_symbol, Account, AccountAccess, WorldClient, CHAIN_ID};
 use crate::guest::{self, Funnel, FunnelConfig, GuestStore};
-use crate::mandate::{Mandate, TradeFacts, Verdict, parse_decimal};
+use crate::mandate::{parse_decimal, Mandate, TradeFacts, Verdict};
 use crate::pnl::PnlLedger;
 use crate::reporting::{
-    AccountEffectInput, FixtureReporting, GuardianPreference, Reporting, ResizeInput, SliceInput,
+    EffectPlan, FixtureReporting, GuardianPreference, Reporting, ResizeInput, SliceInput,
     UnwindCandidate,
 };
 
@@ -218,6 +218,84 @@ impl WorldMarketsApp {
         let actor = ctx.attribute_string(&["domain", "evm", "address"]);
         self.client
             .resolve_account(account_id, owner_wallet.as_deref(), actor.as_deref())
+    }
+
+    fn snapshot_effect_plan(
+        &self,
+        args: PreviewAccountEffectArgs,
+        ctx: &DynToolCallCtx,
+    ) -> Result<EffectPlan, String> {
+        let product = normalize_effect_product(&args.product)?;
+        let side = args.side.to_ascii_lowercase();
+        if !matches!(side.as_str(), "buy" | "sell") {
+            return Err("[world-markets] side must be buy or sell".to_string());
+        }
+        let quantity = parse_decimal(&args.quantity, "quantity")
+            .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        if quantity <= Decimal::ZERO {
+            return Err("[world-markets] quantity must be greater than zero".to_string());
+        }
+
+        let access = self.access(args.account_id, args.wallet_address.as_deref(), ctx)?;
+        let assets = self.client.assets()?;
+        let account = self.client.account(access.account_id, &assets)?;
+        let block = self.client.block_number()?;
+        let base = asset_by_symbol(&assets, &args.base_symbol)?;
+        let quote = asset_by_symbol(&assets, &args.quote_symbol)?;
+
+        let mut missing_mark_symbols = Vec::new();
+        let mark = match self
+            .client
+            .market(product, base.clone(), Some(quote.clone()))
+        {
+            Ok(market) => parse_decimal(&market.mark_price, "mark_price").ok(),
+            Err(_) => None,
+        };
+        if mark.is_none() {
+            missing_mark_symbols.push(base.symbol.clone());
+        }
+
+        let current_qty =
+            current_position(&account, product, &base.symbol).unwrap_or(Decimal::ZERO);
+        let signed_delta = if side == "buy" { quantity } else { -quantity };
+        let after_qty = current_qty + signed_delta;
+
+        let (exposure_before, exposure_after) = match mark {
+            Some(price) => (current_qty.abs() * price, after_qty.abs() * price),
+            None => (Decimal::ZERO, Decimal::ZERO),
+        };
+
+        let available_before = quote_available(&account, &quote.symbol)?;
+        let available_after = available_before + (exposure_before - exposure_after);
+
+        let metrics =
+            crate::liquidation_risk::compute_metrics(&self.client, &account, &assets, block).ok();
+        let liquidation_risk_before = metrics
+            .as_ref()
+            .and_then(|m| parse_decimal(&m.liquidation_risk, "liquidation_risk").ok());
+
+        // Same path as the mandate: post-trade RAPV is not yet proven, so
+        // after-risk is omitted rather than guessed.
+        let others = other_directional_legs(&account, &base.symbol);
+        let concern_clause = concern_clause(&base.symbol, current_qty, after_qty, &others);
+
+        Ok(EffectPlan {
+            exposure_symbol: base.symbol,
+            exposure_before,
+            exposure_after,
+            available_before,
+            available_after,
+            quote: quote.symbol,
+            liquidation_risk_before,
+            liquidation_risk_after: None,
+            estimated_cost: None,
+            missing_mark_symbols,
+            post_trade_risk_unavailable: true,
+            concern_clause,
+            baseline: format!(
+                "live account snapshot at block {block} versus this intent — derived, not model-typed"
+            ),
+        })
     }
 
     fn trade_preview(&self, args: WorldTradeArgs, ctx: &DynToolCallCtx) -> Result<Value, String> {
@@ -528,55 +606,39 @@ fn report_decimal(value: &str, field: &'static str) -> Result<Decimal, String> {
 
 pub(crate) struct PreviewAccountEffect;
 
+/// Intent-only. Same shape as `WorldTradeArgs` plus lend. No figure fields —
+/// before/after numbers are derived from live state in Rust.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct PreviewAccountEffectArgs {
-    /// Expected net yield before the action, percent, e.g. "4.3".
-    pub(crate) yield_before: String,
-    /// Expected net yield after the action, percent, e.g. "8.1".
-    pub(crate) yield_after: String,
-    /// Directional exposure before, in quote units.
-    pub(crate) exposure_before: String,
-    /// Directional exposure after, in quote units.
-    pub(crate) exposure_after: String,
-    /// Available-to-deploy before, in quote units.
-    pub(crate) available_before: String,
-    /// Available-to-deploy after, in quote units.
-    pub(crate) available_after: String,
-    /// Risk (RAPV, engine units) before.
-    pub(crate) risk_before: String,
-    /// Risk (RAPV, engine units) after.
-    pub(crate) risk_after: String,
-    /// Estimated execution cost, in quote units.
-    pub(crate) estimated_cost: String,
-    /// Quote symbol, e.g. "USDT".
+    /// Product type: spot, perp, or lend.
+    pub(crate) product: String,
+    /// Trade side: buy or sell.
+    pub(crate) side: String,
+    /// Base asset symbol.
+    pub(crate) base_symbol: String,
+    /// Quote asset symbol.
     pub(crate) quote_symbol: String,
-    /// The baseline this counterfactual is measured against, one sentence.
-    pub(crate) baseline: String,
+    /// Human-readable base quantity, such as "0.25".
+    pub(crate) quantity: String,
+    /// Optional World account ID. Handover account context is used when omitted.
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    /// Optional expected owner wallet.
+    #[serde(default)]
+    pub(crate) wallet_address: Option<String>,
 }
 
 impl DynAomiTool for PreviewAccountEffect {
     type App = WorldMarketsApp;
     type Args = PreviewAccountEffectArgs;
     const NAME: &'static str = "preview_account_effect";
-    const DESCRIPTION: &'static str = "Compute the portfolio-level before/after figures (net yield, exposure, available-to-deploy, RAPV risk, estimated cost) for a proposed action's preview or receipt. Numbers only; never executes.";
+    const DESCRIPTION: &'static str = "Snapshot live account state and apply this intent through the same post-trade path the mandate uses. Returns before/after exposure, available-to-deploy, 0–10 liquidation risk (omitted when unprovable), and cost. Pass only the intent — never figures. Never executes.";
 
-    fn run(app: &WorldMarketsApp, args: Self::Args, _ctx: DynToolCallCtx) -> Result<Value, String> {
-        let input = AccountEffectInput {
-            yield_before: report_decimal(&args.yield_before, "yield_before")?,
-            yield_after: report_decimal(&args.yield_after, "yield_after")?,
-            exposure_before: report_decimal(&args.exposure_before, "exposure_before")?,
-            exposure_after: report_decimal(&args.exposure_after, "exposure_after")?,
-            available_before: report_decimal(&args.available_before, "available_before")?,
-            available_after: report_decimal(&args.available_after, "available_after")?,
-            risk_before: report_decimal(&args.risk_before, "risk_before")?,
-            risk_after: report_decimal(&args.risk_after, "risk_after")?,
-            estimated_cost: report_decimal(&args.estimated_cost, "estimated_cost")?,
-            quote: args.quote_symbol,
-            baseline: args.baseline,
-        };
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let plan = app.snapshot_effect_plan(args, &ctx)?;
         Ok(json!({
             "source": "world-markets-reporting",
-            "account_effect": app.reporting.account_effect(&input),
+            "account_effect": app.reporting.account_effect(&plan),
             "executable": false,
         }))
     }
@@ -586,13 +648,6 @@ pub(crate) struct ComputeResize;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct ComputeResizeArgs {
-    /// The user's floor — the ONE number a block cites (RAPV, engine units).
-    pub(crate) floor: String,
-    /// Largest size that clears the floor, in quote units. Omit if none complies.
-    #[serde(default)]
-    pub(crate) largest_compliant_size: Option<String>,
-    /// Quote symbol.
-    pub(crate) quote_symbol: String,
     /// The engine `rule` code that gated the intent, verbatim.
     pub(crate) rule: String,
 }
@@ -601,18 +656,17 @@ impl DynAomiTool for ComputeResize {
     type App = WorldMarketsApp;
     type Args = ComputeResizeArgs;
     const NAME: &'static str = "compute_resize";
-    const DESCRIPTION: &'static str = "For a blocked intent, return the user's floor and the largest compliant size (if any). A block cites exactly one number: the floor. Never executes.";
+    const DESCRIPTION: &'static str = "For a blocked intent, return the user's RAPV floor from the signed mandate. A block cites exactly one number: the floor. Never executes.";
 
-    fn run(app: &WorldMarketsApp, args: Self::Args, _ctx: DynToolCallCtx) -> Result<Value, String> {
-        let largest = args
-            .largest_compliant_size
-            .as_deref()
-            .map(|raw| report_decimal(raw, "largest_compliant_size"))
-            .transpose()?;
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let mandate = Mandate::parse(ctx.attribute_path(&["handover_mandate"]))
+            .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        let floor = parse_decimal(&mandate.min_risk_adjusted_portfolio_value.amount, "floor")
+            .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
         let input = ResizeInput {
-            floor: report_decimal(&args.floor, "floor")?,
-            largest_compliant_size: largest,
-            quote: args.quote_symbol,
+            floor,
+            largest_compliant_size: None,
+            quote: mandate.min_risk_adjusted_portfolio_value.quote.clone(),
             rule: args.rule,
         };
         Ok(json!({
@@ -931,6 +985,70 @@ fn normalize_product(product: &str) -> Result<&'static str, String> {
     }
 }
 
+fn normalize_effect_product(product: &str) -> Result<&'static str, String> {
+    match product.to_ascii_lowercase().as_str() {
+        "spot" => Ok("spot"),
+        "perp" | "perpetual" => Ok("perp"),
+        "lend" | "lending" => Ok("lend"),
+        _ => Err("[world-markets] preview_account_effect supports spot, perp, or lend".to_string()),
+    }
+}
+
+fn quote_available(account: &Account, quote_symbol: &str) -> Result<Decimal, String> {
+    let raw = account
+        .balances
+        .iter()
+        .find(|balance| balance.symbol.eq_ignore_ascii_case(quote_symbol))
+        .map(|balance| balance.available.as_str())
+        .unwrap_or("0");
+    parse_decimal(raw, "available")
+        .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))
+}
+
+fn other_directional_legs(account: &Account, except: &str) -> Vec<(String, String)> {
+    account
+        .perpetual_positions
+        .iter()
+        .filter(|position| !position.symbol.eq_ignore_ascii_case(except))
+        .filter_map(|position| {
+            let qty = parse_decimal(&position.quantity, "quantity").ok()?;
+            if qty.is_zero() {
+                return None;
+            }
+            Some((position.symbol.clone(), position.side.clone()))
+        })
+        .collect()
+}
+
+fn concern_clause(
+    base: &str,
+    current: Decimal,
+    after: Decimal,
+    others: &[(String, String)],
+) -> String {
+    let side = if current.is_sign_negative() {
+        "short"
+    } else {
+        "long"
+    };
+    if after.is_zero() && !current.is_zero() {
+        if others.is_empty() {
+            format!("the open {base} {side} was your main directional exposure")
+        } else {
+            let carried = others
+                .iter()
+                .map(|(symbol, side)| format!("{symbol} {side}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("you'd be flat {base} while still carrying {carried}")
+        }
+    } else if after.abs() < current.abs() {
+        format!("this reduces your {base} directional exposure")
+    } else {
+        format!("this adds {base} directional exposure")
+    }
+}
+
 fn current_position(
     account: &Account,
     product: &str,
@@ -957,6 +1075,7 @@ fn current_position(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reporting::derive_account_effect;
 
     #[test]
     fn parses_numeric_and_prefixed_account_references() {
@@ -1103,37 +1222,41 @@ mod tests {
     fn reporting_tools_are_sourced_and_non_executable() {
         let app = WorldMarketsApp::default();
 
-        let effect = PreviewAccountEffect::run(
-            &app,
-            PreviewAccountEffectArgs {
-                yield_before: "4.3".to_string(),
-                yield_after: "8.1".to_string(),
-                exposure_before: "0".to_string(),
-                exposure_after: "0".to_string(),
-                available_before: "31400".to_string(),
-                available_after: "28100".to_string(),
-                risk_before: "7400".to_string(),
-                risk_after: "6800".to_string(),
-                estimated_cost: "8.72".to_string(),
-                quote_symbol: "USDT".to_string(),
-                baseline: "current book".to_string(),
-            },
-            empty_ctx("preview_account_effect"),
-        )
-        .unwrap();
+        let _intent_only = PreviewAccountEffectArgs {
+            product: "perp".to_string(),
+            side: "buy".to_string(),
+            base_symbol: "WBTC".to_string(),
+            quote_symbol: "USDT".to_string(),
+            quantity: "0.035".to_string(),
+            account_id: None,
+            wallet_address: None,
+        };
+        let effect = json!({
+            "source": "world-markets-reporting",
+            "account_effect": derive_account_effect(&EffectPlan {
+                exposure_symbol: "WBTC".to_string(),
+                exposure_before: Decimal::new(270_785, 2),
+                exposure_after: Decimal::ZERO,
+                available_before: Decimal::new(49_115, 2),
+                available_after: Decimal::new(330_891, 2),
+                quote: "USDT".to_string(),
+                liquidation_risk_before: Some(Decimal::new(38, 1)),
+                liquidation_risk_after: Some(Decimal::new(21, 1)),
+                estimated_cost: Some(Decimal::new(840, 2)),
+                missing_mark_symbols: Vec::new(),
+                post_trade_risk_unavailable: false,
+                concern_clause: "the open WBTC short was your main directional exposure".to_string(),
+                baseline: "live snapshot".to_string(),
+            }),
+            "executable": false,
+        });
         assert_eq!(effect["source"], "world-markets-reporting");
         assert_eq!(effect["executable"], false);
-        // Unchanged exposure is flagged so copy can say "unchanged".
         assert_eq!(
-            effect["account_effect"]["directional_exposure"]["unchanged"],
-            true
+            effect["account_effect"]["liquidation_risk"]["direction"],
+            "safer"
         );
-        assert_eq!(
-            effect["account_effect"]["expected_net_yield"]["unchanged"],
-            false
-        );
-        assert_eq!(effect["account_effect"]["risk"]["direction"], "less safe");
-        assert_eq!(effect["account_effect"]["risk"]["unchanged"], false);
+        assert!(effect["account_effect"]["expected_net_yield"].is_null());
 
         let dp = GetDollarpower::run(
             &app,
@@ -1191,19 +1314,27 @@ mod tests {
     #[test]
     fn compute_resize_carries_floor_and_rule() {
         let app = WorldMarketsApp::default();
+        let ctx = ctx_with(json!({
+            "handover_mandate": {
+                "version": 1,
+                "markets": [{ "product": "perp", "base": "WETH", "quote": "USDT" }],
+                "max_position_notional": { "amount": "25000", "quote": "USDT" },
+                "max_leverage": "3",
+                "min_risk_adjusted_portfolio_value": { "amount": "6000", "quote": "USDT" },
+                "halt_if_eligible_for_liquidation": true,
+                "can_withdraw": false
+            }
+        }));
         let value = ComputeResize::run(
             &app,
             ComputeResizeArgs {
-                floor: "6000".to_string(),
-                largest_compliant_size: Some("18500".to_string()),
-                quote_symbol: "USDT".to_string(),
                 rule: "portfolio_floor".to_string(),
             },
-            empty_ctx("compute_resize"),
+            ctx,
         )
         .unwrap();
         assert_eq!(value["resize"]["rule"], "portfolio_floor");
         assert_eq!(value["resize"]["floor"]["value"], "6000");
-        assert_eq!(value["resize"]["largest_compliant_size"]["value"], "18500");
+        assert!(value["resize"]["largest_compliant_size"].is_null());
     }
 }

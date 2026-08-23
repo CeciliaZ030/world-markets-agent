@@ -94,7 +94,7 @@ fn no_banned_vocabulary() {
 /// Every figure in a `>` line must be a `[#]` placeholder or live in a fence.
 #[test]
 fn workflows_contain_no_bare_response_numbers() {
-    for file in ["workflows.md", "guest.md", "share.md"] {
+    for file in ["workflows.md", "guest.md", "share.md", "lookups.md"] {
         let prose = prose_only(&skill(file));
         for (i, line) in prose.lines().enumerate() {
             let trimmed = line.trim();
@@ -411,5 +411,87 @@ fn available_lookup_deferred_without_exact_figure() {
     assert!(
         rules.contains("lookups.md"),
         "action-rules must point terse lookups to lookups.md"
+    );
+}
+
+/// F2 — user-facing Risk is the 0–10 score; RAPV is never a "score".
+#[test]
+fn risk_is_liquidation_score_not_rapv() {
+    let wf = skill("workflows.md");
+    let instructions = skill("instructions.md");
+    assert!(
+        wf.contains("0–10") || wf.contains("liquidation"),
+        "workflows must cite the 0–10 liquidation score"
+    );
+    assert!(
+        instructions.contains("higher = worse") || instructions.contains("0–10"),
+        "instructions must state score polarity"
+    );
+    let health = {
+        let start = wf.find("## 6.13").expect("6.13 health section");
+        let end = wf[start..]
+            .find("## 6.14")
+            .map(|o| start + o)
+            .unwrap_or(wf.len());
+        wf[start..end].to_lowercase()
+    };
+    assert!(
+        !health.contains("above your floor") && !health.contains("below your floor"),
+        "health card must not mix the 0–10 score with a RAPV floor"
+    );
+    assert!(
+        health.contains("and nothing needs you now")
+            || health.contains("and nothing needs you now."),
+        "health card must bind the calm feeling clause"
+    );
+}
+
+/// F3 — mandate-absent family is the handshake: zero numbers, verbatim detail,
+/// no floor sign-off.
+#[test]
+fn mandate_absent_handshake_stated() {
+    let wf = skill("workflows.md");
+    for code in [
+        "missing_mandate",
+        "unknown_mandate_key",
+        "invalid_mandate",
+        "unsupported_mandate_version",
+    ] {
+        assert!(wf.contains(code), "workflows missing mandate-absent code {code}");
+    }
+    assert!(
+        wf.contains("I can't trade — or withdraw, transfer, or bridge")
+            || wf.contains("I can't trade — or withdraw, transfer, or bridge"),
+        "handshake body missing"
+    );
+    let start = wf.find("missing_mandate").expect("mandate-absent family");
+    let slice = &wf[start..].lines().take(20).collect::<Vec<_>>().join("\n");
+    assert!(
+        !slice.contains("The limit is yours, and it held")
+            && !slice.contains("the limit is yours, and it held"),
+        "floor sign-off must not leak into mandate-absent copy"
+    );
+}
+
+/// F5 — measured-layer idioms are grep-able.
+#[test]
+fn measured_layer_idioms_present() {
+    let lookups = skill("lookups.md");
+    assert!(
+        lookups.contains("I've left it out rather than guess."),
+        "missing-data idiom"
+    );
+    assert!(
+        lookups.contains("`$0` difference.") || lookups.contains("$0` difference"),
+        "null-result idiom"
+    );
+    assert!(
+        lookups.contains("whole dollars") && lookups.contains("2 dp"),
+        "estimate-vs-exact idiom"
+    );
+    let rules = skill("action-rules.md");
+    assert!(
+        rules.contains("intent only") || rules.contains("never figures"),
+        "preview_account_effect must be intent-only"
     );
 }
