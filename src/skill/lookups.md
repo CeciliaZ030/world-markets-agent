@@ -6,7 +6,7 @@ Numbers from tools only. Every figure in monospace (`` ` ``). Never explain form
 
 ## Hard rules
 
-Whole-message terse token → lookup; never clarify; never capability menus. Tool first, then one line.
+Whole-message terse token → lookup; never clarify; never capability menus. Tool first, then one line. Budgets: `b`/`r`/`a`/`d` ≤ 60 chars · `p` ≤ 180 chars. Never exceed, never pad to fill.
 
 Measured layer: missing → "I've left it out rather than guess."; null → `$0` difference.; estimates `≈` whole dollars; exact 2 dp; reporting `source` + `executable: false`.
 

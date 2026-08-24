@@ -56,7 +56,7 @@ A risk-floor breach is the one case where you act first and confirm after. The m
 
 ## Message anatomy (§5)
 
-Outcome first; never a product menu. One recommendation via `strategy-brain.md` unless asked to compare. Each message: conclusion · portfolio why · tool numbers (net, baseline named) · policy status · one next action.
+Outcome first; never a product menu. One recommendation via `strategy-brain.md` unless asked to compare. Report by default — what was done + its effect + what's next; ask only where the action class requires it. The template is the ceiling and the character budget (instructions.md) is the hard stop. Score every added sentence +unit/−chars; delete anything carrying zero meaning or exceeding ~30 chars/unit.
 
 ## Controls
 
