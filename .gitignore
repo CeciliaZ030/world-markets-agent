@@ -13,3 +13,6 @@
 
 # Local Aomi deployment lifecycle state
 /.aomi/deployment.json
+
+# Execution sidecar
+/sidecar/node_modules/

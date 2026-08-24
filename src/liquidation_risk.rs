@@ -13,7 +13,8 @@ use rust_decimal::prelude::FromPrimitive;
 use serde::Serialize;
 
 use crate::client::{
-    Account, Asset, BASE_TOKEN_ID, Balance, PerpetualPosition, WorldClient, decimal_digits,
+    Account, Asset, BASE_TOKEN_ID, Balance, LendingPosition, PerpetualPosition, WorldClient,
+    decimal_digits,
 };
 use crate::mandate::parse_decimal;
 const LEND_DURATION_DAYS: u32 = 10;
@@ -68,6 +69,465 @@ pub(crate) fn compute_metrics(
             "composite portfolio evaluation at block {block_number} (risk multiplier search vs live RAPV)"
         ),
     })
+}
+
+/// Intent used to project post-trade ATLAS RAPV and the 0–10 liquidation score.
+#[derive(Debug, Clone)]
+pub(crate) struct TradeIntent<'a> {
+    pub(crate) product: &'a str,
+    pub(crate) side: &'a str,
+    pub(crate) base: &'a Asset,
+    pub(crate) quote: &'a Asset,
+    pub(crate) quantity: Decimal,
+    pub(crate) mark: Decimal,
+}
+
+/// Derived post-trade risk. RAPV is ATLAS `evaluate` at risk multiplier 1,
+/// anchored to the live contract RAPV via a state delta so the current reading
+/// stays the source of truth.
+///
+/// **Derivation (owner ratification):**
+/// `post_trade_rapv = live_rapv + evaluate(apply(intent, state), 1) − evaluate(state, 1)`
+/// where `evaluate` is the Composite/ATLAS valuation already used for NAV
+/// (multiplier 0) and the liquidation search. At multiplier 1 this is native
+/// riskPrice / riskSlippage plus the 98% lender haircut. Labeled `is_estimate`
+/// because it is a derivation, not a post-trade contract read (the exchange
+/// does not expose a simulation).
+#[derive(Debug, Clone)]
+pub(crate) struct PostTradeProjection {
+    pub(crate) rapv: Decimal,
+    pub(crate) rapv_display: String,
+    pub(crate) liquidation_risk: Decimal,
+    pub(crate) source: &'static str,
+    pub(crate) is_estimate: bool,
+}
+
+const POST_TRADE_SOURCE: &str = "world-markets-reporting";
+
+pub(crate) fn project_post_trade(
+    client: &WorldClient,
+    account: &Account,
+    assets: &[Asset],
+    intent: &TradeIntent<'_>,
+) -> Result<PostTradeProjection, String> {
+    let time_sec = client.block_timestamp()?;
+    let borrow_rate_raw = if is_lend(intent.product)
+        && matches!(
+            intent.side.to_ascii_lowercase().as_str(),
+            "buy" | "long" | "borrow"
+        ) {
+        Some(borrow_rate_raw(client, intent.base.token_id)?)
+    } else {
+        None
+    };
+    project_from_account(client, account, assets, time_sec, intent, borrow_rate_raw)
+}
+
+fn is_lend(product: &str) -> bool {
+    matches!(product, "lend" | "lending")
+}
+
+fn borrow_rate_raw(client: &WorldClient, token_id: u32) -> Result<u16, String> {
+    let book = client.lend_book_rates(token_id)?;
+    let apr = book.borrow_apr.ok_or_else(|| {
+        "[world-markets] lend book has no borrow rate; post-trade RAPV is unprovable".to_string()
+    })?;
+    apr_to_rate_raw(&apr)
+}
+
+fn apr_to_rate_raw(apr: &str) -> Result<u16, String> {
+    let parsed = parse_decimal(apr, "borrow_apr")
+        .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+    let scaled = (parsed * Decimal::from(10_000)).trunc();
+    if scaled.is_sign_negative() || scaled > Decimal::from(u16::MAX) {
+        return Err("[world-markets] borrow APR is outside the supported rate range".to_string());
+    }
+    scaled
+        .normalize()
+        .to_string()
+        .parse::<u16>()
+        .map_err(|e| format!("[world-markets] borrow APR is not a rate raw: {e}"))
+}
+
+fn project_from_account(
+    client: &WorldClient,
+    account: &Account,
+    assets: &[Asset],
+    time_sec: u64,
+    intent: &TradeIntent<'_>,
+    borrow_rate_raw: Option<u16>,
+) -> Result<PostTradeProjection, String> {
+    let quote_asset = assets
+        .iter()
+        .find(|asset| asset.token_id == BASE_TOKEN_ID)
+        .ok_or_else(|| "[world-markets] base token config is missing".to_string())?;
+    let current_state = build_state(client, account, assets)?;
+    let eval_before = evaluate(&current_state, assets, client, quote_asset, time_sec, 1.0)?;
+    let mut projected = account.clone();
+    apply_intent(&mut projected, intent, borrow_rate_raw, time_sec)?;
+    let projected_state = build_state(client, &projected, assets)?;
+    let eval_after = evaluate(&projected_state, assets, client, quote_asset, time_sec, 1.0)?;
+    let live_rapv = parse_decimal(
+        &account.risk_adjusted_portfolio_value,
+        "risk_adjusted_portfolio_value",
+    )
+    .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+    let post_rapv = live_rapv
+        .checked_add(eval_after)
+        .and_then(|value| value.checked_sub(eval_before))
+        .ok_or_else(|| "[world-markets] post-trade RAPV overflow".to_string())?;
+    let nav = evaluate(&projected_state, assets, client, quote_asset, time_sec, 0.0)?;
+    let val_at_max = evaluate(
+        &projected_state,
+        assets,
+        client,
+        quote_asset,
+        time_sec,
+        MAX_SCORE,
+    )?;
+    let risk = calculate_liquidation_risk(nav, post_rapv, val_at_max, |multiplier| {
+        evaluate(
+            &projected_state,
+            assets,
+            client,
+            quote_asset,
+            time_sec,
+            multiplier,
+        )
+    })?;
+    let risk_display = format_risk_score(risk);
+    let liquidation_risk = parse_decimal(&risk_display, "liquidation_risk")
+        .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+    Ok(PostTradeProjection {
+        rapv: post_rapv,
+        rapv_display: format_decimal(post_rapv, quote_asset.position_decimals),
+        liquidation_risk,
+        source: POST_TRADE_SOURCE,
+        is_estimate: true,
+    })
+}
+
+fn apply_intent(
+    account: &mut Account,
+    intent: &TradeIntent<'_>,
+    borrow_rate_raw: Option<u16>,
+    time_sec: u64,
+) -> Result<(), String> {
+    let product = intent.product.to_ascii_lowercase();
+    let side = intent.side.to_ascii_lowercase();
+    if intent.quantity <= Decimal::ZERO {
+        return Err("[world-markets] quantity must be greater than zero".to_string());
+    }
+    match product.as_str() {
+        "lend" | "lending" => match side.as_str() {
+            "sell" | "short" | "lend" => apply_lend_supply(account, intent.base, intent.quantity),
+            "buy" | "long" | "borrow" => {
+                apply_lend_borrow(account, intent.base, intent.quantity, borrow_rate_raw)
+            }
+            _ => Err("[world-markets] lend side must be buy or sell".to_string()),
+        },
+        "spot" => apply_spot(
+            account,
+            intent.base,
+            intent.quote,
+            &side,
+            intent.quantity,
+            intent.mark,
+        ),
+        "perp" | "perpetual" => apply_perp(
+            account,
+            intent.base,
+            &side,
+            intent.quantity,
+            intent.mark,
+            time_sec,
+        ),
+        other => Err(format!(
+            "[world-markets] cannot project post-trade RAPV for product {other}"
+        )),
+    }
+}
+
+fn apply_lend_supply(
+    account: &mut Account,
+    token: &Asset,
+    quantity: Decimal,
+) -> Result<(), String> {
+    debit_vault(account, token, quantity)?;
+    let pos_raw = to_u64_raw(quantity, token.position_decimals)?;
+    let idx = ensure_lending(account, token);
+    let position = &mut account.lending_positions[idx];
+    position.lender_quantity_raw = position
+        .lender_quantity_raw
+        .checked_add(pos_raw)
+        .ok_or_else(|| "[world-markets] lender quantity overflow".to_string())?;
+    position.lender_quantity = decimal_digits(
+        position.lender_quantity_raw.to_string(),
+        token.position_decimals,
+    );
+    Ok(())
+}
+
+fn apply_lend_borrow(
+    account: &mut Account,
+    token: &Asset,
+    quantity: Decimal,
+    borrow_rate_raw: Option<u16>,
+) -> Result<(), String> {
+    let rate = borrow_rate_raw
+        .ok_or_else(|| "[world-markets] borrow RAPV requires a live lend-book rate".to_string())?;
+    credit_vault(account, token, quantity)?;
+    let pos_raw = to_u64_raw(quantity, token.position_decimals)?;
+    let idx = ensure_lending(account, token);
+    let position = &mut account.lending_positions[idx];
+    position.borrower_quantity_raw = position
+        .borrower_quantity_raw
+        .checked_add(pos_raw)
+        .ok_or_else(|| "[world-markets] borrower quantity overflow".to_string())?;
+    position.borrower_quantity = decimal_digits(
+        position.borrower_quantity_raw.to_string(),
+        token.position_decimals,
+    );
+    if rate > position.highest_interest_rate_raw {
+        position.highest_interest_rate_raw = rate;
+        position.highest_interest_rate = decimal_digits(u64::from(rate).to_string(), 4);
+        position.highest_interest_rate_percent = decimal_digits(u64::from(rate).to_string(), 2);
+    }
+    Ok(())
+}
+
+fn apply_spot(
+    account: &mut Account,
+    base: &Asset,
+    quote: &Asset,
+    side: &str,
+    quantity: Decimal,
+    mark: Decimal,
+) -> Result<(), String> {
+    let quote_notional = quantity
+        .checked_mul(mark)
+        .ok_or_else(|| "[world-markets] spot notional overflow".to_string())?;
+    match side {
+        "buy" | "long" => {
+            debit_vault(account, quote, quote_notional)?;
+            credit_vault(account, base, quantity)?;
+        }
+        "sell" | "short" => {
+            debit_vault(account, base, quantity)?;
+            credit_vault(account, quote, quote_notional)?;
+        }
+        _ => return Err("[world-markets] spot side must be buy or sell".to_string()),
+    }
+    Ok(())
+}
+
+fn apply_perp(
+    account: &mut Account,
+    base: &Asset,
+    side: &str,
+    quantity: Decimal,
+    mark: Decimal,
+    time_sec: u64,
+) -> Result<(), String> {
+    let signed = match side {
+        "buy" | "long" => quantity,
+        "sell" | "short" => -quantity,
+        _ => return Err("[world-markets] perp side must be buy or sell".to_string()),
+    };
+    let idx = account
+        .perpetual_positions
+        .iter()
+        .position(|p| p.token_id == base.token_id);
+    if let Some(idx) = idx {
+        let position = &mut account.perpetual_positions[idx];
+        let current = parse_decimal(&position.quantity, "perp_quantity")
+            .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        let entry = parse_decimal(&position.entry_price, "perp_entry_price")
+            .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        let new_qty = current
+            .checked_add(signed)
+            .ok_or_else(|| "[world-markets] perp quantity overflow".to_string())?;
+        if new_qty.is_zero() {
+            account.perpetual_positions.remove(idx);
+            return Ok(());
+        }
+        let same_sign = (current.is_sign_positive() && new_qty.is_sign_positive())
+            || (current.is_sign_negative() && new_qty.is_sign_negative());
+        let new_entry = if current.is_zero() || !same_sign {
+            mark
+        } else if new_qty.abs() > current.abs() {
+            let added = signed.abs();
+            ((entry * current.abs()) + (mark * added))
+                .checked_div(new_qty.abs())
+                .ok_or_else(|| "[world-markets] perp entry average overflow".to_string())?
+        } else {
+            entry
+        };
+        if !same_sign {
+            position.owed_nom_raw = "0".to_string();
+            position.owed_nom = "0".to_string();
+            position.owed_base_raw = "0".to_string();
+            position.funding_start_time = time_sec;
+        }
+        position.quantity = format_decimal(new_qty, base.position_decimals);
+        position.quantity_raw = to_i64_raw(new_qty, base.position_decimals)?;
+        position.entry_price = new_entry.normalize().to_string();
+        position.side = if new_qty.is_sign_negative() {
+            "short".to_string()
+        } else {
+            "long".to_string()
+        };
+        return Ok(());
+    }
+    account.perpetual_positions.push(PerpetualPosition {
+        token_id: base.token_id,
+        symbol: base.symbol.clone(),
+        quantity_raw: to_i64_raw(signed, base.position_decimals)?,
+        quantity: format_decimal(signed, base.position_decimals),
+        side: if signed.is_sign_negative() {
+            "short".to_string()
+        } else {
+            "long".to_string()
+        },
+        entry_price_raw: 0,
+        entry_price: mark.normalize().to_string(),
+        funding_start_time: time_sec,
+        owed_nom_raw: "0".to_string(),
+        owed_nom: "0".to_string(),
+        owed_base_raw: "0".to_string(),
+    });
+    Ok(())
+}
+
+fn debit_vault(account: &mut Account, token: &Asset, quantity: Decimal) -> Result<(), String> {
+    let vault_raw = to_u128_raw(quantity, token.vault_decimals)?;
+    let idx = ensure_balance(account, token);
+    let balance = &mut account.balances[idx];
+    let current = parse_u128(&balance.balance_raw)?;
+    let available = parse_u128(&balance.available_raw)?;
+    if available < vault_raw || current < vault_raw {
+        return Err(format!(
+            "[world-markets] insufficient {} available to apply this intent",
+            token.symbol
+        ));
+    }
+    balance.balance_raw = (current - vault_raw).to_string();
+    balance.available_raw = (available - vault_raw).to_string();
+    refresh_balance(balance, token);
+    Ok(())
+}
+
+fn credit_vault(account: &mut Account, token: &Asset, quantity: Decimal) -> Result<(), String> {
+    let vault_raw = to_u128_raw(quantity, token.vault_decimals)?;
+    let idx = ensure_balance(account, token);
+    let balance = &mut account.balances[idx];
+    let current = parse_u128(&balance.balance_raw)?;
+    let available = parse_u128(&balance.available_raw)?;
+    balance.balance_raw = current
+        .checked_add(vault_raw)
+        .ok_or_else(|| "[world-markets] vault balance overflow".to_string())?
+        .to_string();
+    balance.available_raw = available
+        .checked_add(vault_raw)
+        .ok_or_else(|| "[world-markets] available balance overflow".to_string())?
+        .to_string();
+    refresh_balance(balance, token);
+    Ok(())
+}
+
+fn refresh_balance(balance: &mut Balance, token: &Asset) {
+    balance.balance = decimal_digits(balance.balance_raw.clone(), token.vault_decimals);
+    balance.available = decimal_digits(balance.available_raw.clone(), token.vault_decimals);
+}
+
+fn ensure_balance(account: &mut Account, token: &Asset) -> usize {
+    if let Some(idx) = account
+        .balances
+        .iter()
+        .position(|balance| balance.token_id == token.token_id)
+    {
+        return idx;
+    }
+    account.balances.push(Balance {
+        token_id: token.token_id,
+        symbol: token.symbol.clone(),
+        balance_raw: "0".to_string(),
+        balance: "0".to_string(),
+        available_raw: "0".to_string(),
+        available: "0".to_string(),
+        spot_lend_sequestered_raw: "0".to_string(),
+        spot_lend_sequestered: "0".to_string(),
+        perp_sequestered_raw: "0".to_string(),
+        perp_sequestered: "0".to_string(),
+    });
+    account.balances.len() - 1
+}
+
+fn ensure_lending(account: &mut Account, token: &Asset) -> usize {
+    if let Some(idx) = account
+        .lending_positions
+        .iter()
+        .position(|position| position.token_id == token.token_id)
+    {
+        return idx;
+    }
+    account.lending_positions.push(LendingPosition {
+        token_id: token.token_id,
+        symbol: token.symbol.clone(),
+        lender_quantity_raw: 0,
+        lender_quantity: "0".to_string(),
+        borrower_quantity_raw: 0,
+        borrower_quantity: "0".to_string(),
+        highest_interest_rate_raw: 0,
+        highest_interest_rate: "0".to_string(),
+        highest_interest_rate_percent: "0".to_string(),
+    });
+    account.lending_positions.len() - 1
+}
+
+fn parse_u128(raw: &str) -> Result<u128, String> {
+    raw.parse::<u128>()
+        .map_err(|e| format!("[world-markets] invalid vault raw {raw}: {e}"))
+}
+
+fn to_u128_raw(value: Decimal, decimals: u8) -> Result<u128, String> {
+    if value.is_sign_negative() {
+        return Err("[world-markets] quantity must be non-negative".to_string());
+    }
+    let scale = Decimal::from(10u64.saturating_pow(u32::from(decimals)));
+    let scaled = value
+        .checked_mul(scale)
+        .ok_or_else(|| "[world-markets] quantity scale overflow".to_string())?;
+    if scaled != scaled.trunc() {
+        return Err("[world-markets] quantity is not representable at token decimals".to_string());
+    }
+    scaled
+        .trunc()
+        .normalize()
+        .to_string()
+        .parse::<u128>()
+        .map_err(|e| format!("[world-markets] quantity raw parse: {e}"))
+}
+
+fn to_u64_raw(value: Decimal, decimals: u8) -> Result<u64, String> {
+    let raw = to_u128_raw(value, decimals)?;
+    u64::try_from(raw).map_err(|_| "[world-markets] quantity exceeds u64 raw range".to_string())
+}
+
+fn to_i64_raw(value: Decimal, decimals: u8) -> Result<i64, String> {
+    let scale = Decimal::from(10u64.saturating_pow(u32::from(decimals)));
+    let scaled = value
+        .checked_mul(scale)
+        .ok_or_else(|| "[world-markets] signed quantity scale overflow".to_string())?;
+    if scaled != scaled.trunc() {
+        return Err("[world-markets] quantity is not representable at token decimals".to_string());
+    }
+    scaled
+        .trunc()
+        .normalize()
+        .to_string()
+        .parse::<i64>()
+        .map_err(|e| format!("[world-markets] signed quantity raw parse: {e}"))
 }
 
 fn risk_band(score: f64) -> &'static str {
@@ -507,5 +967,124 @@ mod tests {
         let rate = Decimal::new(10, 2);
         let obligation = calc_borrower_obligation(principal, rate, 30, 6).unwrap();
         assert!(obligation > principal);
+    }
+
+    fn usdt_asset() -> Asset {
+        Asset {
+            token_id: BASE_TOKEN_ID,
+            symbol: "USDT".to_string(),
+            name: "USDT".to_string(),
+            token_type: "erc20".to_string(),
+            erc20_address: "0x0000000000000000000000000000000000000000".to_string(),
+            erc20_decimals: 6,
+            vault_decimals: 6,
+            position_decimals: 6,
+            risk_price_percent: 0,
+            risk_slippage_percent: 0.0,
+        }
+    }
+
+    fn usdt_account(balance: Decimal) -> Account {
+        let raw = to_u128_raw(balance, 6).unwrap();
+        Account {
+            account_id: 1,
+            owner: "0x0000000000000000000000000000000000000001".to_string(),
+            risk_adjusted_portfolio_value_raw: 0,
+            risk_adjusted_portfolio_value: balance.normalize().to_string(),
+            eligible_for_liquidation: false,
+            balances: vec![Balance {
+                token_id: BASE_TOKEN_ID,
+                symbol: "USDT".to_string(),
+                balance_raw: raw.to_string(),
+                balance: decimal_digits(raw.to_string(), 6),
+                available_raw: raw.to_string(),
+                available: decimal_digits(raw.to_string(), 6),
+                spot_lend_sequestered_raw: "0".to_string(),
+                spot_lend_sequestered: "0".to_string(),
+                perp_sequestered_raw: "0".to_string(),
+                perp_sequestered: "0".to_string(),
+            }],
+            lending_positions: Vec::new(),
+            perpetual_positions: Vec::new(),
+            debt_token_ids: Vec::new(),
+            non_debt_token_ids: vec![BASE_TOKEN_ID],
+        }
+    }
+
+    #[test]
+    fn lending_usdt_applies_two_percent_atlas_haircut_to_rapv() {
+        let client = WorldClient::default();
+        let usdt = usdt_asset();
+        let account = usdt_account(Decimal::from(1_000));
+        let assets = [usdt.clone()];
+        let before_state = build_state(&client, &account, &assets).unwrap();
+        let before = evaluate(&before_state, &assets, &client, &usdt, 0, 1.0).unwrap();
+        let mut projected = account.clone();
+        apply_lend_supply(&mut projected, &usdt, Decimal::from(100)).unwrap();
+        let after_state = build_state(&client, &projected, &assets).unwrap();
+        let after = evaluate(&after_state, &assets, &client, &usdt, 0, 1.0).unwrap();
+        assert_eq!(before - after, Decimal::from(2));
+        let projection = project_from_account(
+            &client,
+            &account,
+            &assets,
+            0,
+            &TradeIntent {
+                product: "lend",
+                side: "lend",
+                base: &usdt,
+                quote: &usdt,
+                quantity: Decimal::from(100),
+                mark: Decimal::ONE,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(projection.rapv, Decimal::from(998));
+        assert!(projection.is_estimate);
+        assert_eq!(projection.source, "world-markets-reporting");
+    }
+
+    #[test]
+    fn lend_supply_fails_closed_when_available_is_insufficient() {
+        let usdt = usdt_asset();
+        let mut account = usdt_account(Decimal::from(10));
+        let err = apply_lend_supply(&mut account, &usdt, Decimal::from(50)).unwrap_err();
+        assert!(err.contains("insufficient"), "{err}");
+    }
+
+    #[test]
+    #[ignore = "requires live UniFi RPC"]
+    fn atlas_unit_risk_evaluate_matches_live_contract_rapv() {
+        let client = WorldClient::default();
+        let assets = client.assets().unwrap();
+        let account_id = client.latest_account_id().unwrap();
+        let account = client.account(account_id, &assets).unwrap();
+        let quote = assets
+            .iter()
+            .find(|asset| asset.token_id == BASE_TOKEN_ID)
+            .unwrap();
+        let time_sec = client.block_timestamp().unwrap();
+        let state = build_state(&client, &account, &assets).unwrap();
+        let derived = evaluate(&state, &assets, &client, quote, time_sec, 1.0).unwrap();
+        let live = parse_decimal(
+            &account.risk_adjusted_portfolio_value,
+            "risk_adjusted_portfolio_value",
+        )
+        .unwrap();
+        let delta = (derived - live).abs();
+        // UniFi RAPV and Composite evaluate(1) share ATLAS inputs but not
+        // identical truncation. Observed residual on this fixture is ~0.17 on
+        // ~790. Post-trade uses the delta method so the live contract RAPV
+        // remains the anchor: live + evaluate(after,1) − evaluate(before,1).
+        let relative = if live.abs() > Decimal::ONE {
+            delta / live.abs()
+        } else {
+            delta
+        };
+        assert!(
+            relative <= Decimal::new(5, 3),
+            "ATLAS evaluate(1) {derived} must stay within 50 bps of live RAPV {live} (delta {delta})"
+        );
     }
 }

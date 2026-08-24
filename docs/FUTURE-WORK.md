@@ -80,6 +80,25 @@ When Telegram start-payload routing, the share-card renderer, or the live demo-b
 
 ---
 
+## Local execution sidecar
+
+### Current state
+
+`sidecar/` is a Node process wrapping `@wcm-inc/sdk` (run via `tsx` because `@wcm-inc/abi` ships TypeScript factories). It signs with `WORLD_PRIVATE_KEY` from `.env` and exposes `/v1/orders`, `/v1/orders/cancel`, `/v1/swaps`, `/v1/loans/renew`. The Rust plugin (`src/execution.rs`) is an HTTP client only. The swap point for hosted Aomi signing is that HTTP client, not a new plugin tool surface.
+
+Local mandate arrives via `WORLD_MANDATE_JSON`, `WORLD_MANDATE_PATH`, or the bundled `mandate.dev.example.json` placeholder because `aomi-run` stubs `handover_mandate`. Set `WORLD_MANDATE_PATH=none` to test the fail-closed handshake. Post-trade RAPV is a pre-trade stand-in.
+
+### Future intention
+
+Replace the sidecar process with whatever Aomi uses to hold a key and broadcast — keep the request types in `src/execution.rs`. Then delete local `.env` key usage.
+
+### When to revisit
+
+When Aomi documents host signing, or when swapping the rest of the Rust contract reads to the same SDK service.
+
+
+---
+
 ## Template for new entries
 
 ```markdown

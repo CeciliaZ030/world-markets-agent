@@ -2,6 +2,7 @@ use aomi_sdk::*;
 
 mod carry;
 mod client;
+mod execution;
 mod guest;
 mod liquidation_risk;
 mod loans;
@@ -16,7 +17,7 @@ mod tool;
 dyn_aomi_app!(
     app = tool::WorldMarketsApp,
     name = "world-markets",
-    version = "0.3.0",
+    version = "0.4.0",
     preamble = preamble::COMPOSED,
     tools = [
         tool::ListWorldAssets,
@@ -26,6 +27,10 @@ dyn_aomi_app!(
         tool::GetWorldLoans,
         tool::PreviewWorldTrade,
         tool::CheckWorldMandate,
+        tool::ExecuteWorldOrder,
+        tool::CancelWorldOrder,
+        tool::ExecuteWorldSwap,
+        tool::RenewWorldLoans,
         tool::GetWorldAgentPermission,
         tool::GetWorldOpenOrders,
         tool::GetWorldPnl,

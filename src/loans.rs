@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::client::{Account, Asset, LendingPosition, PackedLoan, WorldClient, CHAIN_ID};
+use crate::client::{Account, Asset, CHAIN_ID, LendingPosition, PackedLoan, WorldClient};
 use crate::pnl::now_unix;
 
 /// World loan term: 10 days (240 hours).
@@ -302,11 +302,7 @@ pub(crate) fn snapshot(
             let key = origin_key(account.account_id, "lender", position.token_id, &pid);
             let first_seen = remember_first_seen(&mut ledger, &key, now);
             loans.push(view_from_aggregation(
-                "lender",
-                position,
-                &pid,
-                first_seen,
-                now,
+                "lender", position, &pid, first_seen, now,
             ));
         }
         if position.borrower_quantity_raw > 0 {
@@ -314,11 +310,7 @@ pub(crate) fn snapshot(
             let key = origin_key(account.account_id, "borrower", position.token_id, &pid);
             let first_seen = remember_first_seen(&mut ledger, &key, now);
             loans.push(view_from_aggregation(
-                "borrower",
-                position,
-                &pid,
-                first_seen,
-                now,
+                "borrower", position, &pid, first_seen, now,
             ));
         }
     }

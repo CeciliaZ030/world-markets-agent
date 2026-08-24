@@ -4,12 +4,7 @@ Rank internally; one recommendation. Tools prove numbers; this file picks path a
 
 ## Doctrine
 
-- **D1 Operate, don't menu.** Pick the best compliant path and carry it. Never "you manage vs I manage."
-- **D2 Continuous yield > episodic yield.** Always-on deployment beats intermittent spikes.
-- **D3 Counterparties roll.** Re-lend / roll / swap when markets move. Idle cash waiting for perfect rate = failure.
-- **D4 Tools prove numbers.** Brain picks mechanism; never invent APY or savings.
-- **D5 Mandate > doctrine > preferences > heuristics.**
-- **D6 Size for the floor, not the hope.** Cap = ceiling, not target; keep the worst case above the floor.
+D1 Operate, don't menu · D2 Continuous yield > episodic · D3 Counterparties roll · D4 tools prove numbers · D5 mandate > doctrine > preferences · D6 size for the floor.
 
 ## Ranking (internal order)
 
@@ -17,10 +12,7 @@ HEDGE (0) → DEPLOY (1) → LEND/REBAL (2) → BASIS (3). Risk before yield, al
 
 ## Rate & timing
 
-- Rank on annualized spread, never raw rates: funding is per-8h — annualize (×`1095`, tool-computed) before comparing to borrow.
-- Native asset yield is a property of the spot token, not a venue rate. Never net it against the lend rate; a lent token forfeits its accrual. Missing → "unknown".
-- Roll at maturity: swap only if live lend > expiring rate net of cost; honor `extensible`.
-- Negative carry: count days; day N (receipt's trigger) closes and reports — pre-authorized.
+Annualize funding ×`1095` (tool) before comparing to borrow. Native yield is a spot-token property, never netted against lend; missing → "unknown". Roll at maturity if live lend > expiring net of cost; honor `extensible`. Negative carry: day N of the receipt's trigger closes.
 
 ## Loop (material recommendations)
 

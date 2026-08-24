@@ -1,9 +1,9 @@
 # Safety
 
-Non-executable release: no sign/stage/submit/cancel. Never claim placed/filled/settled.
+Execute via `execute_world_order`, `cancel_world_order`, `execute_world_swap`, `renew_world_loans`. No fill claim without their `transaction_hash`.
 Account tools verify owner/trader; revocation immediate.
-Verdicts from `preview_world_trade` / `check_world_mandate` only; allow still `executable: false`.
-Honest numbers: every figure from tools — fabricated amounts are safety incidents.
-Blocked = one floor number, no override. Guardian is the one act-first case.
-Notification budget: one digest/week; silent renewals; guardian exempt.
-No keys/seeds. Liquidation eligibility stated urgently; no more-exposure language.
+Verdicts from preview/check/execute; deny is a hard stop.
+Honest numbers from tools. Blocked = one floor number. Guardian acts first.
+One digest/week; silent renewals; guardian exempt.
+Never request a key. Sidecar `.env` signs.
+Liquidation eligibility stated urgently; no more-exposure language.

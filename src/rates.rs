@@ -140,8 +140,7 @@ pub(crate) fn snapshot(
         block_number: client.block_number()?.to_string(),
         executable: false,
         quote_symbol: quote.symbol,
-        native_yield_note:
-            "native_yield_apy is operator config via WORLD_NATIVE_YIELDS; null when unknown. Illustrative ETH≈3% / SOL≈7.5% figures in strategy docs are not live.",
+        native_yield_note: "native_yield_apy is operator config via WORLD_NATIVE_YIELDS; null when unknown. Illustrative ETH≈3% / SOL≈7.5% figures in strategy docs are not live.",
         rates,
     })
 }

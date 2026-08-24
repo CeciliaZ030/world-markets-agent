@@ -378,7 +378,7 @@ impl WorldClient {
     }
 
     #[cfg(test)]
-    fn latest_account_id(&self) -> Result<u64, String> {
+    pub(crate) fn latest_account_id(&self) -> Result<u64, String> {
         Ok(self.call(&bulkReadMaxUserId_5445644137Call {})?.maxUserId)
     }
 
@@ -645,11 +645,7 @@ impl WorldClient {
                 base.symbol
             ));
         }
-        let mark_price_raw = self
-            .call(&getMarkPriceCall {
-                tokenId: base.token_id,
-            })?
-            .price;
+        let (mark_price_raw, mark_price) = self.mark_price(base.token_id)?;
 
         Ok(Market {
             product: product.to_string(),
@@ -659,7 +655,7 @@ impl WorldClient {
             buy_token_id,
             pay_token_id,
             mark_price_raw,
-            mark_price: decode_price(mark_price_raw),
+            mark_price,
         })
     }
 

@@ -360,9 +360,7 @@ pub(crate) fn derive_account_effect(plan: &EffectPlan) -> AccountEffect {
         "available",
     );
     let liquidation_risk = match (plan.liquidation_risk_before, plan.liquidation_risk_after) {
-        (Some(before), Some(after)) if !plan.post_trade_risk_unavailable => {
-            Some(Transition::new(before, after, "", "liquidation_risk"))
-        }
+        (Some(before), Some(after)) => Some(Transition::new(before, after, "", "liquidation_risk")),
         _ => None,
     };
     let direction = liquidation_risk.as_ref().map(|t| t.direction.clone());

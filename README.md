@@ -5,7 +5,7 @@ An Aomi app for live World Markets context on the UniFi testnet.
 The app reads the World exchange contract directly and exposes typed tools in two
 groups.
 
-Live contract reads (mandate-aware, non-executable):
+Live contract reads and execution (mandate-aware):
 
 - `list_world_assets`
 - `get_world_account`
@@ -14,6 +14,10 @@ Live contract reads (mandate-aware, non-executable):
 - `get_world_loans`
 - `preview_world_trade`
 - `check_world_mandate`
+- `execute_world_order`
+- `cancel_world_order`
+- `execute_world_swap`
+- `renew_world_loans`
 - `get_world_agent_permission`
 - `get_world_open_orders`
 
@@ -30,16 +34,14 @@ so the message layer never authors a number; see `src/skill/` and the
 - `simulate_guardian_unwind`
 - `check_negative_carry`
 
-Version 0.3 is mandate-aware and intentionally non-executable. It verifies the
-active actor as the World account owner or an on-chain permitted trader, parses
-mandate v1 with fail-closed unknown-key handling, evaluates structured intents
-against live account and market state, and reads resting orders. Its app-scoped
-skill cannot be discovered or activated by another Aomi app.
+Version 0.4 is mandate-aware. Local `aomi-run` can place, cancel, swap, and
+extend loans through a Node sidecar (`sidecar/`) that holds `WORLD_PRIVATE_KEY`
+and calls `@wcm-inc/sdk`. The Rust plugin never sees the key. Hosted Aomi
+signing is not in this release.
 
-The app fails closed when it cannot prove post-trade risk-adjusted portfolio
-value. Transaction staging remains disabled until the host can guarantee that
-app policy cannot be bypassed through a host wallet tool and the app can compute
-the full post-trade World risk state.
+The mandate still fail-closes without a bound policy document. Post-trade RAPV is
+derived from ATLAS `evaluate` at unit risk, anchored to the live contract RAPV,
+and labeled as an estimate. If that derivation cannot run, the mandate fail-closes.
 
 ## Validate
 
@@ -58,9 +60,14 @@ runtime: it loads this plugin, calls a real LLM, and shows which tools the model
 selects. It is **not** the hosted Telegram backend.
 
 ```sh
-cargo build   # rebuild after every skill or tool change — aomi-run loads the dylib from disk
+# plugin only (reads, previews)
+cargo build
 aomi-run target/debug/libworld_markets.dylib \
   --env-file .env --provider openrouter
+
+# plugin + local execution sidecar (requires WORLD_PRIVATE_KEY)
+chmod +x scripts/dev-run.sh
+./scripts/dev-run.sh
 ```
 
 On Linux use `libworld_markets.so`. `/help` inside the REPL lists only host
@@ -68,9 +75,13 @@ commands (`/quit`, `/reset`, …) — not agent lookup tokens. Terse lookups (`b
 `p`, `r`, …) are plain messages, not slash commands.
 
 Set `WORLD_ACCOUNT_ID` in `.env` (not only on the shell command line) so the
-plugin process inherits it via `--env-file`.
-returns `None` for all handover state attributes per the
+plugin process inherits it via `--env-file`. `aomi-run` returns `None` for all
+handover state attributes per the
 [aomi-run docs](https://aomi.dev/docs/build/toolchain/aomi-run#what-the-dev-runtime-stubs).
+`aomi-run` has no `handover_mandate`, so the plugin uses a bundled placeholder
+policy (WETH/USDT, see `mandate.dev.example.json`) unless you set
+`WORLD_MANDATE_PATH` to a real file or to `none`. Start the sidecar so execute
+tools can submit.
 
 Smoke prompts:
 
@@ -83,8 +94,8 @@ PnL persistence (until Aomi host storage is agreed): realized and closed-positio
 figures are written under `WORLD_PNL_DIR`, else
 `$XDG_DATA_HOME/aomi/world-markets/pnl`. Open PnL is live from the contract.
 
-Deploy against the real backend for live handover and mandate context. This app
-release remains intentionally non-executable.
+Deploy against the real backend for live handover and mandate context. Hosted
+execution waits on Aomi's key-holding design; local execution uses the sidecar.
 
 ## Deploy
 

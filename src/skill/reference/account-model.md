@@ -6,4 +6,4 @@ A wallet owns the account (deposit, withdraw, grant/revoke traders). Sub-account
 
 **PnL.** Call `get_world_pnl`. Account PnL is the sum of perpetual position PnL. Each position's PnL is that position's lifetime — mark versus contract entry minus unpaid funding while open, and realized at close or true-up when this app observes it. Spot balances and deposits/withdrawals are not PnL. Do not invent calendar-range PnL; the tool does not offer arbitrary timelines.
 
-**This app.** Mandate-aware and non-executable (v0.3): read, preview, check mandate. A policy `allow` is still `executable: false`. Do not describe a preview as an order or fill. Official World Agent (Telegram, routine unsigned execution) is a different product: https://docs.world.inc/ai-agents/world-agent.md
+**This app.** Mandate-aware. Local execute uses the sidecar after allow. A preview is not a fill. Official World Agent: https://docs.world.inc/ai-agents/world-agent.md

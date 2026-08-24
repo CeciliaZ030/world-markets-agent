@@ -2,11 +2,14 @@ use aomi_sdk::schemars::JsonSchema;
 use aomi_sdk::*;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::client::{asset_by_symbol, Account, AccountAccess, WorldClient, CHAIN_ID};
+use crate::client::{Account, AccountAccess, CHAIN_ID, WorldClient, asset_by_symbol};
+use crate::execution::{
+    CancelOrderRequest, ExecutionClient, PlaceOrderRequest, RenewLoansRequest, SwapRequest,
+};
 use crate::guest::{self, Funnel, FunnelConfig, GuestStore};
-use crate::mandate::{parse_decimal, Mandate, TradeFacts, Verdict};
+use crate::mandate::{Mandate, TradeFacts, Verdict, parse_decimal};
 use crate::pnl::PnlLedger;
 use crate::reporting::{
     EffectPlan, FixtureReporting, GuardianPreference, Reporting, ResizeInput, SliceInput,
@@ -21,6 +24,16 @@ pub(crate) struct WorldMarketsApp {
     guest_store: GuestStore,
     carry_ledger: crate::carry::CarryLedger,
     loan_origins: crate::loans::LoanOriginStore,
+    execution: ExecutionClient,
+}
+
+struct LiveVerdictInput<'a> {
+    product: &'a str,
+    side: &'a str,
+    base: &'a crate::client::Asset,
+    quote: &'a crate::client::Asset,
+    quantity: Decimal,
+    account: &'a Account,
 }
 
 pub(crate) struct ListWorldAssets;
@@ -126,6 +139,87 @@ pub(crate) struct WorldTradeArgs {
     pub(crate) wallet_address: Option<String>,
 }
 
+pub(crate) struct ExecuteWorldOrder;
+pub(crate) struct CancelWorldOrder;
+pub(crate) struct ExecuteWorldSwap;
+pub(crate) struct RenewWorldLoans;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct ExecuteWorldOrderArgs {
+    /// Product type: spot, perp, or lend.
+    pub(crate) product: String,
+    /// Side: buy/sell (spot), long/short (perp), lend/borrow (lend).
+    pub(crate) side: String,
+    /// Base asset symbol, such as WETH.
+    pub(crate) base_symbol: String,
+    /// Quote asset symbol. Required for spot and perp; defaults to USDT for lend.
+    #[serde(default)]
+    pub(crate) quote_symbol: Option<String>,
+    /// Human-readable base quantity.
+    pub(crate) quantity: String,
+    /// Limit price (spot/perp) or interest rate (lend). Omit for a market/IOC order.
+    #[serde(default)]
+    pub(crate) price: Option<String>,
+    /// `limit` or `market`. Inferred from price when omitted.
+    #[serde(default)]
+    pub(crate) order_type: Option<String>,
+    /// Slippage decimal for market orders, e.g. "0.005" for 0.5%.
+    #[serde(default)]
+    pub(crate) slippage: Option<String>,
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    #[serde(default)]
+    pub(crate) wallet_address: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct CancelWorldOrderArgs {
+    /// Product type: spot, perp, or lend.
+    pub(crate) product: String,
+    /// Side of the resting order to cancel.
+    pub(crate) side: String,
+    pub(crate) base_symbol: String,
+    #[serde(default)]
+    pub(crate) quote_symbol: Option<String>,
+    /// Resting order id (spot/perp).
+    #[serde(default)]
+    pub(crate) order_id: Option<String>,
+    /// Interest rate of the resting lend/borrow order. Required for lend cancels.
+    #[serde(default)]
+    pub(crate) interest_rate: Option<String>,
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    #[serde(default)]
+    pub(crate) wallet_address: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct ExecuteWorldSwapArgs {
+    /// Symbol to sell, such as USDT.
+    pub(crate) token_in_symbol: String,
+    /// Symbol to buy, such as WETH.
+    pub(crate) token_out_symbol: String,
+    /// Human-readable input amount.
+    pub(crate) amount_in: String,
+    #[serde(default)]
+    pub(crate) slippage: Option<String>,
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    #[serde(default)]
+    pub(crate) wallet_address: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct RenewWorldLoansArgs {
+    /// Extend borrower loans due within this many hours. Defaults to 24.
+    #[serde(default)]
+    pub(crate) within_hours: Option<u64>,
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    #[serde(default)]
+    pub(crate) wallet_address: Option<String>,
+}
+
 pub(crate) struct GetWorldAgentPermission;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -227,8 +321,13 @@ impl WorldMarketsApp {
     ) -> Result<EffectPlan, String> {
         let product = normalize_effect_product(&args.product)?;
         let side = args.side.to_ascii_lowercase();
-        if !matches!(side.as_str(), "buy" | "sell") {
-            return Err("[world-markets] side must be buy or sell".to_string());
+        if !matches!(
+            side.as_str(),
+            "buy" | "sell" | "long" | "short" | "lend" | "borrow"
+        ) {
+            return Err(
+                "[world-markets] side must be buy/sell, long/short, or lend/borrow".to_string(),
+            );
         }
         let quantity = parse_decimal(&args.quantity, "quantity")
             .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
@@ -244,11 +343,8 @@ impl WorldMarketsApp {
         let quote = asset_by_symbol(&assets, &args.quote_symbol)?;
 
         let mut missing_mark_symbols = Vec::new();
-        let mark = match self
-            .client
-            .market(product, base.clone(), Some(quote.clone()))
-        {
-            Ok(market) => parse_decimal(&market.mark_price, "mark_price").ok(),
+        let mark = match self.client.mark_price(base.token_id) {
+            Ok((_, price)) => parse_decimal(&price, "mark_price").ok(),
             Err(_) => None,
         };
         if mark.is_none() {
@@ -257,7 +353,11 @@ impl WorldMarketsApp {
 
         let current_qty =
             current_position(&account, product, &base.symbol).unwrap_or(Decimal::ZERO);
-        let signed_delta = if side == "buy" { quantity } else { -quantity };
+        let signed_delta = if matches!(side.as_str(), "buy" | "long" | "borrow") {
+            quantity
+        } else {
+            -quantity
+        };
         let after_qty = current_qty + signed_delta;
 
         let (exposure_before, exposure_after) = match mark {
@@ -274,8 +374,24 @@ impl WorldMarketsApp {
             .as_ref()
             .and_then(|m| parse_decimal(&m.liquidation_risk, "liquidation_risk").ok());
 
-        // Same path as the mandate: post-trade RAPV is not yet proven, so
-        // after-risk is omitted rather than guessed.
+        let projection_mark =
+            mark.or_else(|| matches!(product, "lend" | "lending").then_some(Decimal::ONE));
+        let projected = projection_mark.and_then(|price| {
+            crate::liquidation_risk::project_post_trade(
+                &self.client,
+                &account,
+                &assets,
+                &crate::liquidation_risk::TradeIntent {
+                    product,
+                    side: &side,
+                    base: &base,
+                    quote: &quote,
+                    quantity,
+                    mark: price,
+                },
+            )
+            .ok()
+        });
         let others = other_directional_legs(&account, &base.symbol);
         let concern_clause = concern_clause(&base.symbol, current_qty, after_qty, &others);
 
@@ -287,10 +403,10 @@ impl WorldMarketsApp {
             available_after,
             quote: quote.symbol,
             liquidation_risk_before,
-            liquidation_risk_after: None,
+            liquidation_risk_after: projected.as_ref().map(|p| p.liquidation_risk),
             estimated_cost: None,
             missing_mark_symbols,
-            post_trade_risk_unavailable: true,
+            post_trade_risk_unavailable: projected.is_none(),
             concern_clause,
             baseline: format!(
                 "live account snapshot at block {block} versus this intent — derived, not model-typed"
@@ -326,7 +442,21 @@ impl WorldMarketsApp {
             "risk_adjusted_portfolio_value",
         )
         .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
-        let mandate = Mandate::parse(ctx.attribute_path(&["handover_mandate"]));
+        let projected = crate::liquidation_risk::project_post_trade(
+            &self.client,
+            &account,
+            &assets,
+            &crate::liquidation_risk::TradeIntent {
+                product,
+                side: &side,
+                base: &base,
+                quote: &quote,
+                quantity,
+                mark: mark_price,
+            },
+        )
+        .ok();
+        let mandate = Mandate::bound(ctx.attribute_path(&["handover_mandate"]));
         let verdict = match mandate {
             Ok(mandate) => mandate.evaluate(&TradeFacts {
                 product,
@@ -337,7 +467,7 @@ impl WorldMarketsApp {
                 mark_price,
                 current_position_quantity,
                 risk_adjusted_portfolio_value: rapv,
-                post_trade_risk_adjusted_portfolio_value: None,
+                post_trade_risk_adjusted_portfolio_value: projected.as_ref().map(|p| p.rapv),
                 eligible_for_liquidation: account.eligible_for_liquidation,
             }),
             Err(verdict) => verdict,
@@ -346,12 +476,12 @@ impl WorldMarketsApp {
             "[world-markets] estimated notional exceeds numeric range".to_string()
         })?;
         let status = if verdict.is_allow() {
-            "policy_allowed_preview_only"
+            "policy_allowed"
         } else {
             "policy_denied"
         };
         let reason = if verdict.is_allow() {
-            "The deterministic mandate permits this intent, but this release remains non-executable until the host transaction boundary cannot bypass app policy."
+            "The deterministic mandate permits this intent. Submit with execute_world_order to send it through the local execution sidecar."
         } else {
             "The deterministic World mandate denied this intent; do not construct or stage a transaction."
         };
@@ -376,7 +506,9 @@ impl WorldMarketsApp {
                 "estimated_notional": estimated_notional.to_string(),
                 "order_book": market.book,
                 "pre_execution_risk_adjusted_portfolio_value": account.risk_adjusted_portfolio_value,
-                "post_trade_risk_adjusted_portfolio_value": null,
+                "post_trade_risk_adjusted_portfolio_value": projected.as_ref().map(|p| p.rapv_display.clone()),
+                "post_trade_risk_is_estimate": projected.as_ref().map(|p| p.is_estimate),
+                "post_trade_risk_source": projected.as_ref().map(|p| p.source),
                 "pre_execution_eligible_for_liquidation": account.eligible_for_liquidation,
                 "policy_result": verdict,
                 "executable": false,
@@ -384,6 +516,43 @@ impl WorldMarketsApp {
                 "reason": reason,
             }
         }))
+    }
+
+    fn live_verdict(
+        &self,
+        input: LiveVerdictInput<'_>,
+        ctx: &DynToolCallCtx,
+    ) -> Result<(crate::client::Market, Decimal, Verdict), String> {
+        let quote_for_book = (input.product != "lend").then(|| input.quote.clone());
+        let market = self
+            .client
+            .market(input.product, input.base.clone(), quote_for_book)?;
+        let mark_price = parse_decimal(&market.mark_price, "mark_price")
+            .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        let current_position_quantity =
+            current_position(input.account, input.product, &input.base.symbol)?;
+        let rapv = parse_decimal(
+            &input.account.risk_adjusted_portfolio_value,
+            "risk_adjusted_portfolio_value",
+        )
+        .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        let mandate = Mandate::bound(ctx.attribute_path(&["handover_mandate"]));
+        let verdict = match mandate {
+            Ok(mandate) => mandate.evaluate(&TradeFacts {
+                product: input.product,
+                side: input.side,
+                base: &input.base.symbol,
+                quote: &input.quote.symbol,
+                quantity: input.quantity,
+                mark_price,
+                current_position_quantity,
+                risk_adjusted_portfolio_value: rapv,
+                post_trade_risk_adjusted_portfolio_value: Some(rapv),
+                eligible_for_liquidation: input.account.eligible_for_liquidation,
+            }),
+            Err(verdict) => verdict,
+        };
+        Ok((market, mark_price, verdict))
     }
 }
 
@@ -505,6 +674,262 @@ impl DynAomiTool for CheckWorldMandate {
             })),
             "policy_result": preview.pointer("/preview/policy_result"),
             "executable": false,
+        }))
+    }
+}
+
+impl DynAomiTool for ExecuteWorldOrder {
+    type App = WorldMarketsApp;
+    type Args = ExecuteWorldOrderArgs;
+    const NAME: &'static str = "execute_world_order";
+    const DESCRIPTION: &'static str = "Place a World spot, perp, or lend/borrow order through the local execution sidecar after the mandate allows. Limit if price is set, otherwise market/IOC. Never withdraws.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let product = normalize_execute_product(&args.product)?;
+        let side = normalize_execute_side(product, &args.side)?;
+        let quantity = parse_decimal(&args.quantity, "quantity")
+            .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        if quantity <= Decimal::ZERO {
+            return Err("[world-markets] quantity must be greater than zero".to_string());
+        }
+        let access = app.access(args.account_id, args.wallet_address.as_deref(), &ctx)?;
+        let assets = app.client.assets()?;
+        let account = app.client.account(access.account_id, &assets)?;
+        let base = asset_by_symbol(&assets, &args.base_symbol)?;
+        let quote_symbol = args
+            .quote_symbol
+            .clone()
+            .unwrap_or_else(|| "USDT".to_string());
+        let quote = asset_by_symbol(&assets, &quote_symbol)?;
+        let (market, _, verdict) = app.live_verdict(
+            LiveVerdictInput {
+                product,
+                side: &side,
+                base: &base,
+                quote: &quote,
+                quantity,
+                account: &account,
+            },
+            &ctx,
+        )?;
+        if !verdict.is_allow() {
+            return Ok(execution_blocked(&access, &verdict));
+        }
+        let order_type = resolve_order_type(args.order_type.as_deref(), args.price.as_deref());
+        let receipt = app.execution.place_order(&PlaceOrderRequest {
+            account_id: access.account_id,
+            product: product.to_string(),
+            side: side.clone(),
+            base_token_id: base.token_id,
+            quote_token_id: (product != "lend").then_some(quote.token_id),
+            quantity: args.quantity.clone(),
+            price: args.price.clone(),
+            order_type,
+            slippage: args.slippage.clone(),
+        })?;
+        Ok(execution_ok(
+            &access,
+            &verdict,
+            receipt,
+            json!({
+                "product": product,
+                "side": side,
+                "base_symbol": base.symbol,
+                "quote_symbol": quote.symbol,
+                "quantity": args.quantity,
+                "order_book": market.book,
+            }),
+        ))
+    }
+}
+
+impl DynAomiTool for CancelWorldOrder {
+    type App = WorldMarketsApp;
+    type Args = CancelWorldOrderArgs;
+    const NAME: &'static str = "cancel_world_order";
+    const DESCRIPTION: &'static str = "Cancel a resting World order through the local execution sidecar. Requires a bound mandate and a live trader grant. Spot/perp need order_id; lend/borrow need interest_rate.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let product = normalize_execute_product(&args.product)?;
+        let side = normalize_execute_side(product, &args.side)?;
+        let access = app.access(args.account_id, args.wallet_address.as_deref(), &ctx)?;
+        Mandate::bound(ctx.attribute_path(&["handover_mandate"]))
+            .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        let assets = app.client.assets()?;
+        let base = asset_by_symbol(&assets, &args.base_symbol)?;
+        let quote = match args.quote_symbol.as_deref() {
+            Some(symbol) => Some(asset_by_symbol(&assets, symbol)?),
+            None if product == "lend" => None,
+            None => {
+                return Err(
+                    "[world-markets] quote_symbol is required to cancel a spot or perp order"
+                        .to_string(),
+                );
+            }
+        };
+        if product != "lend" && args.order_id.is_none() {
+            return Err(
+                "[world-markets] order_id is required to cancel a spot or perp order".to_string(),
+            );
+        }
+        if product == "lend" && args.interest_rate.is_none() {
+            return Err(
+                "[world-markets] interest_rate is required to cancel a lend or borrow order"
+                    .to_string(),
+            );
+        }
+        let receipt = app.execution.cancel_order(&CancelOrderRequest {
+            account_id: access.account_id,
+            product: product.to_string(),
+            side,
+            base_token_id: base.token_id,
+            quote_token_id: quote.as_ref().map(|asset| asset.token_id),
+            order_id: args.order_id.clone(),
+            price: args.interest_rate.clone(),
+            interest_rate: args.interest_rate.clone(),
+        })?;
+        Ok(json!({
+            "source": "world-markets-execution",
+            "executable": true,
+            "access": access,
+            "receipt": receipt,
+        }))
+    }
+}
+
+impl DynAomiTool for ExecuteWorldSwap {
+    type App = WorldMarketsApp;
+    type Args = ExecuteWorldSwapArgs;
+    const NAME: &'static str = "execute_world_swap";
+    const DESCRIPTION: &'static str = "Swap two World assets through the local execution sidecar (SwapAggregator) after the mandate allows the equivalent spot intent.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let amount_in = parse_decimal(&args.amount_in, "amount_in")
+            .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        if amount_in <= Decimal::ZERO {
+            return Err("[world-markets] amount_in must be greater than zero".to_string());
+        }
+        let access = app.access(args.account_id, args.wallet_address.as_deref(), &ctx)?;
+        let assets = app.client.assets()?;
+        let account = app.client.account(access.account_id, &assets)?;
+        let token_in = asset_by_symbol(&assets, &args.token_in_symbol)?;
+        let token_out = asset_by_symbol(&assets, &args.token_out_symbol)?;
+        let usdt_in = token_in.symbol.eq_ignore_ascii_case("USDT");
+        let usdt_out = token_out.symbol.eq_ignore_ascii_case("USDT");
+        if !usdt_in && !usdt_out {
+            return Err(
+                "[world-markets] local swaps must include USDT so the mandate quote matches"
+                    .to_string(),
+            );
+        }
+        let (side, base, quote) = if usdt_in {
+            ("buy".to_string(), token_out.clone(), token_in.clone())
+        } else {
+            ("sell".to_string(), token_in.clone(), token_out.clone())
+        };
+        let market = app
+            .client
+            .market("spot", base.clone(), Some(quote.clone()))?;
+        let mark = parse_decimal(&market.mark_price, "mark_price")
+            .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        let quantity = if usdt_in && !mark.is_zero() {
+            amount_in
+                .checked_div(mark)
+                .ok_or_else(|| "[world-markets] swap quantity exceeds numeric range".to_string())?
+        } else {
+            amount_in
+        };
+        let (_, _, verdict) = app.live_verdict(
+            LiveVerdictInput {
+                product: "spot",
+                side: &side,
+                base: &base,
+                quote: &quote,
+                quantity,
+                account: &account,
+            },
+            &ctx,
+        )?;
+        if !verdict.is_allow() {
+            return Ok(execution_blocked(&access, &verdict));
+        }
+        let receipt = app.execution.swap(&SwapRequest {
+            account_id: access.account_id,
+            token_in: token_in.erc20_address.clone(),
+            token_out: token_out.erc20_address.clone(),
+            amount_in: args.amount_in.clone(),
+            slippage: args.slippage.clone(),
+        })?;
+        Ok(execution_ok(
+            &access,
+            &verdict,
+            receipt,
+            json!({
+                "token_in": token_in.symbol,
+                "token_out": token_out.symbol,
+                "amount_in": args.amount_in,
+            }),
+        ))
+    }
+}
+
+impl DynAomiTool for RenewWorldLoans {
+    type App = WorldMarketsApp;
+    type Args = RenewWorldLoansArgs;
+    const NAME: &'static str = "renew_world_loans";
+    const DESCRIPTION: &'static str = "Extend borrower loans that are due or within the given hour window, via the local execution sidecar. Requires a bound mandate and a live trader grant. Routine renewals are silent in chat.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let access = app.access(args.account_id, args.wallet_address.as_deref(), &ctx)?;
+        let mandate = Mandate::bound(ctx.attribute_path(&["handover_mandate"]))
+            .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        let assets = app.client.assets()?;
+        let account = app.client.account(access.account_id, &assets)?;
+        let rapv = parse_decimal(
+            &account.risk_adjusted_portfolio_value,
+            "risk_adjusted_portfolio_value",
+        )
+        .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        if account.eligible_for_liquidation && mandate.halt_if_eligible_for_liquidation {
+            return Ok(execution_blocked(
+                &access,
+                &Verdict {
+                    status: "deny",
+                    rule: "liquidatable",
+                    detail: "The live World account is eligible for liquidation and this mandate requires a halt.".to_string(),
+                },
+            ));
+        }
+        let floor = parse_decimal(&mandate.min_risk_adjusted_portfolio_value.amount, "floor")
+            .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        if rapv < floor {
+            return Ok(execution_blocked(
+                &access,
+                &Verdict {
+                    status: "deny",
+                    rule: "portfolio_floor",
+                    detail: format!(
+                        "Live risk-adjusted portfolio value {rapv} is below the mandate floor {floor}."
+                    ),
+                },
+            ));
+        }
+        let token_ids = account
+            .lending_positions
+            .iter()
+            .filter(|position| position.borrower_quantity_raw > 0)
+            .map(|position| position.token_id)
+            .collect::<Vec<_>>();
+        let receipt = app.execution.renew_loans(&RenewLoansRequest {
+            account_id: access.account_id,
+            token_ids,
+            max_hours_remaining: args.within_hours,
+        })?;
+        Ok(json!({
+            "source": "world-markets-execution",
+            "executable": true,
+            "access": access,
+            "receipt": receipt,
         }))
     }
 }
@@ -659,7 +1084,7 @@ impl DynAomiTool for ComputeResize {
     const DESCRIPTION: &'static str = "For a blocked intent, return the user's RAPV floor from the signed mandate. A block cites exactly one number: the floor. Never executes.";
 
     fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
-        let mandate = Mandate::parse(ctx.attribute_path(&["handover_mandate"]))
+        let mandate = Mandate::bound(ctx.attribute_path(&["handover_mandate"]))
             .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
         let floor = parse_decimal(&mandate.min_risk_adjusted_portfolio_value.amount, "floor")
             .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
@@ -985,6 +1410,63 @@ fn normalize_product(product: &str) -> Result<&'static str, String> {
     }
 }
 
+fn normalize_execute_product(product: &str) -> Result<&'static str, String> {
+    match product.to_ascii_lowercase().as_str() {
+        "spot" => Ok("spot"),
+        "perp" | "perpetual" => Ok("perp"),
+        "lend" | "lending" => Ok("lend"),
+        _ => Err("[world-markets] execute tools support spot, perp, or lend".to_string()),
+    }
+}
+
+fn normalize_execute_side(product: &str, side: &str) -> Result<String, String> {
+    let side = side.to_ascii_lowercase();
+    let ok = match product {
+        "lend" => matches!(side.as_str(), "lend" | "borrow" | "buy" | "sell"),
+        "perp" => matches!(side.as_str(), "buy" | "sell" | "long" | "short"),
+        _ => matches!(side.as_str(), "buy" | "sell"),
+    };
+    if !ok {
+        return Err(format!(
+            "[world-markets] unsupported side {side:?} for product {product}"
+        ));
+    }
+    Ok(match side.as_str() {
+        "long" => "buy".to_string(),
+        "short" => "sell".to_string(),
+        other => other.to_string(),
+    })
+}
+
+fn resolve_order_type(named: Option<&str>, price: Option<&str>) -> String {
+    match named.map(|value| value.to_ascii_lowercase()).as_deref() {
+        Some("market") | Some("ioc") => "market".to_string(),
+        Some("limit") => "limit".to_string(),
+        _ if price.is_some() => "limit".to_string(),
+        _ => "market".to_string(),
+    }
+}
+
+fn execution_blocked(access: &AccountAccess, verdict: &Verdict) -> Value {
+    json!({
+        "source": "world-markets-execution",
+        "executable": false,
+        "access": access,
+        "policy_result": verdict,
+    })
+}
+
+fn execution_ok(access: &AccountAccess, verdict: &Verdict, receipt: Value, intent: Value) -> Value {
+    json!({
+        "source": "world-markets-execution",
+        "executable": true,
+        "access": access,
+        "intent": intent,
+        "policy_result": verdict,
+        "receipt": receipt,
+    })
+}
+
 fn normalize_effect_product(product: &str) -> Result<&'static str, String> {
     match product.to_ascii_lowercase().as_str() {
         "spot" => Ok("spot"),
@@ -1065,6 +1547,11 @@ fn current_position(
             .iter()
             .find(|balance| balance.symbol.eq_ignore_ascii_case(base_symbol))
             .map(|balance| balance.balance.as_str()),
+        "lend" => account
+            .lending_positions
+            .iter()
+            .find(|position| position.symbol.eq_ignore_ascii_case(base_symbol))
+            .map(|position| position.lender_quantity.as_str()),
         _ => None,
     }
     .unwrap_or("0");
@@ -1083,6 +1570,41 @@ mod tests {
         assert_eq!(value_u64(Some(&json!("42"))), Some(42));
         assert_eq!(value_u64(Some(&json!("world-42"))), Some(42));
         assert_eq!(value_u64(Some(&json!("other-42"))), None);
+    }
+
+    #[test]
+    fn resolve_order_type_infers_limit_from_price() {
+        assert_eq!(resolve_order_type(None, Some("2000")), "limit");
+        assert_eq!(resolve_order_type(None, None), "market");
+        assert_eq!(resolve_order_type(Some("market"), Some("2000")), "market");
+    }
+
+    #[test]
+    fn execute_order_fails_closed_without_account_context() {
+        let app = WorldMarketsApp::default();
+        let err = ExecuteWorldOrder::run(
+            &app,
+            ExecuteWorldOrderArgs {
+                product: "perp".to_string(),
+                side: "buy".to_string(),
+                base_symbol: "WETH".to_string(),
+                quote_symbol: Some("USDT".to_string()),
+                quantity: "0.1".to_string(),
+                price: None,
+                order_type: None,
+                slippage: None,
+                account_id: None,
+                wallet_address: None,
+            },
+            empty_ctx("execute_world_order"),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("no World account")
+                || err.contains("no acting wallet")
+                || err.contains("execution sidecar"),
+            "{err}"
+        );
     }
 
     fn ctx_with(attributes: Value) -> DynToolCallCtx {

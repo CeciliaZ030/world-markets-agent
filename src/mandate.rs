@@ -89,6 +89,10 @@ impl Verdict {
     }
 }
 
+/// Bundled aomi-run placeholder (`mandate.dev.example.json`). Used when
+/// handover is stubbed and `WORLD_MANDATE_PATH` is unset, empty, or `placeholder`.
+const PLACEHOLDER_MANDATE_JSON: &str = include_str!("../mandate.dev.example.json");
+
 /// Canonical detail for the mandate-absent family. One string; the message
 /// layer renders it verbatim and does not choose among variants.
 pub(crate) const MANDATE_ABSENT_DETAIL: &str = "No mandate is bound to this account.";
@@ -110,7 +114,54 @@ fn mandate_absent(rule: &'static str) -> Verdict {
     Verdict::deny(rule, MANDATE_ABSENT_DETAIL)
 }
 
+fn is_placeholder_mandate_path(path: &str) -> bool {
+    matches!(
+        path.trim().to_ascii_lowercase().as_str(),
+        "" | "placeholder" | "dev" | "-"
+    )
+}
+
+fn is_mandate_absent_path(path: &str) -> bool {
+    matches!(
+        path.trim().to_ascii_lowercase().as_str(),
+        "none" | "off" | "missing"
+    )
+}
+
 impl Mandate {
+    /// Hosted: `handover_mandate`. Local aomi-run stubs that to None, so this
+    /// falls back to `WORLD_MANDATE_JSON`, a file at `WORLD_MANDATE_PATH`, or
+    /// the bundled placeholder when the path is unset / `placeholder`.
+    /// Set `WORLD_MANDATE_PATH=none` to keep the fail-closed handshake locally.
+    pub(crate) fn bound(handover: Option<&Value>) -> Result<Self, Verdict> {
+        if handover.is_some() {
+            return Self::parse(handover);
+        }
+        if let Ok(raw) = std::env::var("WORLD_MANDATE_JSON")
+            && !raw.trim().is_empty()
+        {
+            return Self::parse_json(&raw);
+        }
+        match std::env::var("WORLD_MANDATE_PATH") {
+            Ok(path) if is_mandate_absent_path(&path) => Self::parse(None),
+            Ok(path) if is_placeholder_mandate_path(&path) => {
+                Self::parse_json(PLACEHOLDER_MANDATE_JSON)
+            }
+            Ok(path) => {
+                let raw = std::fs::read_to_string(&path)
+                    .map_err(|_| mandate_absent("invalid_mandate"))?;
+                Self::parse_json(&raw)
+            }
+            Err(_) => Self::parse_json(PLACEHOLDER_MANDATE_JSON),
+        }
+    }
+
+    fn parse_json(raw: &str) -> Result<Self, Verdict> {
+        let value: Value =
+            serde_json::from_str(raw).map_err(|_| mandate_absent("invalid_mandate"))?;
+        Self::parse(Some(&value))
+    }
+
     pub(crate) fn parse(value: Option<&Value>) -> Result<Self, Verdict> {
         let Some(value) = value else {
             return Err(mandate_absent("missing_mandate"));
@@ -174,15 +225,15 @@ impl Mandate {
             );
         }
 
-        let signed_quantity = if facts.side.eq_ignore_ascii_case("buy") {
+        let signed_quantity = if is_long_side(facts.side) {
             facts.quantity
-        } else if facts.side.eq_ignore_ascii_case("sell") {
+        } else if is_short_side(facts.side) {
             -facts.quantity
         } else {
             return Verdict::deny(
                 "invalid_side",
                 format!(
-                    "Unsupported trade side {:?}; expected buy or sell.",
+                    "Unsupported trade side {:?}; expected buy/sell, long/short, or lend/borrow.",
                     facts.side
                 ),
             );
@@ -312,9 +363,24 @@ fn amount(limit: &AmountLimit, expected_quote: &str) -> Result<Decimal, Verdict>
     parse_positive(&limit.amount, "mandate amount")
 }
 
+fn is_long_side(side: &str) -> bool {
+    matches!(
+        side.to_ascii_lowercase().as_str(),
+        "buy" | "long" | "borrow"
+    )
+}
+
+fn is_short_side(side: &str) -> bool {
+    matches!(
+        side.to_ascii_lowercase().as_str(),
+        "sell" | "short" | "lend"
+    )
+}
+
 fn normalize_product(product: &str) -> &str {
     match product {
         "perpetual" => "perp",
+        "lending" => "lend",
         other => other,
     }
 }
@@ -355,6 +421,71 @@ mod tests {
     #[test]
     fn allows_trade_inside_every_limit() {
         assert!(mandate().evaluate(&facts()).is_allow());
+    }
+
+    #[test]
+    fn allows_long_and_borrow_side_aliases() {
+        let mut trade = facts();
+        trade.side = "long";
+        assert!(mandate().evaluate(&trade).is_allow());
+
+        let lend = Mandate::parse(Some(&json!({
+            "version": 1,
+            "markets": [{ "product": "lend", "base": "WETH", "quote": "USDT" }],
+            "max_position_notional": { "amount": "25000", "quote": "USDT" },
+            "max_leverage": "3",
+            "min_risk_adjusted_portfolio_value": { "amount": "5000", "quote": "USDT" },
+            "halt_if_eligible_for_liquidation": true,
+            "can_withdraw": false
+        })))
+        .unwrap();
+        let mut trade = facts();
+        trade.product = "lend";
+        trade.side = "borrow";
+        assert!(lend.evaluate(&trade).is_allow());
+    }
+
+    #[test]
+    fn bound_local_env_fallbacks_are_serial() {
+        // Env mutation is process-global; keep the three local-fallback cases
+        // in one test so they cannot race with each other.
+        let previous_json = std::env::var("WORLD_MANDATE_JSON").ok();
+        let previous_path = std::env::var("WORLD_MANDATE_PATH").ok();
+
+        let json = r#"{
+            "version": 1,
+            "markets": [{ "product": "perp", "base": "WETH", "quote": "USDT" }],
+            "max_position_notional": { "amount": "25000", "quote": "USDT" },
+            "max_leverage": "3",
+            "min_risk_adjusted_portfolio_value": { "amount": "5000", "quote": "USDT" },
+            "halt_if_eligible_for_liquidation": true,
+            "can_withdraw": false
+        }"#;
+        unsafe { std::env::set_var("WORLD_MANDATE_JSON", json) };
+        let from_json = Mandate::bound(None).unwrap();
+        assert_eq!(from_json.version, 1);
+
+        unsafe { std::env::remove_var("WORLD_MANDATE_JSON") };
+        unsafe { std::env::remove_var("WORLD_MANDATE_PATH") };
+        let unset = Mandate::bound(None).unwrap();
+        unsafe { std::env::set_var("WORLD_MANDATE_PATH", "placeholder") };
+        let sentinel = Mandate::bound(None).unwrap();
+        assert_eq!(unset.version, 1);
+        assert!(unset.markets.iter().any(|market| market.base == "WETH"));
+        assert_eq!(sentinel.markets.len(), unset.markets.len());
+
+        unsafe { std::env::set_var("WORLD_MANDATE_PATH", "none") };
+        let verdict = Mandate::bound(None).unwrap_err();
+        assert_eq!(verdict.rule, "missing_mandate");
+
+        match previous_json {
+            Some(value) => unsafe { std::env::set_var("WORLD_MANDATE_JSON", value) },
+            None => unsafe { std::env::remove_var("WORLD_MANDATE_JSON") },
+        }
+        match previous_path {
+            Some(value) => unsafe { std::env::set_var("WORLD_MANDATE_PATH", value) },
+            None => unsafe { std::env::remove_var("WORLD_MANDATE_PATH") },
+        }
     }
 
     #[test]
@@ -438,6 +569,15 @@ mod tests {
             mandate().evaluate(&trade).rule,
             "post_trade_portfolio_floor"
         );
+    }
+
+    #[test]
+    fn allows_when_post_trade_rapv_is_proven_and_clears_floor() {
+        let mut trade = facts();
+        trade.post_trade_risk_adjusted_portfolio_value = Some(Decimal::new(5_000, 0));
+        let verdict = mandate().evaluate(&trade);
+        assert!(verdict.is_allow(), "{}", verdict.detail);
+        assert_eq!(verdict.rule, "mandate_v1");
     }
 
     #[test]
