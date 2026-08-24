@@ -457,7 +457,10 @@ fn mandate_absent_handshake_stated() {
         "invalid_mandate",
         "unsupported_mandate_version",
     ] {
-        assert!(wf.contains(code), "workflows missing mandate-absent code {code}");
+        assert!(
+            wf.contains(code),
+            "workflows missing mandate-absent code {code}"
+        );
     }
     assert!(
         wf.contains("I can't trade — or withdraw, transfer, or bridge")
@@ -493,5 +496,150 @@ fn measured_layer_idioms_present() {
     assert!(
         rules.contains("intent only") || rules.contains("never figures"),
         "preview_account_effect must be intent-only"
+    );
+}
+
+/// Shortcut discovery — slash aliases, identity, fade, index, and fallback.
+const INDEX_LINE: &str = "One letter, one answer: `/b` balance · `/p` positions · `/r` risk · `/a` available · `/d` dollarpower. Or say what you want in a sentence.";
+const FALLBACK_LINE: &str =
+    "I didn't catch that — try `/p` for positions, or say what you'd like to do.";
+
+#[test]
+fn shortcut_slash_aliases_and_word_forms() {
+    let lookups = skill("lookups.md");
+    for token in ["`b`/`/b`", "`p`/`/p`", "`r`/`/r`", "`a`/`/a`", "`d`/`/d`"] {
+        assert!(
+            lookups.contains(token),
+            "lookups must list slash alias {token}"
+        );
+    }
+    for word in [
+        "balance",
+        "positions",
+        "risk",
+        "available",
+        "dollarpower",
+        "/balance",
+        "/positions",
+    ] {
+        assert!(lookups.contains(word), "lookups must list word form {word}");
+    }
+    assert!(
+        lookups.contains("whole-message match only"),
+        "slash matching must stay whole-message"
+    );
+    assert!(
+        lookups.contains("`/p` ≡ `p`") || lookups.contains("/p` ≡ `p"),
+        "lookups must equate slash and bare tokens"
+    );
+}
+
+#[test]
+fn shortcut_identity_and_fade_stated() {
+    let lookups = skill("lookups.md");
+    let instructions = skill("instructions.md");
+    assert!(
+        lookups.contains("`/letter`") && lookups.contains("code entity"),
+        "lookups must require slash-prefixed mono display"
+    );
+    assert!(
+        lookups.contains("first two natural-language")
+            && lookups.contains("Never on token answers"),
+        "lookups must state the fade gate"
+    );
+    for label in [
+        "`b` balance",
+        "`p` positions",
+        "`r` risk",
+        "`a` available",
+        "`d` dollarpower",
+    ] {
+        assert!(
+            lookups.contains(label),
+            "lookups must pair token with label {label}"
+        );
+    }
+    assert!(
+        instructions.contains("Shortcuts are literal"),
+        "instructions must state the shortcut identity"
+    );
+    assert!(
+        instructions.contains("exactly twice per token"),
+        "instructions must state the fade"
+    );
+}
+
+#[test]
+fn capability_index_and_fallback_copy() {
+    let lookups = skill("lookups.md");
+    let instructions = skill("instructions.md");
+    let wf = skill("workflows.md");
+    assert!(
+        lookups.contains(INDEX_LINE),
+        "lookups must carry the capability index line"
+    );
+    assert!(
+        wf.contains(INDEX_LINE),
+        "workflows §6.19 must carry the capability index line"
+    );
+    assert!(
+        wf.contains(FALLBACK_LINE) && instructions.contains(FALLBACK_LINE),
+        "fallback one-liner must live in instructions and §6.20"
+    );
+    assert!(
+        lookups.contains("| Capability |")
+            && lookups.contains("what can you do?")
+            && lookups.contains("commands")
+            && lookups.contains("shortcuts"),
+        "lookups table must route capability asks to the index"
+    );
+    for file_src in [&lookups, &instructions, &wf] {
+        assert!(
+            file_src.contains("never \"help\"")
+                || file_src.contains("Not \"help\"")
+                || file_src.contains("Do **not** fire on \"help\""),
+            "help must be excluded from the capability index trigger"
+        );
+        assert!(
+            !file_src.contains("check balances, positions, risk")
+                && !file_src.contains("preview trades")
+                && !file_src.contains("I don't recognize that command"),
+            "old capability-list fallback must be gone"
+        );
+    }
+    assert!(
+        wf.contains("## 6.19") && wf.contains("## 6.20"),
+        "workflows must add §6.19 and §6.20"
+    );
+}
+
+#[test]
+fn shortcuts_absent_from_non_lookup_surfaces() {
+    let wf = skill("workflows.md");
+    let start = wf.find("## 6.1").expect("6.1 present");
+    let end = wf.find("## 6.19").expect("6.19 present");
+    let prior: String = wf[start..end]
+        .lines()
+        .filter(|l| l.trim_start().starts_with('>'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for token in ["`/b`", "`/p`", "`/r`", "`/a`", "`/d`"] {
+        assert!(
+            !prior.contains(token),
+            "shortcut {token} must not appear in action/health/digest response copy"
+        );
+    }
+    let first_contact = {
+        let s = wf.find("## 6.1").unwrap();
+        let e = wf[s..].find("## 6.2").map(|o| s + o).unwrap();
+        &wf[s..e]
+    };
+    assert!(
+        first_contact.contains("I can trade in your account within your signed mandate."),
+        "§6.1 first-contact copy must stay untouched"
+    );
+    assert!(
+        !first_contact.contains("`/b`") && !first_contact.contains("`/p`"),
+        "§6.1 must not grow a shortcut menu"
     );
 }
