@@ -643,3 +643,21 @@ fn shortcuts_absent_from_non_lookup_surfaces() {
         "§6.1 must not grow a shortcut menu"
     );
 }
+
+#[test]
+fn mini_app_button_copy_is_exact_and_unpromoted() {
+    let rules = skill("action-rules.md");
+    assert!(
+        rules.contains("Opens a detailed portfolio view in a Mini App. Tap it."),
+        "action-rules must ship the Mini App exact reply"
+    );
+    let wf = skill("workflows.md");
+    assert!(
+        wf.contains("[View portfolio]"),
+        "workflows must note the host View portfolio button"
+    );
+    assert!(
+        wf.contains("do not mention the button"),
+        "workflows must forbid mentioning the Mini App button"
+    );
+}

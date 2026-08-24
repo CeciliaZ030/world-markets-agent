@@ -40,6 +40,8 @@ Natural-language lookup (not a token): append italic *`/X` = label.* last — fi
 
 **`b`:** > Portfolio `[#]`. *(reducible until window P&L ships — never fabricate a delta.)*
 
+Host may attach [View portfolio] after `b`/`p`; do not mention it.
+
 **`p`** — `lookups.positions`. Fixed class order, never ranked across classes. Class labels **bold**; spine glyphs in prose only:
 
 - **Holdings** ◆ — spot (cash is a holding, never ranked against a perp)

@@ -8,6 +8,7 @@ mod liquidation_risk;
 mod loans;
 mod lookups;
 mod mandate;
+pub mod mini_app;
 mod pnl;
 mod preamble;
 mod rates;

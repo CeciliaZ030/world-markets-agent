@@ -211,6 +211,8 @@ Normal:
 
 Risky (score ≥ `8`): name the issue with band (`high` / `eligible`); feeling line uses the issue clause; button `[Review the {position}]`. Else unchanged.
 
+Host then adds [View portfolio]; do not mention the button.
+
 ## 6.14 Weekly digest (M6 — one unprompted non-critical message)
 
 Sundays, opt-out. P&L from `get_world_pnl` (position lifetime).
@@ -228,7 +230,7 @@ Sundays, opt-out. P&L from `get_world_pnl` (position lifetime).
 
 > [Nothing for now] [Preview lending]
 
-`Nothing for now` is first. Never ask for more capital.
+`Nothing for now` is first. Never ask for more capital. Host then adds [View portfolio]; do not mention the button.
 
 ## 6.15 Dollarpower
 

@@ -406,7 +406,7 @@ fn compute_netting(holdings: &[ClassRow], perps: &[ClassRow]) -> Vec<NettingLine
     out
 }
 
-fn notional_usdt(
+pub(crate) fn notional_usdt(
     client: &WorldClient,
     asset: &Asset,
     _base: &Asset,
