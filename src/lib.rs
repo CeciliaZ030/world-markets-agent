@@ -31,6 +31,8 @@ dyn_aomi_app!(
         tool::CancelWorldOrder,
         tool::ExecuteWorldSwap,
         tool::RenewWorldLoans,
+        tool::PayWorldLoanInterest,
+        tool::CloseWorldLoan,
         tool::GetWorldAgentPermission,
         tool::GetWorldOpenOrders,
         tool::GetWorldPnl,

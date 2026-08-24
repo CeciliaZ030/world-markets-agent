@@ -16,3 +16,8 @@
 
 # Execution sidecar
 /sidecar/node_modules/
+
+# Local-only live trading suite artifacts (the suite itself lives in tests/)
+/tests/trading-suite/logs/
+/tests/trading-suite/results.json
+/tests/trading-suite/results.md

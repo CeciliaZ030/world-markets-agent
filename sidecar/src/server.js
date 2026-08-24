@@ -93,6 +93,14 @@ async function handle(req, res) {
       send(res, 200, await renewLoans(body));
       return;
     }
+    if (url.pathname === "/v1/loans/pay-interest") {
+      send(res, 200, await payInterest(body));
+      return;
+    }
+    if (url.pathname === "/v1/loans/close") {
+      send(res, 200, await closeLoans(body));
+      return;
+    }
     send(res, 404, { ok: false, error: "not found" });
   } catch (error) {
     send(res, 400, { ok: false, error: publicError(error) });
@@ -121,7 +129,7 @@ async function placeOrder(body) {
     type: orderType,
   };
   if (product === "lend") {
-    order.interestRate = price;
+    order.interestRate = quantizeLendRate(price);
     delete order.price;
   }
   const receipt = await submitPlace(book, product, side, order);
@@ -140,7 +148,9 @@ async function cancelOrder(body) {
   const book = await orderBook(product, body);
   let receipt;
   if (product === "lend") {
-    const interestRate = required(body.price ?? body.interest_rate, "interest_rate");
+    const interestRate = quantizeLendRate(
+      required(body.price ?? body.interest_rate, "interest_rate"),
+    );
     const lendParams = { interestRate, accountId };
     receipt =
       side === "lend"
@@ -250,6 +260,98 @@ async function renewLoans(body) {
   };
 }
 
+async function payInterest(body) {
+  const accountId = accountIdOf(body);
+  const extendPeriod = Boolean(body.extend_period);
+  const acted = [];
+  const skipped = [];
+  for (const position of await borrowerPositions(body, accountId)) {
+    const receipt = await exchange.payInterestAndFees({
+      positionId: position.positionId,
+      extendPeriod,
+    });
+    acted.push({
+      position_id: position.positionId.toString(),
+      token_id: String(position.tokenId ?? body.token_id ?? ""),
+      transaction_hash: receipt.hash,
+    });
+  }
+  if (acted.length === 0 && skipped.length === 0) {
+    throw new Error("no borrower positions to pay");
+  }
+  return {
+    ok: true,
+    transaction_hash: acted[0]?.transaction_hash ?? null,
+    paid: acted,
+    skipped,
+  };
+}
+
+async function closeLoans(body) {
+  const accountId = accountIdOf(body);
+  const acted = [];
+  for (const position of await borrowerPositions(body, accountId)) {
+    const receipt = await exchange.closeLoan({
+      positionId: position.positionId,
+    });
+    acted.push({
+      position_id: position.positionId.toString(),
+      transaction_hash: receipt.hash,
+    });
+  }
+  if (acted.length === 0) {
+    throw new Error("no borrower positions to close");
+  }
+  return {
+    ok: true,
+    transaction_hash: acted[0]?.transaction_hash ?? null,
+    closed: acted,
+  };
+}
+
+async function borrowerPositions(body, accountId) {
+  const positionId = numericPositionId(body.position_id);
+  if (positionId !== null) {
+    return [{ positionId }];
+  }
+  const tokenIds = Array.isArray(body.token_ids)
+    ? body.token_ids
+    : body.token_id
+      ? [body.token_id]
+      : [];
+  if (tokenIds.length === 0) {
+    throw new Error("token_ids or position_id is required");
+  }
+  const found = [];
+  for (const tokenId of tokenIds) {
+    let positions;
+    try {
+      positions = await exchange.getAllBorrowerPositions({
+        tokenId: Number(tokenId),
+        accountId,
+      });
+    } catch (error) {
+      continue;
+    }
+    for (const position of positions || []) {
+      found.push(position);
+    }
+  }
+  return found;
+}
+
+function quantizeLendRate(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error("interest_rate must be a positive number");
+  }
+  const ticks = Math.round(n * 10000);
+  if (ticks < 1) {
+    throw new Error("interest_rate is below the 0.0001 lend tick");
+  }
+  return (ticks / 10000).toFixed(4);
+}
+
 async function submitPlace(book, product, side, order) {
   if (product === "spot") {
     return side === "buy"
@@ -334,6 +436,13 @@ function accountIdOf(body) {
     throw new Error("account_id is required");
   }
   return BigInt(body.account_id);
+}
+
+function numericPositionId(raw) {
+  if (raw === undefined || raw === null || raw === "") return null;
+  const value = String(raw);
+  if (!/^\d+$/.test(value)) return null;
+  return BigInt(value);
 }
 
 function receiptJson(receipt, extra = {}) {

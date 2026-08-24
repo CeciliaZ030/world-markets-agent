@@ -6,7 +6,8 @@ use serde_json::{Value, json};
 
 use crate::client::{Account, AccountAccess, CHAIN_ID, WorldClient, asset_by_symbol};
 use crate::execution::{
-    CancelOrderRequest, ExecutionClient, PlaceOrderRequest, RenewLoansRequest, SwapRequest,
+    CancelOrderRequest, CloseLoanRequest, ExecutionClient, PayInterestRequest, PlaceOrderRequest,
+    RenewLoansRequest, SwapRequest,
 };
 use crate::guest::{self, Funnel, FunnelConfig, GuestStore};
 use crate::mandate::{Mandate, TradeFacts, Verdict, parse_decimal};
@@ -143,6 +144,8 @@ pub(crate) struct ExecuteWorldOrder;
 pub(crate) struct CancelWorldOrder;
 pub(crate) struct ExecuteWorldSwap;
 pub(crate) struct RenewWorldLoans;
+pub(crate) struct PayWorldLoanInterest;
+pub(crate) struct CloseWorldLoan;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct ExecuteWorldOrderArgs {
@@ -214,6 +217,34 @@ pub(crate) struct RenewWorldLoansArgs {
     /// Extend borrower loans due within this many hours. Defaults to 24.
     #[serde(default)]
     pub(crate) within_hours: Option<u64>,
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    #[serde(default)]
+    pub(crate) wallet_address: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct PayWorldLoanInterestArgs {
+    /// Optional base symbol to restrict which borrower loans are paid.
+    #[serde(default)]
+    pub(crate) base_symbol: Option<String>,
+    /// When true, extend the period (same as a renewal). Defaults to false (pay dues only).
+    #[serde(default)]
+    pub(crate) extend_period: Option<bool>,
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    #[serde(default)]
+    pub(crate) wallet_address: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct CloseWorldLoanArgs {
+    /// Optional base symbol to restrict which borrower loans are closed.
+    #[serde(default)]
+    pub(crate) base_symbol: Option<String>,
+    /// Optional on-chain position id. When omitted, close matching borrower loans.
+    #[serde(default)]
+    pub(crate) position_id: Option<String>,
     #[serde(default)]
     pub(crate) account_id: Option<u64>,
     #[serde(default)]
@@ -553,6 +584,51 @@ impl WorldMarketsApp {
             Err(verdict) => verdict,
         };
         Ok((market, mark_price, verdict))
+    }
+
+    fn loan_execution_prep(
+        &self,
+        account_id: Option<u64>,
+        wallet_address: Option<&str>,
+        base_symbol: Option<&str>,
+        ctx: &DynToolCallCtx,
+    ) -> Result<(AccountAccess, Vec<u32>), String> {
+        let access = self.access(account_id, wallet_address, ctx)?;
+        let mandate = Mandate::bound(ctx.attribute_path(&["handover_mandate"]))
+            .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        let assets = self.client.assets()?;
+        let account = self.client.account(access.account_id, &assets)?;
+        let rapv = parse_decimal(
+            &account.risk_adjusted_portfolio_value,
+            "risk_adjusted_portfolio_value",
+        )
+        .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        if account.eligible_for_liquidation && mandate.halt_if_eligible_for_liquidation {
+            return Err(
+                "[world-markets] liquidatable: The live World account is eligible for liquidation and this mandate requires a halt."
+                    .to_string(),
+            );
+        }
+        let floor = parse_decimal(&mandate.min_risk_adjusted_portfolio_value.amount, "floor")
+            .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        if rapv < floor {
+            return Err(format!(
+                "[world-markets] portfolio_floor: Live risk-adjusted portfolio value {rapv} is below the mandate floor {floor}."
+            ));
+        }
+        let wanted = base_symbol.map(|symbol| symbol.to_ascii_uppercase());
+        let token_ids = account
+            .lending_positions
+            .iter()
+            .filter(|position| position.borrower_quantity_raw > 0)
+            .filter(|position| {
+                wanted
+                    .as_ref()
+                    .is_none_or(|symbol| position.symbol.eq_ignore_ascii_case(symbol))
+            })
+            .map(|position| position.token_id)
+            .collect::<Vec<_>>();
+        Ok((access, token_ids))
     }
 }
 
@@ -924,6 +1000,61 @@ impl DynAomiTool for RenewWorldLoans {
             account_id: access.account_id,
             token_ids,
             max_hours_remaining: args.within_hours,
+        })?;
+        Ok(json!({
+            "source": "world-markets-execution",
+            "executable": true,
+            "access": access,
+            "receipt": receipt,
+        }))
+    }
+}
+
+impl DynAomiTool for PayWorldLoanInterest {
+    type App = WorldMarketsApp;
+    type Args = PayWorldLoanInterestArgs;
+    const NAME: &'static str = "pay_world_loan_interest";
+    const DESCRIPTION: &'static str = "Pay interest and fees on live borrower loans through the local execution sidecar. Does not extend the term unless extend_period is true. Requires a bound mandate.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let (access, token_ids) = app.loan_execution_prep(
+            args.account_id,
+            args.wallet_address.as_deref(),
+            args.base_symbol.as_deref(),
+            &ctx,
+        )?;
+        let receipt = app.execution.pay_interest(&PayInterestRequest {
+            account_id: access.account_id,
+            token_ids,
+            position_id: None,
+            extend_period: args.extend_period,
+        })?;
+        Ok(json!({
+            "source": "world-markets-execution",
+            "executable": true,
+            "access": access,
+            "receipt": receipt,
+        }))
+    }
+}
+
+impl DynAomiTool for CloseWorldLoan {
+    type App = WorldMarketsApp;
+    type Args = CloseWorldLoanArgs;
+    const NAME: &'static str = "close_world_loan";
+    const DESCRIPTION: &'static str = "Close borrower loans and pay remaining interest through the local execution sidecar. Requires a bound mandate. Pass position_id to close one loan, or a base_symbol to close matching borrows.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let (access, token_ids) = app.loan_execution_prep(
+            args.account_id,
+            args.wallet_address.as_deref(),
+            args.base_symbol.as_deref(),
+            &ctx,
+        )?;
+        let receipt = app.execution.close_loan(&CloseLoanRequest {
+            account_id: access.account_id,
+            token_ids,
+            position_id: numeric_position_id(args.position_id.as_deref()),
         })?;
         Ok(json!({
             "source": "world-markets-execution",
@@ -1447,6 +1578,14 @@ fn resolve_order_type(named: Option<&str>, price: Option<&str>) -> String {
     }
 }
 
+fn numeric_position_id(raw: Option<&str>) -> Option<String> {
+    let value = raw?.trim();
+    if value.is_empty() || !value.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    Some(value.to_string())
+}
+
 fn execution_blocked(access: &AccountAccess, verdict: &Verdict) -> Value {
     json!({
         "source": "world-markets-execution",
@@ -1577,6 +1716,16 @@ mod tests {
         assert_eq!(resolve_order_type(None, Some("2000")), "limit");
         assert_eq!(resolve_order_type(None, None), "market");
         assert_eq!(resolve_order_type(Some("market"), Some("2000")), "market");
+    }
+
+    #[test]
+    fn numeric_position_id_ignores_aggregated_loan_ids() {
+        assert_eq!(
+            numeric_position_id(Some("436080915855955")),
+            Some("436080915855955".to_string())
+        );
+        assert_eq!(numeric_position_id(Some("agg:WETH:borrower")), None);
+        assert_eq!(numeric_position_id(None), None);
     }
 
     #[test]

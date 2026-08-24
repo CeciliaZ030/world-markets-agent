@@ -68,6 +68,24 @@ pub(crate) struct RenewLoansRequest {
     pub(crate) max_hours_remaining: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PayInterestRequest {
+    pub(crate) account_id: u64,
+    pub(crate) token_ids: Vec<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) position_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) extend_period: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CloseLoanRequest {
+    pub(crate) account_id: u64,
+    pub(crate) token_ids: Vec<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) position_id: Option<String>,
+}
+
 impl Default for ExecutionClient {
     fn default() -> Self {
         Self::from_env()
@@ -103,6 +121,14 @@ impl ExecutionClient {
 
     pub(crate) fn renew_loans(&self, request: &RenewLoansRequest) -> Result<Value, String> {
         self.post("/v1/loans/renew", request)
+    }
+
+    pub(crate) fn pay_interest(&self, request: &PayInterestRequest) -> Result<Value, String> {
+        self.post("/v1/loans/pay-interest", request)
+    }
+
+    pub(crate) fn close_loan(&self, request: &CloseLoanRequest) -> Result<Value, String> {
+        self.post("/v1/loans/close", request)
     }
 
     fn post<T: Serialize>(&self, path: &str, body: &T) -> Result<Value, String> {
