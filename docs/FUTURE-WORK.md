@@ -99,6 +99,27 @@ When Aomi documents host signing, or when swapping the rest of the Rust contract
 
 ---
 
+## Candlestick charts (Telegram photo delivery)
+
+### Current state
+
+`render_market_chart` fetches OHLC from a pluggable feed (Yahoo by default), writes a compact PNG under `WORLD_CHART_DIR` (auto-pruned), and returns `caption` plus `image` / `image_status` / `image_path` — the same field names as share cards. Local `aomi-run` can `open` the file when `WORLD_CHART_OPEN=1`. The plugin does not call Telegram `sendPhoto`.
+
+### Observations
+
+Aomi tools return JSON only. Hosted Telegram will not show a photo until the runtime attaches `image_path` (or equivalent bytes) the same way it is supposed to attach share-card PNGs.
+
+### Future intention
+
+Host sends the generated PNG via Telegram `sendPhoto` (or a documented image-attachment envelope). Keep plugin charts ephemeral: do not archive bytes in the host transcript.
+
+### When to revisit
+
+When Aomi documents image/photo delivery from tool results, or alongside the share-card PNG renderer.
+
+
+---
+
 ## Template for new entries
 
 ```markdown

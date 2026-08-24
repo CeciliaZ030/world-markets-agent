@@ -17,6 +17,12 @@ use crate::reporting::{
     UnwindCandidate,
 };
 
+pub(crate) const MARKET_DATA_API_KEY: Secret = Secret::new(
+    "MARKET_DATA_API_KEY",
+    "Optional market-data vendor API key. Unused by the default Yahoo feed.",
+    false,
+);
+
 #[derive(Clone, Default)]
 pub(crate) struct WorldMarketsApp {
     client: WorldClient,
@@ -1519,6 +1525,73 @@ impl DynAomiTool for ApplyGuestUpgrade {
         let funnel = Funnel::new(&app.reporting, &app.guest_store, FunnelConfig::default());
         let surface = funnel.render(&guest_id, "upgrade")?;
         Ok(guest::to_tool_json(&surface))
+    }
+}
+
+pub(crate) struct RenderMarketChart;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct RenderMarketChartArgs {
+    /// Ticker as the user typed it (e.g. AAPL, BTC-USD, WETH).
+    pub(crate) ticker: String,
+    /// Duration token: d/day, w/week, or m/month.
+    pub(crate) period: String,
+}
+
+impl DynAomiTool for RenderMarketChart {
+    type App = WorldMarketsApp;
+    type Args = RenderMarketChartArgs;
+    const NAME: &'static str = "render_market_chart";
+    const DESCRIPTION: &'static str = "Render a candlestick chart for a ticker over d/w/m. Send `caption` verbatim. Never invent last or change. Never executes.";
+
+    fn run(
+        _app: &WorldMarketsApp,
+        args: Self::Args,
+        _ctx: DynToolCallCtx,
+    ) -> Result<Value, String> {
+        crate::marketdata::render_chart_tool(&args.ticker, &args.period)
+    }
+}
+
+pub(crate) struct RefreshMarketUniverse;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct RefreshMarketUniverseArgs {}
+
+impl DynAomiTool for RefreshMarketUniverse {
+    type App = WorldMarketsApp;
+    type Args = RefreshMarketUniverseArgs;
+    const NAME: &'static str = "refresh_market_universe";
+    const DESCRIPTION: &'static str =
+        "Rebuild the cached market-data asset universe from the configured feed. Never executes.";
+
+    fn run(
+        _app: &WorldMarketsApp,
+        _args: Self::Args,
+        _ctx: DynToolCallCtx,
+    ) -> Result<Value, String> {
+        crate::marketdata::refresh_universe_tool()
+    }
+}
+
+pub(crate) struct ClearMarketCharts;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct ClearMarketChartsArgs {}
+
+impl DynAomiTool for ClearMarketCharts {
+    type App = WorldMarketsApp;
+    type Args = ClearMarketChartsArgs;
+    const NAME: &'static str = "clear_market_charts";
+    const DESCRIPTION: &'static str =
+        "Delete stored candlestick PNG files. Send `caption` verbatim. Never executes.";
+
+    fn run(
+        _app: &WorldMarketsApp,
+        _args: Self::Args,
+        _ctx: DynToolCallCtx,
+    ) -> Result<Value, String> {
+        crate::chart::clear_charts_tool()
     }
 }
 

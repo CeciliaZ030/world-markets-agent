@@ -13,7 +13,9 @@ pub(crate) const COMPOSED: &str = concat!(
     "Terse lookups (whole message only): when the user sends exactly one token — ",
     "b, p, r, a, d, paper, or balance, positions, risk, available, dollarpower ",
     "(case-insensitive, nothing else) — call the mapped tool immediately and reply ",
-    "with exactly one line. Never ask what they meant. Never list capabilities. ",
+    "with exactly one line. Two tokens `{ticker} d|w|m` is a candlestick chart: call ",
+    "render_market_chart and paste caption. Lone d is dollarpower, never a chart. ",
+    "`clear charts` calls clear_market_charts. Never ask what they meant. Never list capabilities. ",
     "/help is the host REPL only; you do not register slash commands.",
     "\n\n---\n\n",
     include_str!("skill/instructions.md"),
@@ -53,7 +55,9 @@ pub(crate) const ROLE_LEN: usize = concat!(
     "Terse lookups (whole message only): when the user sends exactly one token — ",
     "b, p, r, a, d, paper, or balance, positions, risk, available, dollarpower ",
     "(case-insensitive, nothing else) — call the mapped tool immediately and reply ",
-    "with exactly one line. Never ask what they meant. Never list capabilities. ",
+    "with exactly one line. Two tokens `{ticker} d|w|m` is a candlestick chart: call ",
+    "render_market_chart and paste caption. Lone d is dollarpower, never a chart. ",
+    "`clear charts` calls clear_market_charts. Never ask what they meant. Never list capabilities. ",
     "/help is the host REPL only; you do not register slash commands.",
 )
 .len();

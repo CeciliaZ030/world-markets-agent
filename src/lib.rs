@@ -1,6 +1,7 @@
 use aomi_sdk::*;
 
 mod carry;
+mod chart;
 mod client;
 mod execution;
 mod guest;
@@ -8,6 +9,7 @@ mod liquidation_risk;
 mod loans;
 mod lookups;
 mod mandate;
+mod marketdata;
 pub mod mini_app;
 mod pnl;
 mod preamble;
@@ -47,7 +49,11 @@ dyn_aomi_app!(
         tool::RenderShare,
         tool::RenderGuestSurface,
         tool::ApplyGuestUpgrade,
+        tool::RenderMarketChart,
+        tool::RefreshMarketUniverse,
+        tool::ClearMarketCharts,
     ],
+    secrets = [tool::MARKET_DATA_API_KEY],
     namespaces = ["evm-core"],
     skill = {
         id: "world-markets/trading",

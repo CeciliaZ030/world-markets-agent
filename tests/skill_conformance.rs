@@ -661,3 +661,33 @@ fn mini_app_button_copy_is_exact_and_unpromoted() {
         "workflows must forbid mentioning the Mini App button"
     );
 }
+
+#[test]
+fn chart_lookup_is_two_token_and_does_not_steal_d() {
+    let lookups = skill("lookups.md");
+    let rules = skill("action-rules.md");
+    assert!(
+        lookups.contains("Lone `d` is dollarpower"),
+        "chart lookup must not steal lone d from dollarpower"
+    );
+    assert!(
+        lookups.contains("two tokens") || lookups.contains("two token"),
+        "chart lookup must be two-token"
+    );
+    assert!(
+        lookups.contains("render_market_chart") && lookups.contains("clear charts"),
+        "lookups must name chart tools"
+    );
+    assert!(
+        lookups.contains(INDEX_LINE),
+        "capability index must still assign d to dollarpower"
+    );
+    assert!(
+        lookups.contains("{ticker} {d|w|m}"),
+        "lookups must mention the chart pattern"
+    );
+    assert!(
+        rules.contains("render_market_chart"),
+        "action-rules must map chart tool"
+    );
+}

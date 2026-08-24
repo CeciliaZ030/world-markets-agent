@@ -63,6 +63,10 @@ Netting (`lookups.positions.netting`) only when the reporting layer reports a re
 
 **`d`:** > Dollarpower `[#]`× — your `[#]` is doing the work of `[#]`.
 
+## Chart
+
+Whole-message two tokens `{ticker} {d|w|m}` (or day/week/month). `$`/`/` ignored. **Lone `d` is dollarpower, never a chart.** `render_market_chart` → paste `caption`. Unknown → `caption` refuse. `clear charts` → `clear_market_charts`.
+
 ## Secondary
 
 funding → `get_world_rates`: `[asset]` funding `[#]` per 8h. · orders → `get_world_open_orders`: `[#]` resting order(s) · `[#]` buys, `[#]` sells. · mark → `get_world_market`: `[asset]` mark `[#]`. · fills → when a fills tool exists: `[#]` fill(s) · [latest fill summary]. Missing → one line, no padding.
