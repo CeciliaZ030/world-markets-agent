@@ -99,7 +99,19 @@ execution waits on Aomi's key-holding design; local execution uses the sidecar.
 
 ## Deploy
 
-After an owner/admin connects the Project in Aomi Build:
+An owner or repository administrator must first open the
+[World Markets staging import page](https://build-staging.aomi.dev/operate/deployments/new?platform=world-market-apps&mode=import),
+confirm the `world-market-apps` platform, and connect `World-Markets-Inc/aomi`.
+Scope the staging Aomi GitHub App to this repository rather than every
+organization repository.
+
+![Connect the World Markets repository to its Aomi platform](docs/images/aomi-build-connect.jpg)
+
+If Build reports that `.aomi/config.json` uses `world-market-apps` but the
+Project uses `community`, no Project was created. Reopen the scoped staging
+link above and retry on `world-market-apps`.
+
+After the Project is connected:
 
 ```sh
 cargo install --git https://github.com/aomi-labs/aomi-sdk \
