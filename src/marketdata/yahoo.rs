@@ -71,19 +71,14 @@ impl MarketDataFeed for YahooFeed {
     }
 
     fn candles(&self, symbol: &str, range: ChartRange) -> Result<CandleSeries, FeedError> {
-        let (yahoo_range, interval) = yahoo_params(range);
         let encoded = urlencoding_lite(symbol);
-        let url = format!("{CHART_URL}/{encoded}?range={yahoo_range}&interval={interval}");
+        let url = format!(
+            "{CHART_URL}/{encoded}?range={}&interval={}",
+            range.yahoo_range(),
+            range.yahoo_interval()
+        );
         let value = self.get_json(&url)?;
         parse_yahoo_chart(&value, symbol)
-    }
-}
-
-fn yahoo_params(range: ChartRange) -> (&'static str, &'static str) {
-    match range {
-        ChartRange::Day => ("1d", "5m"),
-        ChartRange::Week => ("5d", "60m"),
-        ChartRange::Month => ("1mo", "1d"),
     }
 }
 

@@ -49,6 +49,30 @@ impl ChartRange {
             Self::Month => "1M",
         }
     }
+
+    pub(crate) fn yahoo_range(self) -> &'static str {
+        match self {
+            Self::Day => "1d",
+            Self::Week => "5d",
+            Self::Month => "1mo",
+        }
+    }
+
+    pub(crate) fn yahoo_interval(self) -> &'static str {
+        match self {
+            Self::Day => "5m",
+            Self::Week => "15m",
+            Self::Month => "60m",
+        }
+    }
+
+    pub(crate) fn bar_label(self) -> &'static str {
+        match self {
+            Self::Day => "5M",
+            Self::Week => "15M",
+            Self::Month => "4H",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,7 +113,7 @@ impl AssetUniverse {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct Candle {
     pub(crate) ts: i64,
     pub(crate) open: f64,

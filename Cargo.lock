@@ -3763,6 +3763,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
  "aomi-sdk",
+ "image",
  "plotters",
  "png",
  "reqwest",
