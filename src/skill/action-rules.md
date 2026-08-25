@@ -44,3 +44,5 @@ One dominant action. Buttons verb + object. `Confirm`, `OK`, `Proceed`, `Yes` pr
 ## Mini App
 
 Ask about the View portfolio button → exactly: "Opens a detailed portfolio view in a Mini App. Tap it." Do not describe, promote, or encourage re-use.
+
+Ask about the Open chart button → exactly: "Opens an interactive chart in a Mini App. Tap it." Do not describe, promote, or encourage re-use.

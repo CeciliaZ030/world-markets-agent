@@ -103,7 +103,7 @@ When Aomi documents host signing, or when swapping the rest of the Rust contract
 
 ### Current state
 
-`render_market_chart` fetches OHLC from a pluggable feed (Yahoo by default), writes a compact PNG under `WORLD_CHART_DIR` (auto-pruned), and returns `caption` plus `image` / `image_status` / `image_path` — the same field names as share cards. Local `aomi-run` can `open` the file when `WORLD_CHART_OPEN=1`. The plugin does not call Telegram `sendPhoto`.
+`render_market_chart` fetches OHLC from a pluggable feed (Yahoo by default), writes a compact PNG under `WORLD_CHART_DIR` (auto-pruned), and returns `caption` plus `image` / `image_status` / `image_path` — the same field names as share cards — plus optional `controls` / `mini_app` for **Open chart**. `photo_action` is `viewer`: tapping the PNG must not open the Mini App. Local `aomi-run` can `open` the file when `WORLD_CHART_OPEN=1`. The plugin does not call Telegram `sendPhoto`.
 
 ### Observations
 
@@ -111,7 +111,7 @@ Aomi tools return JSON only. Hosted Telegram will not show a photo until the run
 
 ### Future intention
 
-Host sends the generated PNG via Telegram `sendPhoto` (or a documented image-attachment envelope). Keep plugin charts ephemeral: do not archive bytes in the host transcript.
+Host sends the generated PNG via Telegram `sendPhoto` (or a documented image-attachment envelope). Tapping the photo opens Telegram's media viewer only. The Mini App is optional: one inline `web_app` button **under** the photo (`Open chart` from `mini_app.path` / `mini_app.startapp`). Do not bind `web_app` to the photo. Keep plugin charts ephemeral: do not archive bytes in the host transcript.
 
 ### When to revisit
 

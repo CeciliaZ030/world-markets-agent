@@ -205,6 +205,29 @@ pub(crate) fn normalize_ticker(raw: &str) -> Option<String> {
     Some(trimmed.to_ascii_uppercase())
 }
 
+pub(crate) fn chart_startapp(symbol: &str, range: ChartRange) -> String {
+    let safe: String = symbol
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{}_{}", safe, range.as_token())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn parse_chart_startapp(raw: &str) -> Option<(String, ChartRange)> {
+    let raw = raw.trim();
+    let (sym, per) = raw.rsplit_once('_')?;
+    let range = ChartRange::parse(per)?;
+    let symbol = normalize_ticker(sym)?;
+    Some((symbol, range))
+}
+
 /// Whole-message `{ticker} {d|w|m}`. Lone `d` is not a chart.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_chart_lookup(message: &str) -> Option<(String, ChartRange)> {
@@ -407,6 +430,19 @@ pub(crate) fn render_chart_tool(ticker: &str, period: &str) -> Result<serde_json
         "last": fmt_price(last),
         "change_pct": format!("{change_pct:.2}"),
         "caption": caption,
+        "photo_action": "viewer",
+        "controls": [{ "label": "Open chart", "action": "mini_app.chart" }],
+        "mini_app": {
+            "kind": "chart",
+            "path": format!(
+                "/chart?symbol={}&period={}",
+                requested,
+                range.as_token()
+            ),
+            "startapp": chart_startapp(&requested, range),
+            "symbol": requested,
+            "period": range.as_token(),
+        },
         "executable": false,
     }))
 }
@@ -490,6 +526,17 @@ mod tests {
         assert_eq!(parse_chart_lookup("/d"), None);
         assert_eq!(parse_chart_lookup("AAPL"), None);
         assert_eq!(parse_chart_lookup("clear charts"), None);
+    }
+
+    #[test]
+    fn chart_startapp_round_trips() {
+        assert_eq!(chart_startapp("AAPL", ChartRange::Day), "AAPL_d");
+        assert_eq!(
+            parse_chart_startapp("BTC-USD_w"),
+            Some(("BTC-USD".into(), ChartRange::Week))
+        );
+        assert_eq!(parse_chart_startapp("AAPL"), None);
+        assert_eq!(parse_chart_startapp("_d"), None);
     }
 
     #[test]

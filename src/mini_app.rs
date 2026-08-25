@@ -98,6 +98,85 @@ pub fn load_portfolio(account_id: u64) -> Result<PortfolioResponse, String> {
     assemble(client, &account, &assets, &metrics, floor, block_number)
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ChartSnapshot {
+    pub symbol: String,
+    pub feed_symbol: String,
+    pub period: String,
+    pub period_label: String,
+    pub bar_label: String,
+    pub source: String,
+    pub candles: Vec<ChartBar>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChartBar {
+    pub t: i64,
+    pub o: f64,
+    pub h: f64,
+    pub l: f64,
+    pub c: f64,
+}
+
+#[derive(Debug)]
+pub enum ChartError {
+    BadRequest(String),
+    NotFound(String),
+    Upstream(String),
+}
+
+impl std::fmt::Display for ChartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadRequest(m) | Self::NotFound(m) | Self::Upstream(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+/// Live OHLC for the Mini App chart (same Yahoo feed as the Telegram PNG).
+pub fn load_chart(ticker: &str, period: &str) -> Result<ChartSnapshot, ChartError> {
+    use crate::marketdata::{
+        ChartRange, FeedError, feed_from_env, load_or_refresh, normalize_ticker, resolve_ticker,
+    };
+
+    let range = ChartRange::parse(period).ok_or_else(|| {
+        ChartError::BadRequest("[world-markets] period must be d, w, or m".into())
+    })?;
+    let requested = normalize_ticker(ticker)
+        .ok_or_else(|| ChartError::BadRequest("[world-markets] ticker is empty".into()))?;
+    let feed = feed_from_env().map_err(ChartError::Upstream)?;
+    let universe = load_or_refresh(feed.as_ref()).map_err(ChartError::Upstream)?;
+    let resolved = resolve_ticker(&requested, &universe);
+    let series = match feed.candles(&resolved.feed_symbol, range) {
+        Ok(series) => series,
+        Err(FeedError::NotFound { symbol }) => {
+            return Err(ChartError::NotFound(format!(
+                "[world-markets] no chart for {symbol}"
+            )));
+        }
+        Err(err) => return Err(ChartError::Upstream(err.to_string())),
+    };
+    Ok(ChartSnapshot {
+        symbol: requested,
+        feed_symbol: series.feed_symbol,
+        period: range.as_token().to_string(),
+        period_label: range.label().to_string(),
+        bar_label: range.bar_label().to_string(),
+        source: series.source,
+        candles: series
+            .candles
+            .into_iter()
+            .map(|c| ChartBar {
+                t: c.ts,
+                o: c.open,
+                h: c.high,
+                l: c.low,
+                c: c.close,
+            })
+            .collect(),
+    })
+}
+
 fn mandate_floor() -> Option<Decimal> {
     let path = std::env::var("WORLD_MANDATE_PATH").unwrap_or_default();
     let path_lc = path.trim().to_ascii_lowercase();
@@ -413,6 +492,18 @@ mod tests {
         .unwrap();
         assert_eq!(json["liquidation_score"], 3);
         assert!(json.get("score").is_none());
+    }
+
+    #[test]
+    fn load_chart_rejects_bad_period() {
+        match load_chart("AAPL", "year") {
+            Err(ChartError::BadRequest(_)) => {}
+            other => panic!("expected bad request, got {other:?}"),
+        }
+        match load_chart("   ", "d") {
+            Err(ChartError::BadRequest(_)) => {}
+            other => panic!("expected empty ticker, got {other:?}"),
+        }
     }
 
     #[test]

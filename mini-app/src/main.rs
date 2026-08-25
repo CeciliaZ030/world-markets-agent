@@ -1,4 +1,4 @@
-//! Telegram Mini App server for the World Markets portfolio snapshot.
+//! Telegram Mini App server: portfolio snapshot and interactive charts.
 //!
 //! Init-data HMAC follows Telegram's WebApp algorithm (HMAC-SHA256 keyed by
 //! `WebAppData`, then HMAC of the sorted data-check string). The Mini App spec's
@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -77,6 +77,7 @@ async fn main() {
     let app = Router::new()
         .route("/api/v1/mini-app/auth", post(auth_handler))
         .route("/api/v1/mini-app/portfolio", get(portfolio_handler))
+        .route("/api/v1/mini-app/chart", get(chart_handler))
         .route("/api/v1/mini-app/health", get(health_handler))
         .fallback(static_handler)
         .layer(CorsLayer::permissive())
@@ -143,16 +144,20 @@ fn issue_session(state: &AppState, telegram_user_id: u64) -> Response {
         .into_response()
 }
 
+#[derive(Debug, Deserialize)]
+struct ChartQuery {
+    symbol: String,
+    #[serde(default = "default_period")]
+    period: String,
+}
+
+fn default_period() -> String {
+    "d".to_string()
+}
+
 async fn portfolio_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(token) = bearer_token(&headers) else {
+    if !session_ok(&state, &headers) {
         return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
-    };
-    {
-        let mut sessions = state.sessions.lock().expect("session lock");
-        sessions.retain(|_, session| session.expires_at > Instant::now());
-        if !sessions.contains_key(&token) {
-            return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
-        }
     }
     let Some(account_id) = state.account_id else {
         tracing::error!("WORLD_ACCOUNT_ID is not set");
@@ -169,6 +174,44 @@ async fn portfolio_handler(State(state): State<AppState>, headers: HeaderMap) ->
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
         }
     }
+}
+
+async fn chart_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ChartQuery>,
+) -> Response {
+    if !session_ok(&state, &headers) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let symbol = query.symbol.clone();
+    let period = query.period.clone();
+    match spawn_blocking(move || world_markets::mini_app::load_chart(&symbol, &period)).await {
+        Ok(Ok(chart)) => Json(chart).into_response(),
+        Ok(Err(world_markets::mini_app::ChartError::BadRequest(_))) => {
+            json_error(StatusCode::BAD_REQUEST, "bad_request")
+        }
+        Ok(Err(world_markets::mini_app::ChartError::NotFound(_))) => {
+            json_error(StatusCode::NOT_FOUND, "not_found")
+        }
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, "chart fetch failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "chart task join failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
+        }
+    }
+}
+
+fn session_ok(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(token) = bearer_token(headers) else {
+        return false;
+    };
+    let mut sessions = state.sessions.lock().expect("session lock");
+    sessions.retain(|_, session| session.expires_at > Instant::now());
+    sessions.contains_key(&token)
 }
 
 fn unix_now() -> u64 {
@@ -191,7 +234,7 @@ fn json_error(status: StatusCode, error: &str) -> Response {
 
 async fn static_handler(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
-    let path = if path.is_empty() || path == "portfolio" {
+    let path = if path.is_empty() || path == "portfolio" || path == "chart" {
         "index.html"
     } else {
         path

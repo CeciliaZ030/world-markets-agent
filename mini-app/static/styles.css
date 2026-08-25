@@ -24,7 +24,84 @@ html, body {
   font-size: 15px;
   line-height: 1.35;
 }
-body { padding: 16px 16px calc(24px + env(safe-area-inset-bottom)); }
+body { padding: calc(56px + env(safe-area-inset-top, 0px)) 16px calc(24px + env(safe-area-inset-bottom)); }
+body.page-chart {
+  padding: 0;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+.topbar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: calc(6px + env(safe-area-inset-top, 0px)) 10px 8px;
+  background: var(--bg);
+}
+.exit {
+  flex: 0 0 44px;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+.exit:active { background: var(--surface-2); }
+.topbar-main { flex: 1; min-width: 0; }
+.topbar h1 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.chart-page {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  padding-top: calc(58px + env(safe-area-inset-top, 0px));
+}
+.chart-meta {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 14px 8px;
+}
+.chart-sym { font-size: 18px; font-weight: 650; }
+.chart-px { font-size: 22px; font-weight: 600; }
+.chart-px.up { color: var(--safe); }
+.chart-px.down { color: var(--danger); }
+.chart-sub { color: var(--muted); font-size: 12px; padding: 0 14px 8px; }
+.periods {
+  display: flex;
+  gap: 8px;
+  padding: 0 14px 10px;
+}
+.periods button {
+  flex: 1;
+  padding: 8px 0;
+  border-color: var(--border);
+  color: var(--muted);
+  background: var(--surface);
+}
+.periods button.active {
+  border-color: var(--fg);
+  color: var(--fg);
+}
+#plot {
+  flex: 1;
+  min-height: 240px;
+  width: 100%;
+}
 .num { font-variant-numeric: tabular-nums; font-family: var(--mono); }
 
 h1 {

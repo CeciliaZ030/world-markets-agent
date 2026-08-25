@@ -660,6 +660,19 @@ fn mini_app_button_copy_is_exact_and_unpromoted() {
         wf.contains("do not mention the button"),
         "workflows must forbid mentioning the Mini App button"
     );
+    assert!(
+        rules.contains("Opens an interactive chart in a Mini App. Tap it."),
+        "action-rules must ship the Open chart Mini App exact reply"
+    );
+    let lookups = skill("lookups.md");
+    assert!(
+        lookups.contains("[Open chart]"),
+        "lookups must note the host Open chart Mini App button"
+    );
+    assert!(
+        lookups.contains("Tapping the photo is the image only"),
+        "lookups must keep photo tap off the Mini App"
+    );
 }
 
 #[test]

@@ -65,7 +65,7 @@ Netting (`lookups.positions.netting`) only when the reporting layer reports a re
 
 ## Chart
 
-Whole-message two tokens `{ticker} {d|w|m}` (or day/week/month). `$`/`/` ignored. **Lone `d` is dollarpower, never a chart.** `render_market_chart` → paste `caption`. Unknown → `caption` refuse. `clear charts` → `clear_market_charts`.
+Whole-message two tokens `{ticker} {d|w|m}` (or day/week/month). `$`/`/` ignored. **Lone `d` is dollarpower, never a chart.** `render_market_chart` → paste `caption`. Unknown → `caption` refuse. `clear charts` → `clear_market_charts`. Host may attach [Open chart] under the photo (Mini App). Tapping the photo is the image only — never the Mini App. Do not mention the button.
 
 ## Secondary
 
