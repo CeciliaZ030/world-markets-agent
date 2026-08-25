@@ -17,6 +17,17 @@
 # Execution sidecar
 /sidecar/node_modules/
 
+# The Desk (voice client) local runtime
+/desk/.venv/
+/desk/.env
+/desk/data/
+/desk/client/node_modules/
+/desk/client/dist/
+/desk/**/__pycache__/
+/desk/**/.pytest_cache/
+/desk/**/*.egg-info/
+/desk/.coverage
+
 # Local-only live trading suite artifacts (the suite itself lives in tests/)
 /tests/trading-suite/logs/
 /tests/trading-suite/results.json
