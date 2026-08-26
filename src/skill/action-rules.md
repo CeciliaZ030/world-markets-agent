@@ -4,7 +4,7 @@
 
 Account · balance · RAPV · liquidation eligibility · risk 0–10 · NAV → `get_world_account` (`metrics`). Lookups → `lookups.md`. PnL → `get_world_pnl`. Grant status → `get_world_agent_permission`. Asset identity → `list_world_assets`. Market · book · mark → `get_world_market`. Resting orders → `get_world_open_orders`. Trade verdict → `preview_world_trade` / `check_world_mandate`. Before/after figures → `preview_account_effect` (intent only — never figures). Blocked intent's floor + largest compliant size → `compute_resize`. Exit impact → `preview_exit`. Sliced cost → `plan_large_order`. Capital efficiency → `get_dollarpower`. Guardian order + costs → `simulate_guardian_unwind`. Rates → `get_world_rates`. Loans → `get_world_loans`. Carry → `check_negative_carry`. Chart → `render_market_chart`. Introduction → `render_share`. Research/tasks/watches → `get_world_research` (`cause_established` authoritative) · `get_world_tasks` · `set_world_watch` / `cancel_world_task` / `set_world_preference`. Earn/deploy/lend/basis/rebalance → `reference/strategy-brain.md`.
 
-**Discovery.** First contact, bound key → `get_world_agent_permission` → `get_world_account` (§6.21). Explain/compare → **no tool, no new figures** (§6.22); never call a rate tool to decorate prose. Simulation on the user's own balance → account → rates → `preview_account_effect` (§6.23). Ranking ask → refuse, then one idle fact from account + rates (§6.24). No account → guest surfaces.
+**Discovery.** First contact, bound key → `get_world_agent_permission` → `get_world_account` (FIRST-CONTACT/§6.1). Explain/compare → **no tool, no new figures** (ADVISORY-EXPLAIN/§6.22); never call a rate tool to decorate prose. Simulation on the user's own balance → account → rates → `preview_account_effect` (ADVISORY-SIM/§6.23). "Should I X" → verdict grounded in `check_world_mandate`, one explanation, one within-limits next step (ADVISORY-VERDICT/§6.24). No account → guest surfaces.
 
 Reuse handover account/wallet context. Quote numbers only from the latest tool result; refresh if state may have changed.
 
@@ -21,7 +21,7 @@ Reuse handover account/wallet context. Quote numbers only from the latest tool r
 
 ## Three action classes
 
-- **Execute** — clear, inside mandate → `execute_*` with whole `sentence`. 3s ×, then TWAP/DCA slices. No tap.
+- **Execute** — clear, inside mandate → `execute_*` with whole `sentence`. 3s ×, then TWAP/DCA slices. No tap. No preamble before the tool — do not say you are about to act; act, then report (E2).
 - **Ask** — instrument/size/level unclear → one voice/text question, max two rounds, then Mini App to inspect. Never guess. Never Sign.
 - **Escalate** — material size jump, lockup/maturity, leverage-band change, first new market, add while liquidation-eligible → voice/text confirm. Chat button last-resort. Silence = no. Policy edits sign on World.
 
