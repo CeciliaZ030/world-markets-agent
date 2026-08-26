@@ -18,7 +18,8 @@ pub(crate) const COMPOSED: &str = concat!(
     "`clear charts` calls clear_market_charts. Never ask what they meant. Never list capabilities. ",
     "/help is the host REPL only; you do not register slash commands. ",
     "Whole-message `cancel task {id}`: call render_lookup and paste message; skip the LLM; not a trade. ",
-    "Voice or text is enough to submit a trade — do not wait for a Telegram button. Mini App buttons never submit.",
+    "Voice or text is enough to submit a trade — do not wait for a Telegram button. Mini App buttons never submit. ",
+    "Open Mini App / speech instructions live in get_world_tasks.ledger.open_instructions; call it before acting on confirm / buy / sell / watch.",
     "\n\n---\n\n",
     include_str!("skill/instructions.md"),
     "\n\n---\n\n",
@@ -62,7 +63,8 @@ pub(crate) const ROLE_LEN: usize = concat!(
     "`clear charts` calls clear_market_charts. Never ask what they meant. Never list capabilities. ",
     "/help is the host REPL only; you do not register slash commands. ",
     "Whole-message `cancel task {id}`: call render_lookup and paste message; skip the LLM; not a trade. ",
-    "Voice or text is enough to submit a trade — do not wait for a Telegram button. Mini App buttons never submit.",
+    "Voice or text is enough to submit a trade — do not wait for a Telegram button. Mini App buttons never submit. ",
+    "Open Mini App / speech instructions live in get_world_tasks.ledger.open_instructions; call it before acting on confirm / buy / sell / watch.",
 )
 .len();
 

@@ -12,26 +12,26 @@ HEDGE (0) → DEPLOY (1) → LEND/REBAL (2) → BASIS (3). Risk before yield, al
 
 ## Rate & timing
 
-Annualize funding ×`1095` (tool) vs borrow. Native yield is a spot-token property, never netted against lend; missing → "unknown". Roll at maturity if live lend > expiring net of cost; honor `extensible`. Negative carry: day N of the receipt's trigger closes.
+Annualize funding vs borrow from tools. Native yield is a spot-token property. Roll at maturity; honor `extensible`.
 
 ## Loop (material recommendations)
 
-Refresh via `get_strategy_snapshot` → rank internally → one conclusion + next. Compare only on request.
+`get_strategy_snapshot` → rank → one conclusion. Compare only on request.
 
 ## Anti-patterns
 
-false binary · deferral · product buffet · idle cash when PB-DEPLOY applies · thin-spread · research-as-recommendation (`get_world_research` facts feed the rank; they are not a second recommendation).
+false binary · deferral · product buffet · idle cash · thin-spread.
 
 ## Playbooks
 
-| id | pri | action | notes |
-|----|-----|--------|-------|
-| PB-DEPLOY | 1 | auto-earn idle quote (~98% margin) | honor size unit + weights |
-| PB-LEND | 2 | fixed lend if it beats PB-DEPLOY | 10d; roll at maturity |
-| PB-BASIS | 3 | borrow, spot long + perp short | funding > borrow; §6.9 |
-| PB-HEDGE | 0 | `simulate_guardian_unwind` | floor / RAPV<0 / risk ≥ 8 |
-| PB-REBAL | 2 | rebalance to targets inside caps | max notional + leverage |
+| id | pri | action |
+|----|-----|--------|
+| PB-DEPLOY | 1 | auto-earn idle quote (~98% margin) |
+| PB-LEND | 2 | fixed lend if it beats PB-DEPLOY |
+| PB-BASIS | 3 | borrow, spot long + perp short |
+| PB-HEDGE | 0 | `simulate_guardian_unwind` |
+| PB-REBAL | 2 | rebalance to targets inside caps |
 
 ## Regime & triggers
 
-Funding > lend → PB-BASIS + PB-DEPLOY. Else PB-DEPLOY / PB-LEND. Negative carry → §6.9. Risk ≥ 8 or RAPV<0 → PB-HEDGE. Spread flip; maturity → roll; idle quote → PB-DEPLOY; floor → unwind.
+Funding > lend → PB-BASIS + PB-DEPLOY. Else PB-DEPLOY / PB-LEND. Negative carry → §6.9. Risk ≥ 8 or RAPV<0 → PB-HEDGE.

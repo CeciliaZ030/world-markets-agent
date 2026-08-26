@@ -1,3 +1,4 @@
+import { readdirSync } from "node:fs";
 import { filePath, readJson, writeJson } from "./store.js";
 import { latestMark } from "./history.js";
 
@@ -34,8 +35,8 @@ const ALLOWED = {
   triggered: ["awaiting_confirm", "executing", "done", "watching", "revoked"],
   awaiting_confirm: ["executing", "declined", "watching", "done", "revoked"],
   pending_execute: ["executing", "revoked", "declined"],
-  executing: ["done"],
-  paused: ["watching", "revoked", "expired"],
+  executing: ["done", "revoked", "paused"],
+  paused: ["watching", "revoked", "expired", "executing"],
   done: [],
   declined: [],
   expired: [],
@@ -62,6 +63,7 @@ const EVENT_TYPES = new Set([
   "expired",
   "revoked",
   "edited",
+  "archived",
 ]);
 
 function itemsPath(accountId) {
@@ -95,6 +97,42 @@ export function newId() {
 
 function nowSecs(now) {
   return Number.isFinite(now) ? now : Math.floor(Date.now() / 1000);
+}
+
+function scheduleOf(params) {
+  const raw = params && typeof params === "object" ? params.schedule : null;
+  return raw && typeof raw === "object" ? raw : null;
+}
+
+function sliceCount(params, fallback = 1) {
+  const scheduled = Number(scheduleOf(params)?.slices);
+  if (Number.isFinite(scheduled) && scheduled > 0) return Math.floor(scheduled);
+  const named = Number(fallback);
+  return Number.isFinite(named) && named > 0 ? Math.floor(named) : 1;
+}
+
+function intervalSecsOf(params, item) {
+  const scheduled = Number(scheduleOf(params)?.interval_secs);
+  if (Number.isFinite(scheduled) && scheduled > 0) return Math.floor(scheduled);
+  const cadence = String(scheduleOf(params)?.cadence || "").toLowerCase();
+  if (cadence === "weekly") return 7 * 86400;
+  if (cadence === "daily") return 86400;
+  const n = sliceCount(params, item?.slice_n);
+  const windowSecs = Number(scheduleOf(params)?.window_secs);
+  if (Number.isFinite(windowSecs) && windowSecs > 0 && n > 1) {
+    return Math.max(1, Math.floor(windowSecs / n));
+  }
+  return 60;
+}
+
+export function instructionAccounts() {
+  try {
+    return readdirSync(filePath("instructions"))
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => name.replace(/\.json$/, ""));
+  } catch {
+    return [];
+  }
 }
 
 function findItem(data, instructionId) {
@@ -168,7 +206,12 @@ export function appendEvent(accountId, instructionId, eventType, detail, now, ex
 }
 
 function actorFor(eventType) {
-  if (eventType === "heard" || eventType === "confirmed" || eventType === "declined") {
+  if (
+    eventType === "heard" ||
+    eventType === "confirmed" ||
+    eventType === "declined" ||
+    eventType === "archived"
+  ) {
     return "you";
   }
   if (eventType === "check" || eventType === "near_miss") return "watcher";
@@ -286,8 +329,11 @@ export function stageTrade(accountId, body, now = nowSecs()) {
     delay_secs: delay,
     progress_pct: 0,
     slice_i: null,
-    slice_n: 1,
+    slice_n: sliceCount(body.params, body.slice_n || 1),
     avg_price: null,
+    next_slice_at: null,
+    child_fills: [],
+    slice_inflight: false,
     created_at: now,
     updated_at: now,
     status_changed_at: now,
@@ -305,8 +351,16 @@ export function beginExecute(accountId, id, now = nowSecs()) {
   if (item.status === "revoked" || item.status === "declined") {
     return { ok: false, error: "cancelled", instruction: cardOf(item, accountId, now) };
   }
-  if (item.status === "executing" || item.status === "done") {
-    return { ok: true, already: true, instruction: cardOf(item, accountId, now) };
+  if (item.status === "done") {
+    return { ok: true, already: true, done: true, instruction: cardOf(item, accountId, now) };
+  }
+  if (item.status === "executing") {
+    return {
+      ok: true,
+      already: true,
+      instruction: cardOf(item, accountId, now),
+      params: item.params || {},
+    };
   }
   if (item.status !== "pending_execute") {
     return { ok: false, error: "not_pending", instruction: cardOf(item, accountId, now) };
@@ -317,7 +371,10 @@ export function beginExecute(accountId, id, now = nowSecs()) {
   transition(item, "executing", now);
   item.progress_pct = 8;
   item.slice_i = 1;
-  item.slice_n = item.slice_n || 1;
+  item.slice_n = sliceCount(item.params, item.slice_n || 1);
+  item.slice_inflight = true;
+  item.slice_inflight_at = now;
+  item.child_fills = Array.isArray(item.child_fills) ? item.child_fills : [];
   item.updated_at = now;
   saveItems(accountId, data);
   appendEvent(accountId, item.instruction_id, "executed", "sending", now, { actor: "aomi" });
@@ -343,6 +400,11 @@ export function completeExecute(accountId, id, body = {}, now = nowSecs()) {
   item.avg_price = body.avg_price || item.avg_price;
   item.receipt = body.receipt || item.receipt;
   item.result_ref = body.result_ref || item.result_ref;
+  item.slice_inflight = false;
+  item.next_slice_at = null;
+  if (Array.isArray(body.child_fills)) {
+    item.child_fills = body.child_fills;
+  }
   if (item.status === "executing") transition(item, "done", now);
   item.updated_at = now;
   saveItems(accountId, data);
@@ -355,6 +417,170 @@ export function completeExecute(accountId, id, body = {}, now = nowSecs()) {
     { actor: "aomi" },
   );
   return { ok: true, instruction: cardOf(item, accountId, now) };
+}
+
+const INFLIGHT_STALE_SECS = 120;
+
+export function claimSlice(accountId, id, now = nowSecs()) {
+  const data = loadItems(accountId);
+  const item = findItem(data, id);
+  if (!item) return { ok: false, error: "not_found" };
+  if (item.status === "revoked" || item.status === "declined") {
+    return { ok: false, error: "cancelled", instruction: cardOf(item, accountId, now) };
+  }
+  if (item.status === "done") {
+    return { ok: true, already: true, done: true, instruction: cardOf(item, accountId, now) };
+  }
+  if (item.status === "pending_execute") {
+    const begun = beginExecute(accountId, id, now);
+    if (!begun.ok) return begun;
+    if (begun.already) {
+      return { ok: false, error: "in_flight", instruction: begun.instruction };
+    }
+    const fresh = loadItems(accountId);
+    const row = findItem(fresh, id);
+    return {
+      ok: true,
+      first: true,
+      slice_i: row?.slice_i || 1,
+      slice_n: row?.slice_n || 1,
+      last: (row?.slice_n || 1) <= 1,
+      instruction: cardOf(row || item, accountId, now),
+      params: row?.params || item.params || {},
+    };
+  }
+  if (item.status !== "executing") {
+    return { ok: false, error: "not_executing", instruction: cardOf(item, accountId, now) };
+  }
+  const fills = Array.isArray(item.child_fills) ? item.child_fills : [];
+  const sliceN = sliceCount(item.params, item.slice_n || 1);
+  if (fills.length >= sliceN) {
+    return { ok: true, already: true, done: true, instruction: cardOf(item, accountId, now) };
+  }
+  if (item.slice_inflight) {
+    const claimedAt = Number(item.slice_inflight_at) || 0;
+    if (!claimedAt || now - claimedAt < INFLIGHT_STALE_SECS) {
+      return { ok: false, error: "in_flight", instruction: cardOf(item, accountId, now) };
+    }
+  }
+  if (item.next_slice_at && now < item.next_slice_at) {
+    return { ok: false, error: "too_soon", instruction: cardOf(item, accountId, now) };
+  }
+  item.slice_i = fills.length + 1;
+  item.slice_n = sliceN;
+  item.slice_inflight = true;
+  item.slice_inflight_at = now;
+  item.updated_at = now;
+  saveItems(accountId, data);
+  return {
+    ok: true,
+    first: false,
+    slice_i: item.slice_i,
+    slice_n: sliceN,
+    last: item.slice_i >= sliceN,
+    instruction: cardOf(item, accountId, now),
+    params: item.params || {},
+  };
+}
+
+export function recordSlice(accountId, id, body = {}, now = nowSecs()) {
+  const data = loadItems(accountId);
+  const item = findItem(data, id);
+  if (!item) return { ok: false, error: "not_found" };
+  if (item.status === "revoked" || item.status === "declined") {
+    return { ok: false, error: "cancelled", instruction: cardOf(item, accountId, now) };
+  }
+  if (item.status === "done") {
+    return { ok: true, already: true, done: true, instruction: cardOf(item, accountId, now) };
+  }
+  if (item.status !== "executing") {
+    return { ok: false, error: "not_executing", instruction: cardOf(item, accountId, now) };
+  }
+  item.child_fills = Array.isArray(item.child_fills) ? item.child_fills : [];
+  if (body.fill && typeof body.fill === "object") {
+    item.child_fills.push(body.fill);
+  }
+  const sliceN = sliceCount(item.params, item.slice_n || 1);
+  item.slice_n = sliceN;
+  item.slice_i = body.slice_i || item.child_fills.length || item.slice_i;
+  item.avg_price = body.avg_price || item.avg_price;
+  item.receipt = body.receipt || item.receipt;
+  item.result_ref = body.result_ref || item.result_ref;
+  const filled = item.child_fills.length;
+  item.progress_pct = Math.max(
+    8,
+    Math.min(99, Math.round((filled / Math.max(1, sliceN)) * 100)),
+  );
+  item.slice_inflight = false;
+  item.slice_inflight_at = null;
+  if (item.params && typeof item.params === "object") {
+    item.params.schedule = item.params.schedule || {};
+    if (body.filled_quantity != null) {
+      item.params.schedule.filled_quantity = String(body.filled_quantity);
+    }
+  }
+  const more = filled < sliceN;
+  if (more) {
+    const interval = intervalSecsOf(item.params, item);
+    item.next_slice_at = now + interval;
+  } else {
+    item.next_slice_at = null;
+  }
+  item.updated_at = now;
+  saveItems(accountId, data);
+  appendEvent(
+    accountId,
+    item.instruction_id,
+    "executed",
+    body.receipt || `slice ${item.slice_i} of ${sliceN}`,
+    now,
+    { actor: "aomi" },
+  );
+  return {
+    ok: true,
+    more,
+    next_slice_at: item.next_slice_at,
+    interval_secs: more ? intervalSecsOf(item.params, item) : null,
+    instruction: cardOf(item, accountId, now),
+    params: item.params || {},
+  };
+}
+
+export function listDueTrades(accountId, now = nowSecs()) {
+  const accounts =
+    accountId == null || accountId === ""
+      ? instructionAccounts()
+      : [String(accountId)];
+  const out = [];
+  for (const id of accounts) {
+    const data = loadItems(id);
+    for (const item of data.items || []) {
+      if (item.kind !== "trade") continue;
+      if (item.status === "pending_execute" && item.execute_at && now >= item.execute_at) {
+        out.push({
+          account_id: item.account_id,
+          instruction_id: item.instruction_id,
+          status: item.status,
+        });
+        continue;
+      }
+      if (item.status !== "executing") continue;
+      const fills = Array.isArray(item.child_fills) ? item.child_fills.length : 0;
+      const sliceN = sliceCount(item.params, item.slice_n || 1);
+      if (fills >= sliceN) continue;
+      if (item.slice_inflight) {
+        const claimedAt = Number(item.slice_inflight_at) || 0;
+        if (claimedAt && now - claimedAt < INFLIGHT_STALE_SECS) continue;
+      }
+      if (item.next_slice_at && now < item.next_slice_at) continue;
+      out.push({
+        account_id: item.account_id,
+        instruction_id: item.instruction_id,
+        status: item.status,
+      });
+    }
+  }
+  return out;
 }
 
 export function confirmInstruction(accountId, body, now = nowSecs()) {
@@ -479,6 +705,7 @@ const CANCELLABLE = new Set([
   "awaiting_confirm",
   "paused",
   "pending_execute",
+  "executing",
 ]);
 
 export function cancelInstruction(accountId, id, now = nowSecs()) {
@@ -507,6 +734,25 @@ export function cancelInstruction(accountId, id, now = nowSecs()) {
     : `cancelled ${result.task_id}`;
   result.command = `cancel task ${result.task_id}`;
   return result;
+}
+
+const ARCHIVABLE = new Set(["done", "cant"]);
+
+export function archiveInstruction(accountId, id, now = nowSecs()) {
+  const data = loadItems(accountId);
+  const item = findItem(data, id);
+  if (!item) return { ok: false, error: "not_found" };
+  if (item.archived_at) {
+    return { ok: true, already: true, instruction: cardOf(item, accountId, now) };
+  }
+  if (!ARCHIVABLE.has(item.status)) {
+    return { ok: false, error: "not_archivable", status: item.status };
+  }
+  item.archived_at = now;
+  item.updated_at = now;
+  saveItems(accountId, data);
+  appendEvent(accountId, item.instruction_id, "archived", "Archived.", now, { actor: "you" });
+  return { ok: true, instruction: cardOf(item, accountId, now) };
 }
 
 export function recordCheck(accountId, watch, result, now = nowSecs()) {
@@ -645,6 +891,9 @@ function cardOf(item, accountId, now = nowSecs()) {
     slice_i: item.slice_i ?? null,
     slice_n: item.slice_n ?? null,
     avg_price: item.avg_price ?? null,
+    next_slice_at: item.next_slice_at ?? null,
+    child_fills: item.child_fills || [],
+    order_type: item.params?.order_type || null,
     instrument: item.instrument,
     params: item.params || {},
     expires_at: item.expires_at,
@@ -739,6 +988,7 @@ function isActiveStatus(status) {
 
 function stillVisible(item, now) {
   if (item.status === "revoked") return false;
+  if (item.archived_at) return false;
   if (isActiveStatus(item.status)) return true;
   const changed = item.status_changed_at || item.updated_at || item.created_at || 0;
   return now - changed < VISIBILITY_SECS;
@@ -783,6 +1033,33 @@ export function getInstruction(accountId, instructionId, now = nowSecs()) {
     ...cardOf(item, accountId, now),
     trail: trailOf(accountId, item.instruction_id),
   };
+}
+
+const OPEN_STATUSES = new Set(["with_aomi", "triggered", "awaiting_confirm"]);
+
+function compactOpenCard(card) {
+  return {
+    instruction_id: card.instruction_id,
+    task_id: card.task_id || null,
+    status: card.status,
+    sentence: card.sentence,
+    kind: card.kind,
+    instrument: card.instrument || null,
+    fire_kind: card.fire_kind || "tell",
+    pending: card.pending || null,
+    trigger_value: card.trigger_value || null,
+    correlation_id: card.correlation_id || null,
+  };
+}
+
+/** Compact cards the agent must act on: drafts, fired confirms, pending pause/resume. */
+export function openInstructions(accountId, now = nowSecs()) {
+  return listInstructions(accountId, now)
+    .filter(
+      (row) =>
+        OPEN_STATUSES.has(row.status) || row.pending === "pause" || row.pending === "resume",
+    )
+    .map(compactOpenCard);
 }
 
 export function summary(accountId, now = nowSecs()) {

@@ -245,6 +245,9 @@ fn research_watch_task_workflows_present() {
     assert!(wf.contains("cause_established"));
     assert!(wf.contains("set_world_watch"));
     assert!(wf.contains("get_world_tasks"));
+    assert!(wf.contains("open_instructions"));
+    assert!(wf.contains("first tool on every non-lookup turn"));
+    assert!(wf.contains("instruction_id"));
     assert!(wf.contains("I won't buy or sell anything"));
     assert!(wf.contains("paste `message`"));
     assert!(wf.contains("portfolio_now"));
@@ -255,6 +258,26 @@ fn research_watch_task_workflows_present() {
     let notes = skill("reference/notifications.md");
     assert!(notes.contains("solicited"));
     assert!(notes.contains("not the digest") || notes.contains("Not the weekly digest"));
+}
+
+#[test]
+fn unfulfillable_cant_is_distinct_from_block() {
+    let wf = skill("workflows.md");
+    assert!(wf.contains("## 6.21"), "missing unfulfillable section");
+    assert!(
+        wf.contains("not §6.6") || wf.contains("not a block"),
+        "must distinguish can't from blocked"
+    );
+    assert!(
+        wf.contains("paste `message`") && wf.contains("`controls`"),
+        "host must paste wall + chips verbatim"
+    );
+    assert!(wf.contains("unclear"), "leftover STT path must be named");
+    let lookups = skill("lookups.md");
+    assert!(
+        lookups.contains("never execute") && lookups.contains("not a §6.6 block"),
+        "lookups must mark unfulfillable as non-executing and not a block"
+    );
 }
 
 /// §10.8 — the notification budget is stated: one weekly digest, silent renewals,

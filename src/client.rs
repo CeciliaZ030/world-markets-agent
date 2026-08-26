@@ -803,6 +803,38 @@ impl WorldClient {
         })
     }
 
+    /// Visible opposite-side size on a spot/perp book. Buy takes asks (sell depth).
+    pub(crate) fn book_visible_depth(
+        &self,
+        book: &str,
+        take_side: &str,
+        quantity_decimals: u8,
+    ) -> Result<String, String> {
+        let book: Address = book
+            .parse()
+            .map_err(|_| format!("[world-markets] invalid order book address {book}"))?;
+        let side = take_side.to_ascii_lowercase();
+        let levels = if matches!(side.as_str(), "buy" | "long" | "lend") {
+            self.call_at(book, &retrieveSellDepthChartCall { maxDepth: 16 })?
+                .levels
+        } else {
+            self.call_at(book, &retrieveBuyDepthChartCall { maxDepth: 16 })?
+                .levels
+        };
+        let mut total: u128 = 0;
+        for word in levels.iter().filter(|w| !w.is_zero()) {
+            let mut qty = u128::from(field(*word, 64, 64));
+            if qty == 0 {
+                qty = u128::from(field(*word, 0, 64));
+            }
+            total = total.saturating_add(qty);
+        }
+        if total == 0 {
+            return Err("[world-markets] empty book depth".to_string());
+        }
+        Ok(decimal(total, quantity_decimals))
+    }
+
     /// Live spot / perp / lend books. Zero-address books are omitted.
     pub(crate) fn list_markets(&self) -> Result<Vec<Market>, String> {
         let assets = self.assets()?;

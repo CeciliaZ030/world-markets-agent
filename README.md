@@ -133,22 +133,25 @@ execution waits on Aomi's key-holding design; local execution uses the sidecar.
 [`world-mini-app`](mini-app/) is the Telegram Mini App UI (ledger, portfolio,
 charts, voice compose). It is **not** started by `aomi-run` or `dev-run.sh`.
 
-**Agents and humans:** start the full local stack with one script:
+**Full local experience** (Mini App browser tabs + agent chat CLI + sidecars):
 
 ```sh
-chmod +x scripts/dev-mini-app.sh
-./scripts/dev-mini-app.sh --open
+chmod +x scripts/dev-full.sh
+./scripts/dev-full.sh
 ```
 
-That script starts the **brain** sidecar (ledger / watches / compose), the
-**mini-app** HTTP server, and the **execution** sidecar when `WORLD_PRIVATE_KEY`
-is set. Portfolio reads chain RPC; the ledger tab reads brain — running only
-`cargo run -p world-mini-app` shows *can't reach the ledger* while portfolio
-still works.
+That one script starts brain, execution sidecar (when `WORLD_PRIVATE_KEY` is
+set), the mini-app server, opens portfolio + chart tabs, and runs **interactive
+`aomi-run`** in the terminal — the same agent thread you used before in the CLI.
+
+Mini App UI only (no agent REPL): `./scripts/dev-mini-app.sh --open`
+
+Agent REPL only (no Mini App): `./scripts/dev-run.sh`
 
 Set in `.env` for browser dev:
 
 - `WORLD_ACCOUNT_ID` — account bound to portfolio/ledger views
+- `OPENROUTER_API_KEY` — required for `aomi-run`
 - `MINI_APP_DEV_BYPASS=1` — skip Telegram auth on localhost
 - `WORLD_PRIVATE_KEY` — optional; enables live trade flush via sidecar
 
@@ -157,9 +160,7 @@ URLs after startup:
 - Portfolio: `http://127.0.0.1:8080/?preview=dev`
 - Chart: `http://127.0.0.1:8080/chart?symbol=AAPL&period=d&preview=dev`
 
-Options: `--open` (browser), `--no-sidecar` (read-only UI), `--help`.
-
-For the plugin/agent REPL (not the Mini App), use `./scripts/dev-run.sh` above.
+Options: `dev-full.sh --no-open`, `--no-cli`, `--no-sidecar`, `--help`.
 
 ## Deploy
 

@@ -1,9 +1,9 @@
 use aomi_sdk::*;
 
 mod brain;
+mod cant;
 mod carry;
 mod chart;
-mod cant;
 mod client;
 mod execution;
 mod guest;
@@ -13,6 +13,7 @@ mod lookups;
 mod mandate;
 mod marketdata;
 pub mod mini_app;
+mod order_intent;
 mod pnl;
 mod preamble;
 mod rates;
@@ -114,6 +115,10 @@ mod tests {
         assert!(
             preamble::COMPOSED.contains("Portfolio"),
             "composed preamble must include balance lookup format"
+        );
+        assert!(
+            preamble::COMPOSED.contains("open_instructions"),
+            "composed preamble must tell the agent to load ledger open_instructions"
         );
         assert!(
             preamble::COMPOSED.len() > preamble::ROLE_LEN + 5000,

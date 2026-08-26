@@ -37,14 +37,19 @@ import {
   watchedAccounts,
 } from "./watches.js";
 import {
+  archiveInstruction,
   composeDraft,
   getInstruction,
   laborStats,
   listInstructions,
+  listDueTrades,
+  openInstructions,
   summary as ledgerSummary,
   watchCountsByInstrument,
   stageTrade,
   beginExecute,
+  claimSlice,
+  recordSlice,
   completeExecute,
 } from "./instructions.js";
 import { drain, peek } from "./outbound.js";
@@ -62,6 +67,11 @@ import {
 } from "./voice.js";
 import { handleHeard } from "./cant.js";
 import { handleShare } from "./share.js";
+import {
+  ontologyStats,
+  ontologySummary,
+  recordOntologySnapshot,
+} from "./ontology_stats.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 loadDotEnv(resolve(ROOT, ".env"));
@@ -80,6 +90,7 @@ const server = createServer((req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`[brain] ${HOST}:${PORT} dir=${dataDir()} (unsigned)`);
+  recordOntologySnapshot();
   startTicker();
 });
 
@@ -150,6 +161,7 @@ async function handle(req, res) {
       ledger: {
         ...ledgerSummary(accountId),
         labor: laborStats(accountId),
+        open_instructions: openInstructions(accountId),
       },
       voice: voiceContext(accountId),
     });
@@ -190,6 +202,29 @@ async function handle(req, res) {
     send(res, 200, exportEval(accountId));
     return;
   }
+  if (req.method === "GET" && url.pathname === "/v1/ontology/summary") {
+    send(res, 200, ontologySummary());
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/v1/ontology/stats") {
+    const accountId = url.searchParams.get("account_id");
+    const all = url.searchParams.get("all") === "1";
+    if (!accountId && !all) {
+      send(res, 400, { ok: false, error: "account_id is required (or all=1 for operator-local)" });
+      return;
+    }
+    send(
+      res,
+      200,
+      ontologyStats({
+        accountId,
+        from: url.searchParams.get("from"),
+        to: url.searchParams.get("to"),
+        all,
+      }),
+    );
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/v1/ledger/summary") {
     const accountId = url.searchParams.get("account_id");
     if (!accountId) {
@@ -228,6 +263,11 @@ async function handle(req, res) {
     send(res, 200, { ok: true, instruction });
     return;
   }
+  if (req.method === "GET" && url.pathname === "/v1/trades/due") {
+    const accountId = url.searchParams.get("account_id");
+    send(res, 200, { ok: true, trades: listDueTrades(accountId) });
+    return;
+  }
   if (req.method !== "POST") {
     send(res, 404, { ok: false, error: "not found" });
     return;
@@ -258,6 +298,14 @@ async function handle(req, res) {
         send(res, 200, cancelTask(accountIdOf(body), cancelIdOf(body)));
         return;
       }
+      if (String(body.kind || "") === "archive") {
+        send(
+          res,
+          200,
+          archiveInstruction(accountIdOf(body), body.instruction_id || body.id),
+        );
+        return;
+      }
       send(res, 200, composeDraft(accountIdOf(body), body));
       return;
     case "/v1/trades/stage":
@@ -265,6 +313,16 @@ async function handle(req, res) {
       return;
     case "/v1/trades/begin":
       send(res, 200, beginExecute(accountIdOf(body), body.instruction_id || body.id));
+      return;
+    case "/v1/trades/claim":
+      send(res, 200, claimSlice(accountIdOf(body), body.instruction_id || body.id));
+      return;
+    case "/v1/trades/progress":
+      send(
+        res,
+        200,
+        recordSlice(accountIdOf(body), body.instruction_id || body.id, body),
+      );
       return;
     case "/v1/trades/complete":
       send(

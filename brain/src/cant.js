@@ -18,7 +18,8 @@ import {
   kindOf,
 } from "./ontology.js";
 import { appendEvent, upsertCant } from "./instructions.js";
-import { lexiconOf, upsertLexicon } from "./voice.js";
+import { lexiconOf, stampUtterance, upsertLexicon, voiceContext } from "./voice.js";
+import { recordCandidateOutcome } from "./ontology_stats.js";
 
 const MAX_CANDIDATES = 3;
 const PHONETIC_FLOOR = 0.65;
@@ -340,24 +341,22 @@ function splitClauses(text) {
     .filter(Boolean);
 }
 
-function extractEntity(clause) {
+function extractEntity(clause, slots) {
   const tokens = tokenize(clause);
   if (!tokens.length) return null;
-  const frames = [
-    ["dollars", "worth", "of"],
-    ["bucks", "worth", "of"],
-    ["worth", "of"],
-    ["dollars", "of"],
-    ["bucks", "of"],
-    ["of"],
-  ];
-  for (const frame of frames) {
-    for (let i = 0; i + frame.length < tokens.length; i++) {
-      if (tokens.slice(i, i + frame.length).join(" ") === frame.join(" ")) {
-        const next = tokens[i + frame.length];
-        if (next) return next;
-      }
-    }
+  const control = tokens.some((t) => t === "cancel" || t === "pause" || t === "resume");
+  const watches = tokens.some((t) =>
+    t === "watches" || t === "tasks" || t === "watch" || t === "task",
+  );
+  if (control && watches) return null;
+  if (Array.isArray(slots) && slots.length) {
+    const lower = String(clause || "").toLowerCase();
+    const inst = slots.find((row) => {
+      if (row?.kind !== "instrument" || !row.surface) return false;
+      return lower.includes(String(row.surface).toLowerCase());
+    });
+    if (inst) return String(inst.surface).toLowerCase();
+    return null;
   }
   const actAt = tokens.findIndex((t) => ACTS.has(t));
   if (actAt >= 0) {
@@ -375,12 +374,7 @@ function hasAct(clause) {
 }
 
 function hasSizeFrame(clause) {
-  const tokens = tokenize(clause);
-  return (
-    tokens.includes("worth") ||
-    (tokens.includes("dollars") && tokens.includes("of")) ||
-    (tokens.includes("bucks") && tokens.includes("of"))
-  );
+  return tokenize(clause).some((t) => kindOf(t) === "size_frame");
 }
 
 function isLookupText(text) {
@@ -445,6 +439,45 @@ function sublineFor(repeatCount) {
   return `asked ${repeatCount} times · kept for the record`;
 }
 
+function trainingUseOf(accountId) {
+  return voiceContext(accountId).consents?.training_use === "granted";
+}
+
+function stampHeard(accountId, body, result) {
+  const ref = body.utterance_ref || body.utterance_id;
+  if (!ref || body.peek) return;
+  const kind = result.kind || result.cant_kind || result.voice_kind;
+  stampUtterance(accountId, ref, { cant_kind: kind || null });
+}
+
+function recordProposalOutcome(accountId, body, outcome) {
+  const ref = body.utterance_ref || body.utterance_id;
+  if (!ref || body.peek) return;
+  const utt = stampUtterance(accountId, ref, {});
+  const proposals = utt?.proposals || body.proposals || body.proposed_confusables || [];
+  const training = trainingUseOf(accountId);
+  for (const row of proposals) {
+    recordCandidateOutcome(accountId, {
+      surface: row.surface || body.asked_entity,
+      target: row.target,
+      slotKind: row.kind || "confusable",
+      channel: utt?.channel || body.channel,
+      outcome,
+      trainingUse: training,
+    });
+  }
+  if (!proposals.length && body.asked_entity) {
+    recordCandidateOutcome(accountId, {
+      surface: body.asked_entity,
+      target: body.resolved || body.asked_entity,
+      slotKind: "confusable",
+      channel: utt?.channel || body.channel,
+      outcome,
+      trainingUse: training,
+    });
+  }
+}
+
 function payloadBase(kind) {
   return {
     ok: true,
@@ -460,7 +493,7 @@ function payloadBase(kind) {
   };
 }
 
-function classifyClause(clause, universe, lexicon, declined) {
+function classifyClause(clause, universe, lexicon, declined, slots) {
   const tokens = tokenize(clause);
   if (!tokens.length) return { kind: "empty" };
   if (isLookupText(clause) || isQuestion(clause)) return { kind: "pass" };
@@ -481,7 +514,7 @@ function classifyClause(clause, universe, lexicon, declined) {
     return { kind: "unclear" };
   }
 
-  const entity = extractEntity(clause);
+  const entity = extractEntity(clause, slots);
   if (!entity || !isStableEntity(entity)) {
     return { kind: "unclear" };
   }
@@ -523,12 +556,17 @@ function applyPending(accountId, text, state, universe, body, now) {
     state.declined[pending.entity] = now;
     state.pending = null;
     saveState(accountId, state);
+    recordProposalOutcome(accountId, {
+      ...body,
+      utterance_ref: pending.utterance_ref || body.utterance_ref,
+      asked_entity: pending.entity,
+    }, "rejected");
     return wallOutcome(accountId, {
       clause: pending.original_text,
       entity: pending.entity,
       kind: "no_market",
       origin: body.origin,
-      utteranceRef: body.utterance_ref,
+      utteranceRef: pending.utterance_ref || body.utterance_ref,
       remaining: pending.remaining_text || "",
       nearOffered: (pending.candidates || []).length,
       now,
@@ -558,14 +596,27 @@ function applyPending(accountId, text, state, universe, body, now) {
     const remaining = pending.remaining_text
       ? `${rewritten} and ${pending.remaining_text}`
       : rewritten;
-    return {
+    const resolved = {
       ...payloadBase("resolved"),
       skip_llm: false,
       reply_verbatim: false,
       rewritten_text: remaining,
       remaining_text: remaining,
       message: "",
+      asked_entity: pending.entity,
     };
+    recordProposalOutcome(
+      accountId,
+      {
+        ...body,
+        utterance_ref: pending.utterance_ref || body.utterance_ref,
+        asked_entity: pending.entity,
+        resolved: hit.symbol,
+      },
+      "accepted",
+    );
+    stampHeard(accountId, { ...body, utterance_ref: pending.utterance_ref || body.utterance_ref }, resolved);
+    return resolved;
   }
   state.pending = null;
   saveState(accountId, state);
@@ -640,8 +691,11 @@ export function handleHeard(accountId, body = {}, now = nowSecs()) {
   const lexicon = lexiconOf(accountId);
   const origin = body.origin || (body.source === "mini_app" || body.utterance_ref ? "voice" : null);
   const peek = Boolean(body.peek);
+  const slots = Array.isArray(body.slots) ? body.slots : null;
   if (!text) {
-    return { ...payloadBase("unclear"), skip_llm: true, message: CANT.unclear, voice_kind: "unclear" };
+    const unclear = { ...payloadBase("unclear"), skip_llm: true, message: CANT.unclear, voice_kind: "unclear" };
+    stampHeard(accountId, body, unclear);
+    return unclear;
   }
   if (isLookupText(text)) {
     return { ...payloadBase("unmatched"), skip_llm: false };
@@ -649,11 +703,14 @@ export function handleHeard(accountId, body = {}, now = nowSecs()) {
 
   const state = loadState(accountId);
   const pendingHit = applyPending(accountId, text, state, universe, { ...body, origin, peek }, now);
-  if (pendingHit) return pendingHit;
+  if (pendingHit) {
+    stampHeard(accountId, body, pendingHit);
+    return pendingHit;
+  }
 
   const clauses = splitClauses(text);
   const classified = clauses.map((clause) =>
-    classifyClause(clause, universe, lexicon, state.declined || {}),
+    classifyClause(clause, universe, lexicon, state.declined || {}, slots),
   );
 
   const unresolved = classified
@@ -666,16 +723,20 @@ export function handleHeard(accountId, body = {}, now = nowSecs()) {
     .filter(Boolean);
 
   if (!unresolved.length && unclear.length && !remainder.length) {
-    return {
+    const out = {
       ...payloadBase("unclear"),
       skip_llm: true,
       message: CANT.unclear,
       voice_kind: "unclear",
     };
+    stampHeard(accountId, body, out);
+    return out;
   }
 
   if (!unresolved.length) {
-    return { ...payloadBase("unmatched"), skip_llm: false, remaining_text: "" };
+    const out = { ...payloadBase("unmatched"), skip_llm: false, remaining_text: "" };
+    stampHeard(accountId, body, out);
+    return out;
   }
 
   const first = unresolved[0];
@@ -697,7 +758,7 @@ export function handleHeard(accountId, body = {}, now = nowSecs()) {
         ...candidates.map((row) => row.label),
         nearMatchEscape(first.entity),
       ];
-      return {
+      const out = {
         ...payloadBase("near_match"),
         skip_llm: true,
         message: nearMatchMessage(first.entity),
@@ -707,6 +768,8 @@ export function handleHeard(accountId, body = {}, now = nowSecs()) {
         candidates,
         voice_kind: "near_match",
       };
+      stampHeard(accountId, body, out);
+      return out;
     }
   }
 
@@ -739,6 +802,7 @@ export function handleHeard(accountId, body = {}, now = nowSecs()) {
     last.message = handled.map((row) => row.message).join("\n\n");
   }
   last.voice_kind = "cant";
+  stampHeard(accountId, body, last);
   return last;
 }
 

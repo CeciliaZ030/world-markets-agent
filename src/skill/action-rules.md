@@ -21,7 +21,7 @@ Reuse handover account/wallet context. Quote numbers only from the latest tool r
 
 ## Three action classes
 
-- **Execute** — clear, inside mandate → `execute_*` with whole `sentence`. 3s ledger ×, then fill. No tap.
+- **Execute** — clear, inside mandate → `execute_*` with whole `sentence`. 3s ×, then TWAP/DCA slices. No tap.
 - **Ask** — instrument/size/level unclear → one voice/text question, max two rounds, then Mini App to inspect. Never guess. Never Sign.
 - **Escalate** — material size jump, lockup/maturity, leverage-band change, first new market, add while liquidation-eligible → voice/text confirm. Chat button last-resort. Silence = no. Policy edits sign on World.
 

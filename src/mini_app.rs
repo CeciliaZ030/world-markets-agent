@@ -645,6 +645,10 @@ pub fn flush_staged_trade(account_id: u64, instruction_id: &str) -> Result<Value
     crate::staged::flush_staged_trade(account_id, instruction_id)
 }
 
+pub fn flush_due_trades(account_id: u64) -> Result<Value, String> {
+    crate::staged::flush_due_trades(account_id)
+}
+
 /// Best-effort Bot API send. Failures are logged by the caller; they must not
 /// undo a completed ledger cancel.
 pub fn post_chat_lines(bot_token: &str, chat_id: u64, lines: &[String]) -> Result<(), String> {
@@ -775,6 +779,19 @@ fn save_prepared_inline_message(
 /// Does not call The Desk. Does not place an order.
 pub fn ingest_voice_note(account_id: u64, body: &Value) -> Result<Value, String> {
     crate::voice::ingest_voice(account_id, body)
+}
+
+pub fn ontology_summary() -> Result<Value, String> {
+    BrainClient::from_env().ontology_summary()
+}
+
+pub fn ontology_stats(
+    account_id: Option<u64>,
+    from: Option<&str>,
+    to: Option<&str>,
+    all: bool,
+) -> Result<Value, String> {
+    BrainClient::from_env().ontology_stats(account_id, from, to, all)
 }
 
 fn risk_score(metrics: &PortfolioMetrics, eligible: bool) -> u8 {

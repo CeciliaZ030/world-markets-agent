@@ -7,6 +7,7 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { filePath, readJson, writeJson } from "./store.js";
 import { kindRank, ontologyKeyterms } from "./ontology.js";
+import { recordCandidateOutcome, recordFromUtterance } from "./ontology_stats.js";
 
 const EPISODE_GAP_SECS = 90;
 const MAX_UTTERANCES = 400;
@@ -182,6 +183,20 @@ export function ingestUtterance(accountId, body, now = nowSecs()) {
     ts: now,
     source: body.source || "mini_app",
     foreign: Boolean(body.foreign),
+    channel: body.channel || null,
+    ontology_version: body.ontology_version ?? null,
+    slots: Array.isArray(body.slots) ? body.slots : [],
+    proposals: Array.isArray(body.proposals)
+      ? body.proposals
+      : Array.isArray(body.proposed_confusables)
+        ? body.proposed_confusables
+        : [],
+    grammar: body.grammar || null,
+    action_ir: body.action_ir || null,
+    lexicon_hits: Array.isArray(body.lexicon_hits) ? body.lexicon_hits : [],
+    unknown_instruments: Array.isArray(body.unknown_instruments)
+      ? body.unknown_instruments
+      : [],
   };
   data.utterances = cap([...data.utterances, utterance], MAX_UTTERANCES);
   const episode = body.foreign
@@ -191,6 +206,10 @@ export function ingestUtterance(accountId, body, now = nowSecs()) {
     applyLexicon(data, body.lexicon_hits, now);
   }
   saveVoice(accountId, data);
+  const training = (data.consents || []).some(
+    (c) => c.kind === "training_use" && c.status === "granted",
+  );
+  recordFromUtterance(accountId, utterance, training);
   return {
     ok: true,
     utterance,
@@ -200,6 +219,16 @@ export function ingestUtterance(accountId, body, now = nowSecs()) {
     long_note_line: longNoteLine,
     split_parse: splitParse,
   };
+}
+
+export function stampUtterance(accountId, utteranceRef, patch) {
+  if (!utteranceRef) return null;
+  const data = loadVoice(accountId);
+  const row = (data.utterances || []).find((u) => u.id === utteranceRef);
+  if (!row) return null;
+  Object.assign(row, patch || {});
+  saveVoice(accountId, data);
+  return row;
 }
 
 function meanConf(words) {
@@ -230,6 +259,38 @@ export function recordCorrection(accountId, body, now = nowSecs()) {
     applyLexicon(data, { ...body.lexicon_rename, source: "confirmed" }, now);
   }
   saveVoice(accountId, data);
+  if (body.utterance_ref) {
+    const training = (data.consents || []).some(
+      (c) => c.kind === "training_use" && c.status === "granted",
+    );
+    const utt = (data.utterances || []).find((u) => u.id === body.utterance_ref);
+    const acceptedSym = body.accepted_intent?.symbol;
+    const rejectedSym = body.rejected_intent?.symbol;
+    for (const proposal of utt?.proposals || []) {
+      const outcome =
+        acceptedSym && String(proposal.target) === String(acceptedSym)
+          ? "accepted"
+          : "rejected";
+      recordCandidateOutcome(accountId, {
+        surface: proposal.surface,
+        target: proposal.target,
+        slotKind: proposal.kind || "confusable",
+        channel: utt?.channel,
+        outcome,
+        trainingUse: training,
+      });
+    }
+    if (rejectedSym && !utt?.proposals?.length) {
+      recordCandidateOutcome(accountId, {
+        surface: rejectedSym,
+        target: acceptedSym || rejectedSym,
+        slotKind: "instrument",
+        channel: utt?.channel,
+        outcome: acceptedSym ? "accepted" : "rejected",
+        trainingUse: training,
+      });
+    }
+  }
   return { ok: true, correction: row };
 }
 

@@ -67,7 +67,7 @@ pub(crate) struct GetWorldAccountArgs {
 
 pub(crate) struct RenderLookup;
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(crate) struct RenderLookupArgs {
     /// Whole user message. Host short-circuit: pass this and send `message` when `skip_llm`.
     #[serde(default)]
@@ -81,6 +81,13 @@ pub(crate) struct RenderLookupArgs {
     /// Expected owner wallet. This does not replace the acting wallet authorization check.
     #[serde(default)]
     pub(crate) wallet_address: Option<String>,
+    /// Set when voice/text ingest already recorded this turn. Avoids a second write.
+    #[serde(default)]
+    pub(crate) utterance_ref: Option<String>,
+    /// Slot list from ingest when `utterance_ref` is set.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub(crate) slots: Option<Value>,
 }
 
 pub(crate) struct WarmAccount;
@@ -220,12 +227,24 @@ pub(crate) struct ExecuteWorldOrderArgs {
     /// Limit price (spot/perp) or interest rate (lend). Omit for a market/IOC order.
     #[serde(default)]
     pub(crate) price: Option<String>,
-    /// `limit` or `market`. Inferred from price when omitted.
+    /// `market`, `limit`, `twap`, or `dca`. Inferred from size vs book when omitted.
     #[serde(default)]
     pub(crate) order_type: Option<String>,
     /// Slippage decimal for market orders, e.g. "0.005" for 0.5%.
     #[serde(default)]
     pub(crate) slippage: Option<String>,
+    /// Slice count for TWAP/DCA. Inferred from book depth when omitted.
+    #[serde(default)]
+    pub(crate) slices: Option<u32>,
+    /// TWAP window in minutes. Spacing is window/slices when set.
+    #[serde(default)]
+    pub(crate) window_minutes: Option<u32>,
+    /// Seconds between child fills. Defaults: 60s TWAP, 1 day DCA.
+    #[serde(default)]
+    pub(crate) interval_secs: Option<u64>,
+    /// DCA cadence: `daily` or `weekly`.
+    #[serde(default)]
+    pub(crate) cadence: Option<String>,
     #[serde(default)]
     pub(crate) account_id: Option<u64>,
     #[serde(default)]
@@ -885,7 +904,7 @@ impl DynAomiTool for RenderLookup {
     type App = WorldMarketsApp;
     type Args = RenderLookupArgs;
     const NAME: &'static str = "render_lookup";
-    const DESCRIPTION: &'static str = "Whole-message terse lookup (b/p/r/a/d, word forms, ?/commands), cancel task {id}, the non-money share/introduce intent, or an unfulfillable/near-match/unclear heard reply. Host: call on every user message with text=user message; if skip_llm, send message (and controls when present) and do not call the LLM. Unmatched messages still prefetch the account. Model: paste message verbatim. Share never executes. Cancel drops a watch — never a trade. Unfulfillable never executes.";
+    const DESCRIPTION: &'static str = "Whole-message terse lookup (b/p/r/a/d, word forms, ?/commands), cancel task {id}, the non-money share/introduce intent, or an unfulfillable/near-match/unclear heard reply. Host: call on every user message with text=user message; pass utterance_ref and slots from Mini App send_payload when present so the heard path does not re-ingest. If skip_llm, send message (and controls when present) and do not call the LLM. Unmatched messages still prefetch the account. Model: paste message verbatim. Share never executes. Cancel drops a watch — never a trade. Unfulfillable never executes.";
 
     fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
         if let Some(id) = args
@@ -920,18 +939,34 @@ impl DynAomiTool for RenderLookup {
                 .filter(|value| !value.is_empty())
             {
                 if let Some(account_id) = WorldMarketsApp::account_id(&ctx, args.account_id) {
-                    if let Some(value) = crate::cant::try_heard(account_id, text, None) {
-                        return Ok(value);
+                    let extra = match (&args.utterance_ref, &args.slots) {
+                        (None, None) => None,
+                        _ => Some(json!({
+                            "utterance_ref": args.utterance_ref,
+                            "slots": args.slots,
+                            "channel": "speech",
+                        })),
+                    };
+                    if let Some(value) = crate::cant::try_heard(account_id, text, extra.as_ref()) {
+                        return Ok(crate::tasks::attach_open_instructions(
+                            &app.brain,
+                            Some(account_id),
+                            value,
+                        ));
                     }
                 }
             }
-            return Ok(json!({
-                "source": "world-markets-lookup",
-                "executable": false,
-                "matched": false,
-                "skip_llm": false,
-                "reply_verbatim": false,
-            }));
+            return Ok(crate::tasks::attach_open_instructions(
+                &app.brain,
+                WorldMarketsApp::account_id(&ctx, args.account_id),
+                json!({
+                    "source": "world-markets-lookup",
+                    "executable": false,
+                    "matched": false,
+                    "skip_llm": false,
+                    "reply_verbatim": false,
+                }),
+            ));
         };
         app.note_activity(&ctx, args.account_id);
         let before = app.client.rpc_stats();
@@ -1287,7 +1322,7 @@ impl DynAomiTool for ExecuteWorldOrder {
     type App = WorldMarketsApp;
     type Args = ExecuteWorldOrderArgs;
     const NAME: &'static str = "execute_world_order";
-    const DESCRIPTION: &'static str = "Stage a World spot, perp, or lend/borrow order on the ledger for a 3s cancel window, then fill through the local execution sidecar after the mandate allows. Pass the user's whole sentence. Limit if price is set, otherwise market/IOC. Call after a clear voice or text instruction — do not wait for a Telegram button. Never withdraws.";
+    const DESCRIPTION: &'static str = "Stage a World spot, perp, or lend/borrow order on the ledger for a 3s cancel window, then fill through the local execution sidecar after the mandate allows. Pass the user's whole sentence. Order type is market, limit, twap, or dca — inferred when omitted (thin book → TWAP; 'every day' → DCA). Limit if a price is set and no algo is named. TWAP/DCA stay on the ledger and fill in slices over time. Call after a clear voice or text instruction — do not wait for a Telegram button. Never withdraws.";
 
     fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
         let product = normalize_execute_product(&args.product)?;
@@ -1305,7 +1340,7 @@ impl DynAomiTool for ExecuteWorldOrder {
             .clone()
             .unwrap_or_else(|| "USDT".to_string());
         let quote = asset_by_symbol(&assets, &quote_symbol)?;
-        let (_, _, verdict) = app.live_verdict(
+        let (market, _, verdict) = app.live_verdict(
             LiveVerdictInput {
                 product,
                 side: &side,
@@ -1320,13 +1355,35 @@ impl DynAomiTool for ExecuteWorldOrder {
             return Ok(execution_blocked(&access, &verdict));
         }
         let sentence = trade_sentence(&args);
+        let opposite_depth = if product == "lend" {
+            None
+        } else {
+            app.client
+                .book_visible_depth(&market.book, &side, base.position_decimals)
+                .ok()
+                .and_then(|raw| parse_decimal(&raw, "depth").ok())
+        };
+        let plan = crate::order_intent::infer_execution_plan(crate::order_intent::InferInput {
+            named: args.order_type.as_deref(),
+            price: args.price.as_deref(),
+            sentence: Some(&sentence),
+            quantity,
+            opposite_depth,
+            slices: args.slices,
+            window_minutes: args.window_minutes,
+            interval_secs: args.interval_secs,
+            cadence: args.cadence.as_deref(),
+        });
+        let mut staged = args.clone();
+        staged.order_type = Some(plan.order_type.clone());
         let mandate = ctx.attribute_path(&["handover_mandate"]).cloned();
         crate::staged::stage_and_schedule(
             &app.brain,
             access.account_id,
-            &args,
+            &staged,
             &sentence,
             mandate.as_ref(),
+            &plan,
         )
     }
 }
@@ -1389,7 +1446,10 @@ pub(crate) fn place_world_order(
     if !verdict.is_allow() {
         return Ok(execution_blocked(&access, &verdict));
     }
-    let order_type = resolve_order_type(args.order_type.as_deref(), args.price.as_deref());
+    let order_type = crate::order_intent::venue_order_type(
+        args.order_type.as_deref().unwrap_or(""),
+        args.price.as_deref(),
+    );
     let receipt = app.execution.place_order(&PlaceOrderRequest {
         account_id: access.account_id,
         product: product.to_string(),
@@ -2321,7 +2381,7 @@ impl DynAomiTool for GetWorldTasks {
     type App = WorldMarketsApp;
     type Args = GetWorldTasksArgs;
     const NAME: &'static str = "get_world_tasks";
-    const DESCRIPTION: &'static str = "List watches, unsigned preferences, signed on-chain policies, plus voice lexicon/episode/consents. Policies are read-only from chat. Never executes.";
+    const DESCRIPTION: &'static str = "List open ledger instructions (sentence + id), watches, unsigned preferences, signed on-chain policies, plus voice lexicon/episode/consents. Open instructions are standing user intent from Mini App, speech, or a fired watch. Policies are read-only from chat. Never executes.";
 
     fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
         app.note_activity(&ctx, args.account_id);
@@ -2751,12 +2811,7 @@ fn normalize_execute_side(product: &str, side: &str) -> Result<String, String> {
 }
 
 fn resolve_order_type(named: Option<&str>, price: Option<&str>) -> String {
-    match named.map(|value| value.to_ascii_lowercase()).as_deref() {
-        Some("market") | Some("ioc") => "market".to_string(),
-        Some("limit") => "limit".to_string(),
-        _ if price.is_some() => "limit".to_string(),
-        _ => "market".to_string(),
-    }
+    crate::order_intent::venue_order_type(named.unwrap_or(""), price)
 }
 
 fn numeric_position_id(raw: Option<&str>) -> Option<String> {
@@ -2897,6 +2952,8 @@ mod tests {
         assert_eq!(resolve_order_type(None, Some("2000")), "limit");
         assert_eq!(resolve_order_type(None, None), "market");
         assert_eq!(resolve_order_type(Some("market"), Some("2000")), "market");
+        assert_eq!(resolve_order_type(Some("twap"), None), "market");
+        assert_eq!(resolve_order_type(Some("dca"), None), "market");
     }
 
     #[test]
@@ -2923,6 +2980,10 @@ mod tests {
                 price: None,
                 order_type: None,
                 slippage: None,
+                slices: None,
+                window_minutes: None,
+                interval_secs: None,
+                cadence: None,
                 account_id: None,
                 wallet_address: None,
                 sentence: None,
@@ -2949,6 +3010,10 @@ mod tests {
             price: None,
             order_type: None,
             slippage: None,
+            slices: None,
+            window_minutes: None,
+            interval_secs: None,
+            cadence: None,
             account_id: None,
             wallet_address: None,
             sentence: Some("  Buy a tenth of ETH spot please  ".to_string()),
@@ -3147,6 +3212,8 @@ mod tests {
                 token: None,
                 account_id: None,
                 wallet_address: None,
+                utterance_ref: None,
+                slots: None,
             },
             empty_ctx("render_lookup"),
         )
@@ -3155,6 +3222,7 @@ mod tests {
         assert_eq!(value["skip_llm"], false);
         assert_eq!(value["executable"], false);
         assert!(value.get("message").is_none());
+        assert_eq!(value["open_instructions"], json!([]));
         assert!(
             app.warmer.never_refreshed(),
             "unit tests must not block on a live prefetch"
@@ -3171,6 +3239,8 @@ mod tests {
                 token: Some("nope".into()),
                 account_id: None,
                 wallet_address: None,
+                utterance_ref: None,
+                slots: None,
             },
             empty_ctx("render_lookup"),
         )
@@ -3189,6 +3259,8 @@ mod tests {
                 token: None,
                 account_id: None,
                 wallet_address: None,
+                utterance_ref: None,
+                slots: None,
             },
             empty_ctx("render_lookup"),
         )
@@ -3206,6 +3278,8 @@ mod tests {
                 token: Some("d".into()),
                 account_id: None,
                 wallet_address: None,
+                utterance_ref: None,
+                slots: None,
             },
             empty_ctx("render_lookup"),
         )
@@ -3223,6 +3297,8 @@ mod tests {
                 token: None,
                 account_id: None,
                 wallet_address: None,
+                utterance_ref: None,
+                slots: None,
             },
             empty_ctx("render_lookup"),
         )
@@ -3240,6 +3316,8 @@ mod tests {
                 token: Some("index".into()),
                 account_id: None,
                 wallet_address: None,
+                utterance_ref: None,
+                slots: None,
             },
             empty_ctx("render_lookup"),
         )
@@ -3262,6 +3340,8 @@ mod tests {
                     token: None,
                     account_id: None,
                     wallet_address: None,
+                    utterance_ref: None,
+                    slots: None,
                 },
                 empty_ctx("render_lookup"),
             )
@@ -3286,6 +3366,8 @@ mod tests {
             token: None,
             account_id,
             wallet_address: None,
+            utterance_ref: None,
+            slots: None,
         }
     }
 

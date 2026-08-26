@@ -1,8 +1,5 @@
-//! World Markets speech ontology: universe, Deepgram keyterm seed, slot repair.
-//!
-//! Checked-in vocabulary is `assets/speech_ontology.json`. Size-frame repair and
-//! exact instrument aliases still rewrite the transcript. `kind: confusable`
-//! surfaces (beef/these) are proposed, not silently mapped — the intent layer asks.
+//! World utterance language. Vocabulary, frames, repairs, and channel policy
+//! live in `assets/speech_ontology.json`. Rust is the only matcher.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -11,7 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 const ONTOLOGY_JSON: &str = include_str!("../assets/speech_ontology.json");
-const ONTOLOGY_VERSION: u32 = 1;
+const ONTOLOGY_VERSION: u32 = 2;
 const EXTRA_KEYTERM_BUDGET: usize = 40;
 const MAX_EDIT_DISTANCE: usize = 1;
 
@@ -19,6 +16,12 @@ const MAX_EDIT_DISTANCE: usize = 1;
 struct OntologyFile {
     version: u32,
     entries: Vec<OntologyEntry>,
+    #[serde(default)]
+    frames: Vec<OntologyFrame>,
+    #[serde(default)]
+    repairs: Vec<OntologyRepair>,
+    #[serde(default)]
+    gates: OntologyGates,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -28,6 +31,236 @@ pub struct OntologyEntry {
     pub kind: String,
     #[serde(default)]
     pub confidence: f64,
+    /// Omitted or empty means both speech and text.
+    #[serde(default)]
+    pub channels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OntologyFrame {
+    id: String,
+    role: String,
+    #[serde(default)]
+    tokens: Vec<String>,
+    #[serde(default)]
+    fuzzy: bool,
+    #[serde(default)]
+    acts: Vec<String>,
+    #[serde(default)]
+    fuzzy_acts: Vec<String>,
+    #[serde(default)]
+    size: Option<String>,
+    #[serde(default)]
+    instrument: Option<String>,
+    #[serde(default)]
+    level: Option<String>,
+    #[serde(default)]
+    referents: Vec<String>,
+    #[serde(default)]
+    open_prefix: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OntologyRepair {
+    id: String,
+    kind: String,
+    surface: String,
+    target: String,
+    #[serde(default)]
+    insert_before_worth: Option<String>,
+    #[serde(default)]
+    require_acts: Vec<String>,
+    #[serde(default)]
+    require_span: Vec<String>,
+    #[serde(default)]
+    channels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct OntologyGates {
+    #[serde(default)]
+    confusable_pronouns: Vec<String>,
+    #[serde(default)]
+    control_acts: Vec<String>,
+    #[serde(default)]
+    watch_referents: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    Speech,
+    Text,
+}
+
+impl Channel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Channel::Speech => "speech",
+            Channel::Text => "text",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("speech") {
+            Channel::Speech
+        } else {
+            Channel::Text
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrammarStatus {
+    Matched,
+    Partial,
+    None,
+}
+
+impl GrammarStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GrammarStatus::Matched => "matched",
+            GrammarStatus::Partial => "partial",
+            GrammarStatus::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UtteranceSlot {
+    pub kind: String,
+    pub surface: String,
+    pub target: String,
+    pub source: String,
+}
+
+impl UtteranceSlot {
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "kind": self.kind,
+            "surface": self.surface,
+            "target": self.target,
+            "source": self.source,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionIr {
+    pub act: String,
+    pub instrument: Option<String>,
+    pub size: Option<String>,
+    pub product: Option<String>,
+    pub referent: Option<String>,
+    pub frame_id: Option<String>,
+    pub order_type: Option<String>,
+}
+
+impl ActionIr {
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "act": self.act,
+            "instrument": self.instrument,
+            "size": self.size,
+            "product": self.product,
+            "referent": self.referent,
+            "frame_id": self.frame_id,
+            "order_type": self.order_type,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LexiconEntry {
+    pub surface_form: String,
+    pub normalized_target: String,
+    pub kind: String,
+}
+
+impl LexiconEntry {
+    pub fn from_json(value: &Value) -> Option<Self> {
+        let surface = value
+            .get("surface_form")
+            .or_else(|| value.get("surface"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        let kind = value
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("instrument");
+        if kind == "confusable" {
+            return None;
+        }
+        let target = value
+            .get("normalized_target")
+            .or_else(|| value.get("target"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(surface);
+        Some(Self {
+            surface_form: surface.to_string(),
+            normalized_target: target.to_string(),
+            kind: kind.to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedUtterance {
+    pub channel: Channel,
+    pub raw: String,
+    pub normalized_text: String,
+    pub ontology_version: u32,
+    pub stt_version: Option<String>,
+    pub keyterm_applied: bool,
+    pub slots: Vec<UtteranceSlot>,
+    pub proposals: Vec<ProposedConfusable>,
+    pub grammar: GrammarStatus,
+    pub action_ir: Option<ActionIr>,
+    pub lexicon_hits: Vec<LexiconHit>,
+    pub repaired_from: Option<String>,
+    pub unknown_instruments: Vec<String>,
+}
+
+impl NormalizedUtterance {
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "channel": self.channel.as_str(),
+            "raw": self.raw,
+            "normalized_text": self.normalized_text,
+            "ontology_version": self.ontology_version,
+            "stt_version": self.stt_version,
+            "keyterm_applied": self.keyterm_applied,
+            "slots": self.slots.iter().map(UtteranceSlot::to_json).collect::<Vec<_>>(),
+            "proposals": self.proposals.iter().map(ProposedConfusable::to_json).collect::<Vec<_>>(),
+            "grammar": self.grammar.as_str(),
+            "action_ir": self.action_ir.as_ref().map(ActionIr::to_json),
+            "lexicon_hits": self.lexicon_hits.iter().map(LexiconHit::to_json).collect::<Vec<_>>(),
+            "repaired_from": self.repaired_from,
+            "unknown_instruments": self.unknown_instruments,
+        })
+    }
+
+    fn blank(raw: impl Into<String>, channel: Channel) -> Self {
+        let raw = raw.into();
+        Self {
+            channel,
+            raw: raw.clone(),
+            normalized_text: raw,
+            ontology_version: ONTOLOGY_VERSION,
+            stt_version: None,
+            keyterm_applied: false,
+            slots: Vec::new(),
+            proposals: Vec::new(),
+            grammar: GrammarStatus::None,
+            action_ir: None,
+            lexicon_hits: Vec::new(),
+            repaired_from: None,
+            unknown_instruments: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +293,7 @@ impl ProposedConfusable {
         serde_json::json!({
             "surface": self.surface,
             "target": self.target,
+            "kind": "confusable",
         })
     }
 }
@@ -73,6 +307,7 @@ pub struct Repair {
 }
 
 impl Repair {
+    #[allow(dead_code)]
     fn blank(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -84,17 +319,78 @@ impl Repair {
 }
 
 enum SlotHit {
-    Canonical(String),
-    Confusable { surface: String, target: String },
+    Canonical {
+        surface: String,
+        target: String,
+        source: String,
+    },
+    Confusable {
+        surface: String,
+        target: String,
+    },
+}
+
+struct MappedSurface {
+    target: String,
+    source: SlotSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotSource {
+    Exact,
+    Alias,
+    Lexicon,
+}
+
+impl SlotSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            SlotSource::Exact => "exact",
+            SlotSource::Alias => "alias",
+            SlotSource::Lexicon => "lexicon",
+        }
+    }
+
+    fn to_string(self) -> String {
+        self.as_str().to_string()
+    }
 }
 
 struct Ontology {
     entries: Vec<OntologyEntry>,
     kind_by_surface: HashMap<String, String>,
     instrument_by_surface: HashMap<String, String>,
+    instrument_channels: HashMap<String, Vec<String>>,
     confusable_by_surface: HashMap<String, String>,
+    confusable_channels: HashMap<String, Vec<String>>,
     size_words: HashSet<String>,
     units: HashSet<String>,
+    frames: Vec<OntologyFrame>,
+    repairs: Vec<OntologyRepair>,
+    gates: OntologyGates,
+}
+
+fn channels_of(channels: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for row in channels {
+        let key = row.trim().to_ascii_lowercase();
+        if key.is_empty() || !seen.insert(key.clone()) {
+            continue;
+        }
+        out.push(key);
+    }
+    if out.is_empty() {
+        vec!["speech".to_string(), "text".to_string()]
+    } else {
+        out
+    }
+}
+
+fn allows_channel(channels: &[String], channel: Channel) -> bool {
+    channels_of(channels)
+        .iter()
+        .any(|row| row == channel.as_str())
 }
 
 fn ontology() -> &'static Ontology {
@@ -111,7 +407,9 @@ fn load_ontology() -> Ontology {
     );
     let mut kind_by_surface = HashMap::new();
     let mut instrument_by_surface = HashMap::new();
+    let mut instrument_channels = HashMap::new();
     let mut confusable_by_surface = HashMap::new();
+    let mut confusable_channels = HashMap::new();
     let mut size_words = HashSet::new();
     let mut units = HashSet::new();
     for entry in &file.entries {
@@ -119,13 +417,16 @@ fn load_ontology() -> Ontology {
         if key.is_empty() {
             continue;
         }
+        let ch = channels_of(&entry.channels);
         kind_by_surface.insert(key.clone(), entry.kind.clone());
         match entry.kind.as_str() {
             "instrument" => {
-                instrument_by_surface.insert(key, entry.normalized_target.clone());
+                instrument_by_surface.insert(key.clone(), entry.normalized_target.clone());
+                instrument_channels.insert(key, ch);
             }
             "confusable" => {
-                confusable_by_surface.insert(key, entry.normalized_target.clone());
+                confusable_by_surface.insert(key.clone(), entry.normalized_target.clone());
+                confusable_channels.insert(key, ch);
             }
             "size" => {
                 size_words.insert(key);
@@ -147,9 +448,14 @@ fn load_ontology() -> Ontology {
         entries: file.entries,
         kind_by_surface,
         instrument_by_surface,
+        instrument_channels,
         confusable_by_surface,
+        confusable_channels,
         size_words,
         units,
+        frames: file.frames,
+        repairs: file.repairs,
+        gates: file.gates,
     }
 }
 
@@ -161,13 +467,10 @@ fn normalize_key(surface: &str) -> String {
         .join(" ")
 }
 
-/// nova-2 `keywords` intensifier (roughly 1–10). Instruments are strongest;
-/// acts/frames/sizes are moderate; nicknames and unknown terms stay weak.
-/// Confusable surfaces are never boosted (see `boostable_keyterms`).
 pub fn intensifier_for(term: &str) -> u8 {
     match kind_for(term).as_deref() {
         Some("instrument") => 5,
-        Some("act" | "size_frame" | "size" | "unit" | "product") => 3,
+        Some("act" | "size_frame" | "size" | "unit" | "product" | "order_type") => 3,
         _ => 2,
     }
 }
@@ -177,13 +480,12 @@ pub fn kind_for(term: &str) -> Option<String> {
     ontology().kind_by_surface.get(&key).cloned()
 }
 
-/// Single-token, non-confusable surfaces for Deepgram `keywords`.
 pub fn boostable_keyterms() -> Vec<String> {
     let ont = ontology();
     let mut ranked: Vec<&OntologyEntry> = ont
         .entries
         .iter()
-        .filter(|row| row.kind != "confusable")
+        .filter(|row| row.kind != "confusable" && allows_channel(&row.channels, Channel::Speech))
         .collect();
     ranked.sort_by(|a, b| {
         kind_rank(&a.kind)
@@ -227,17 +529,16 @@ fn kind_rank(kind: &str) -> u8 {
     match kind {
         "instrument" => 0,
         "act" => 1,
-        "size_frame" => 2,
-        "size" | "unit" => 3,
-        "product" => 4,
-        "level" => 5,
-        "phrase" => 6,
+        "order_type" => 2,
+        "size_frame" => 3,
+        "size" | "unit" => 4,
+        "product" => 5,
+        "level" => 6,
+        "phrase" => 7,
         _ => 9,
     }
 }
 
-/// Ontology tokens + live catalog symbols + holdings. Caps extras so brain
-/// nicknames still fit under STT `MAX_KEYTERMS` (50).
 pub fn seed_keyterms(catalog: &[String], holdings: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -267,30 +568,70 @@ pub fn seed_keyterms(catalog: &[String], holdings: &[String]) -> Vec<String> {
     out
 }
 
-/// Repair STT text using the ontology plus extra catalog symbols.
+/// Thin wrapper around speech-channel normalize with an empty lexicon.
 pub fn repair_transcript(raw: &str, catalog: &[String]) -> Repair {
+    let normalized = normalize_utterance(raw, Channel::Speech, catalog, &[]);
+    Repair {
+        text: normalized.normalized_text,
+        hits: normalized.lexicon_hits,
+        repaired_from: normalized.repaired_from,
+        proposed_confusables: normalized.proposals,
+    }
+}
+
+/// Shared speech/text normalizer. Confusables honor JSON `channels`.
+pub fn normalize_utterance(
+    raw: &str,
+    channel: Channel,
+    catalog: &[String],
+    lexicon: &[LexiconEntry],
+) -> NormalizedUtterance {
     let original = raw.trim();
     if original.is_empty() {
-        return Repair::blank("");
+        return NormalizedUtterance::blank("", channel);
     }
     let mut tokens = tokenize(original);
     if tokens.is_empty() {
-        return Repair::blank(original);
+        return NormalizedUtterance::blank(original, channel);
     }
 
-    let universe = InstrumentUniverse::new(catalog);
-    repair_size_mishear(&mut tokens);
-    let mut slots = instrument_slots(&tokens);
-    slots.sort_by_key(|slot| slot.index);
-    slots.dedup_by_key(|slot| slot.index);
-    let mut hits: Vec<LexiconHit> = Vec::new();
-    let mut hit_seen = HashSet::new();
+    let universe = InstrumentUniverse::new(catalog, lexicon, channel);
+    let mut slots: Vec<UtteranceSlot> = Vec::new();
+    if let Some(size_slot) = apply_repairs(&mut tokens, channel) {
+        slots.push(size_slot);
+    }
+
+    rewrite_exact_aliases(&mut tokens, &universe, &mut slots);
+    let mut instrument_slots = instrument_slots(&tokens);
+    instrument_slots.sort_by_key(|slot| slot.index);
+    instrument_slots.dedup_by_key(|slot| slot.index);
+
     let mut proposed_confusables: Vec<ProposedConfusable> = Vec::new();
     let mut proposed_seen = HashSet::new();
+    let mut unknown_instruments: Vec<String> = Vec::new();
+    let mut unknown_seen = HashSet::new();
+    let mut mapped_indices: HashSet<usize> = HashSet::new();
+    for (idx, token) in tokens.iter().enumerate() {
+        if universe.canonical_instrument(token).is_some() {
+            mapped_indices.insert(idx);
+        }
+    }
 
-    for slot in slots.into_iter().rev() {
-        let Some((consumed, hit)) = resolve_instrument(&tokens, slot.index, slot.fuzzy, &universe)
+    for slot in instrument_slots.into_iter().rev() {
+        if mapped_indices.contains(&slot.index) {
+            continue;
+        }
+        if should_gate_confusable(&tokens, slot.index) {
+            continue;
+        }
+        let Some((consumed, hit)) =
+            resolve_instrument(&tokens, slot.index, slot.fuzzy, channel, &universe)
         else {
+            if let Some(surface) = tokens.get(slot.index) {
+                if unknown_seen.insert(surface.to_ascii_lowercase()) {
+                    unknown_instruments.push(surface.clone());
+                }
+            }
             continue;
         };
         match hit {
@@ -299,36 +640,36 @@ pub fn repair_transcript(raw: &str, catalog: &[String]) -> Repair {
                     proposed_confusables.push(ProposedConfusable { surface, target });
                 }
             }
-            SlotHit::Canonical(canonical) => {
-                tokens[slot.index] = canonical.clone();
+            SlotHit::Canonical {
+                surface,
+                target,
+                source,
+            } => {
+                tokens[slot.index] = target.clone();
                 for _ in 1..consumed {
                     if slot.index + 1 < tokens.len() {
                         tokens.remove(slot.index + 1);
                     }
                 }
-                if hit_seen.insert(canonical.to_ascii_lowercase()) {
-                    hits.push(LexiconHit {
-                        surface_form: canonical.clone(),
-                        normalized_target: canonical,
-                        kind: "instrument".to_string(),
-                        source: "auto".to_string(),
-                    });
-                }
+                mapped_indices.insert(slot.index);
+                push_instrument_slot(&mut slots, surface, target, source);
             }
         }
     }
 
-    // Instruments already in-domain (said ETH, not repaired from a slot miss).
-    for token in &tokens {
-        if let Some(canonical) = universe.canonical_instrument(token) {
-            if hit_seen.insert(canonical.to_ascii_lowercase()) {
-                hits.push(LexiconHit {
-                    surface_form: canonical.clone(),
-                    normalized_target: canonical,
-                    kind: "instrument".to_string(),
-                    source: "auto".to_string(),
-                });
-            }
+    let mut hit_seen = HashSet::new();
+    let mut lexicon_hits: Vec<LexiconHit> = Vec::new();
+    for slot in &slots {
+        if slot.kind != "instrument" {
+            continue;
+        }
+        if hit_seen.insert(slot.target.to_ascii_lowercase()) {
+            lexicon_hits.push(LexiconHit {
+                surface_form: slot.target.clone(),
+                normalized_target: slot.target.clone(),
+                kind: "instrument".to_string(),
+                source: slot.source.clone(),
+            });
         }
     }
 
@@ -338,24 +679,204 @@ pub fn repair_transcript(raw: &str, catalog: &[String]) -> Repair {
     } else {
         None
     };
-    Repair {
-        text,
-        hits,
+    let clause = first_clause(&tokens);
+    let (grammar, action_ir) = parse_grammar(original, clause, &universe);
+    let mut slots = slots;
+    if let Some(ir) = &action_ir {
+        if let Some(size) = &ir.size {
+            ensure_size_slot(&mut slots, size);
+        }
+        if let Some(referent) = &ir.referent {
+            if !slots.iter().any(|row| row.kind == "referent") {
+                slots.push(UtteranceSlot {
+                    kind: "referent".to_string(),
+                    surface: referent.clone(),
+                    target: referent.clone(),
+                    source: "exact".to_string(),
+                });
+            }
+        }
+    }
+    NormalizedUtterance {
+        channel,
+        raw: original.to_string(),
+        normalized_text: text,
+        ontology_version: ONTOLOGY_VERSION,
+        stt_version: None,
+        keyterm_applied: false,
+        slots,
+        proposals: proposed_confusables,
+        grammar,
+        action_ir,
+        lexicon_hits,
         repaired_from,
-        proposed_confusables,
+        unknown_instruments,
     }
 }
 
+fn first_clause(tokens: &[String]) -> &[String] {
+    tokens
+        .iter()
+        .position(|t| t == "and" || t == "then")
+        .map(|i| &tokens[..i])
+        .filter(|clause| !clause.is_empty())
+        .unwrap_or(tokens)
+}
+
+fn ensure_size_slot(slots: &mut Vec<UtteranceSlot>, size: &str) {
+    if slots.iter().any(|row| row.kind == "size") {
+        return;
+    }
+    slots.push(UtteranceSlot {
+        kind: "size".to_string(),
+        surface: size.to_string(),
+        target: size.to_string(),
+        source: "exact".to_string(),
+    });
+}
+
+fn push_instrument_slot(
+    slots: &mut Vec<UtteranceSlot>,
+    surface: String,
+    target: String,
+    source: String,
+) {
+    let key = target.to_ascii_lowercase();
+    if slots
+        .iter()
+        .any(|row| row.kind == "instrument" && row.target.eq_ignore_ascii_case(&key))
+    {
+        return;
+    }
+    slots.push(UtteranceSlot {
+        kind: "instrument".to_string(),
+        surface,
+        target,
+        source,
+    });
+}
+
+fn rewrite_exact_aliases(
+    tokens: &mut Vec<String>,
+    universe: &InstrumentUniverse,
+    slots: &mut Vec<UtteranceSlot>,
+) {
+    let ont = ontology();
+    let mut i = 0;
+    while i < tokens.len() {
+        if i + 1 < tokens.len() {
+            let phrase = format!("{} {}", tokens[i], tokens[i + 1]);
+            if let Some(mapped) = universe.exact(&phrase) {
+                let surface = phrase;
+                tokens[i] = mapped.target.clone();
+                tokens.remove(i + 1);
+                push_instrument_slot(
+                    slots,
+                    surface,
+                    mapped.target.clone(),
+                    mapped.source.to_string(),
+                );
+                i += 1;
+                continue;
+            }
+        }
+        if is_protected_token(&tokens[i], ont) {
+            i += 1;
+            continue;
+        }
+        if let Some(mapped) = universe.exact(&tokens[i]) {
+            let surface = tokens[i].clone();
+            if tokens[i] != mapped.target {
+                tokens[i] = mapped.target.clone();
+            }
+            push_instrument_slot(
+                slots,
+                surface,
+                mapped.target.clone(),
+                mapped.source.to_string(),
+            );
+        }
+        i += 1;
+    }
+}
+
+fn is_protected_token(token: &str, ont: &Ontology) -> bool {
+    if matches!(
+        token,
+        "of" | "a" | "an" | "the" | "and" | "then" | "to" | "for" | "me" | "my"
+    ) {
+        return true;
+    }
+    matches!(
+        ont.kind_by_surface.get(token).map(String::as_str),
+        Some("act" | "size" | "unit" | "size_frame" | "product" | "order_type")
+    )
+}
+
+fn should_gate_confusable(tokens: &[String], index: usize) -> bool {
+    let ont = ontology();
+    let surface = tokens.get(index).map(String::as_str).unwrap_or("");
+    if !ont
+        .gates
+        .confusable_pronouns
+        .iter()
+        .any(|row| row == surface)
+    {
+        return false;
+    }
+    if index > 0
+        && ont
+            .gates
+            .control_acts
+            .iter()
+            .any(|row| row == tokens[index - 1].as_str())
+    {
+        return true;
+    }
+    let control = tokens
+        .iter()
+        .any(|t| matches!(t.as_str(), "cancel" | "pause" | "resume"));
+    let watches = tokens.iter().any(|t| {
+        ont.gates
+            .watch_referents
+            .iter()
+            .any(|row| row == t.as_str())
+    });
+    control && watches
+}
+
 struct InstrumentUniverse {
-    by_surface: HashMap<String, String>,
+    by_surface: HashMap<String, MappedSurface>,
     confusable: HashMap<String, String>,
     alias_surfaces: Vec<(String, String)>,
 }
 
 impl InstrumentUniverse {
-    fn new(catalog: &[String]) -> Self {
+    fn new(catalog: &[String], lexicon: &[LexiconEntry], channel: Channel) -> Self {
         let ont = ontology();
-        let mut by_surface = ont.instrument_by_surface.clone();
+        let mut by_surface: HashMap<String, MappedSurface> = HashMap::new();
+        for (surface, target) in &ont.instrument_by_surface {
+            let ch = ont
+                .instrument_channels
+                .get(surface)
+                .cloned()
+                .unwrap_or_else(|| vec!["speech".into(), "text".into()]);
+            if !allows_channel(&ch, channel) {
+                continue;
+            }
+            let source = if surface.eq_ignore_ascii_case(target) {
+                SlotSource::Exact
+            } else {
+                SlotSource::Alias
+            };
+            by_surface.insert(
+                surface.clone(),
+                MappedSurface {
+                    target: target.clone(),
+                    source,
+                },
+            );
+        }
         for symbol in catalog {
             let trimmed = symbol.trim();
             if trimmed.len() < 2 {
@@ -363,22 +884,61 @@ impl InstrumentUniverse {
             }
             by_surface
                 .entry(trimmed.to_ascii_lowercase())
-                .or_insert_with(|| trimmed.to_string());
+                .or_insert_with(|| MappedSurface {
+                    target: trimmed.to_string(),
+                    source: SlotSource::Exact,
+                });
         }
+        for row in lexicon {
+            if row.kind == "confusable" {
+                continue;
+            }
+            let key = normalize_key(&row.surface_form);
+            let target = row.normalized_target.trim();
+            if key.is_empty() || target.is_empty() {
+                continue;
+            }
+            by_surface.insert(
+                key,
+                MappedSurface {
+                    target: target.to_string(),
+                    source: SlotSource::Lexicon,
+                },
+            );
+        }
+        let confusable: HashMap<String, String> = ont
+            .confusable_by_surface
+            .iter()
+            .filter(|(surface, _)| {
+                let ch = ont
+                    .confusable_channels
+                    .get(*surface)
+                    .cloned()
+                    .unwrap_or_else(|| vec!["speech".into()]);
+                allows_channel(&ch, channel)
+            })
+            .map(|(surface, target)| (surface.clone(), target.clone()))
+            .collect();
         let alias_surfaces: Vec<(String, String)> = by_surface
             .iter()
             .filter(|(surface, _)| !surface.contains(' ') && surface.len() >= 3)
-            .map(|(surface, target)| (surface.clone(), target.clone()))
+            .map(|(surface, mapped)| (surface.clone(), mapped.target.clone()))
             .collect();
         Self {
             by_surface,
-            confusable: ont.confusable_by_surface.clone(),
+            confusable,
             alias_surfaces,
         }
     }
 
     fn canonical_instrument(&self, token: &str) -> Option<String> {
-        self.by_surface.get(&token.to_ascii_lowercase()).cloned()
+        self.by_surface
+            .get(&token.to_ascii_lowercase())
+            .map(|row| row.target.clone())
+    }
+
+    fn exact(&self, surface: &str) -> Option<&MappedSurface> {
+        self.by_surface.get(&normalize_key(surface))
     }
 
     fn resolve_slot(&self, surface: &str, fuzzy: bool) -> Option<SlotHit> {
@@ -386,8 +946,12 @@ impl InstrumentUniverse {
         if key.is_empty() {
             return None;
         }
-        if let Some(target) = self.by_surface.get(&key) {
-            return Some(SlotHit::Canonical(target.clone()));
+        if let Some(mapped) = self.by_surface.get(&key) {
+            return Some(SlotHit::Canonical {
+                surface: surface.to_string(),
+                target: mapped.target.clone(),
+                source: mapped.source.to_string(),
+            });
         }
         if !fuzzy {
             return None;
@@ -398,13 +962,14 @@ impl InstrumentUniverse {
                 target: target.clone(),
             });
         }
-        if key.contains(' ') {
+        if key.contains(' ') || key.len() < 3 {
             return None;
         }
-        if key.len() < 3 {
-            return None;
-        }
-        nearest_alias(&key, &self.alias_surfaces).map(SlotHit::Canonical)
+        nearest_alias(&key, &self.alias_surfaces).map(|target| SlotHit::Canonical {
+            surface: surface.to_string(),
+            target,
+            source: SlotSource::Alias.to_string(),
+        })
     }
 }
 
@@ -455,17 +1020,6 @@ fn is_number_token(token: &str) -> bool {
     !token.is_empty() && token.chars().all(|c| c.is_ascii_digit())
 }
 
-fn is_buy_or_sell(token: &str) -> bool {
-    token == "buy" || token == "sell"
-}
-
-fn is_instrument_act(token: &str) -> bool {
-    matches!(
-        token,
-        "buy" | "sell" | "long" | "short" | "lend" | "borrow" | "watch" | "if"
-    )
-}
-
 fn is_size_filler(token: &str, ont: &Ontology) -> bool {
     is_number_token(token)
         || ont.size_words.contains(token)
@@ -475,26 +1029,56 @@ fn is_size_filler(token: &str, ont: &Ontology) -> bool {
         || token == "open"
 }
 
-/// `$550` / `550` → `fifty` only in a buy/sell + (dollars) worth of frame.
-fn repair_size_mishear(tokens: &mut Vec<String>) {
-    if !tokens.iter().any(|t| is_buy_or_sell(t)) {
-        return;
+fn apply_repairs(tokens: &mut Vec<String>, channel: Channel) -> Option<UtteranceSlot> {
+    let ont = ontology();
+    for repair in &ont.repairs {
+        if repair.kind != "size_mishear" {
+            continue;
+        }
+        if !allows_channel(&repair.channels, channel) {
+            continue;
+        }
+        if !repair.require_acts.is_empty()
+            && !tokens
+                .iter()
+                .any(|t| repair.require_acts.iter().any(|a| a == t))
+        {
+            continue;
+        }
+        if !repair.require_span.is_empty() {
+            let span = &repair.require_span;
+            let hit = tokens
+                .windows(span.len())
+                .any(|w| w.iter().zip(span.iter()).all(|(tok, want)| tok == want));
+            if !hit {
+                continue;
+            }
+        }
+        let Some(idx) = tokens.iter().position(|t| t == &repair.surface) else {
+            continue;
+        };
+        if !repair.require_acts.is_empty()
+            && !tokens[..idx]
+                .iter()
+                .any(|t| repair.require_acts.iter().any(|a| a == t))
+        {
+            continue;
+        }
+        tokens[idx] = repair.target.clone();
+        if let Some(insert) = &repair.insert_before_worth {
+            let after = idx + 1;
+            if after < tokens.len() && tokens[after] == "worth" {
+                tokens.insert(after, insert.clone());
+            }
+        }
+        return Some(UtteranceSlot {
+            kind: "size".to_string(),
+            surface: repair.surface.clone(),
+            target: repair.target.clone(),
+            source: "size_rule".to_string(),
+        });
     }
-    let worth_of = tokens.windows(2).any(|w| w[0] == "worth" && w[1] == "of");
-    if !worth_of {
-        return;
-    }
-    let Some(idx) = tokens.iter().position(|t| t == "550") else {
-        return;
-    };
-    if !tokens[..idx].iter().any(|t| is_buy_or_sell(t)) {
-        return;
-    }
-    tokens[idx] = "fifty".to_string();
-    let after = idx + 1;
-    if after < tokens.len() && tokens[after] == "worth" {
-        tokens.insert(after, "dollars".to_string());
-    }
+    None
 }
 
 struct Slot {
@@ -507,42 +1091,52 @@ fn instrument_slots(tokens: &[String]) -> Vec<Slot> {
     let mut slots = Vec::new();
     let mut marked = HashSet::new();
 
-    let frames: &[&[&str]] = &[
-        &["dollars", "worth", "of"],
-        &["bucks", "worth", "of"],
-        &["worth", "of"],
-        &["dollars", "of"],
-        &["bucks", "of"],
-    ];
-    for frame in frames {
+    for frame in ont
+        .frames
+        .iter()
+        .filter(|frame| frame.role == "instrument_slot")
+    {
+        if frame.tokens.is_empty() {
+            continue;
+        }
         let mut i = 0;
-        while i + frame.len() <= tokens.len() {
-            if tokens[i..i + frame.len()] == **frame {
-                let index = i + frame.len();
+        while i + frame.tokens.len() <= tokens.len() {
+            if tokens[i..i + frame.tokens.len()] == frame.tokens[..] {
+                let index = i + frame.tokens.len();
                 if index < tokens.len() && marked.insert(index) {
-                    slots.push(Slot { index, fuzzy: true });
+                    slots.push(Slot {
+                        index,
+                        fuzzy: frame.fuzzy,
+                    });
                 }
-                i += frame.len();
+                i += frame.tokens.len();
             } else {
                 i += 1;
             }
         }
     }
 
-    let mut i = 0;
-    while i < tokens.len() {
-        if is_instrument_act(&tokens[i]) {
-            let fuzzy = is_buy_or_sell(&tokens[i]);
-            let mut j = i + 1;
-            while j < tokens.len() && is_size_filler(&tokens[j], ont) {
-                j += 1;
+    for frame in ont
+        .frames
+        .iter()
+        .filter(|frame| frame.role == "act_instrument")
+    {
+        let mut i = 0;
+        while i < tokens.len() {
+            if frame.acts.iter().any(|act| act == &tokens[i]) {
+                let fuzzy = frame.fuzzy_acts.iter().any(|act| act == &tokens[i]);
+                let mut j = i + 1;
+                while j < tokens.len() && is_size_filler(&tokens[j], ont) {
+                    j += 1;
+                }
+                if j < tokens.len() && tokens[j] != "worth" && tokens[j] != "of" && marked.insert(j)
+                {
+                    slots.push(Slot { index: j, fuzzy });
+                }
+                i = j.max(i + 1);
+            } else {
+                i += 1;
             }
-            if j < tokens.len() && tokens[j] != "worth" && tokens[j] != "of" && marked.insert(j) {
-                slots.push(Slot { index: j, fuzzy });
-            }
-            i = j.max(i + 1);
-        } else {
-            i += 1;
         }
     }
     slots
@@ -552,6 +1146,7 @@ fn resolve_instrument(
     tokens: &[String],
     start: usize,
     fuzzy: bool,
+    _channel: Channel,
     universe: &InstrumentUniverse,
 ) -> Option<(usize, SlotHit)> {
     if start >= tokens.len() {
@@ -566,6 +1161,249 @@ fn resolve_instrument(
     universe
         .resolve_slot(&tokens[start], fuzzy)
         .map(|hit| (1, hit))
+}
+
+fn parse_grammar(
+    raw: &str,
+    tokens: &[String],
+    universe: &InstrumentUniverse,
+) -> (GrammarStatus, Option<ActionIr>) {
+    if raw.trim().is_empty() || tokens.is_empty() {
+        return (GrammarStatus::None, None);
+    }
+    if is_question(raw) || is_lookup_tokens(tokens) {
+        return (GrammarStatus::None, None);
+    }
+    let product = tokens.iter().find(|t| is_product_token(t)).cloned();
+    let ont = ontology();
+
+    for frame in ont.frames.iter().filter(|frame| frame.role == "grammar") {
+        if !frame.referents.is_empty() {
+            if let Some(ir) = match_referent_frame(tokens, frame, product.clone()) {
+                return (GrammarStatus::Matched, Some(ir));
+            }
+            continue;
+        }
+        if frame.level.as_deref() == Some("required") {
+            if let Some(hit) = match_level_frame(tokens, frame, universe, product.clone()) {
+                return hit;
+            }
+            continue;
+        }
+        if let Some(hit) = match_trade_frame(tokens, frame, universe, product.clone()) {
+            return hit;
+        }
+    }
+    (GrammarStatus::None, None)
+}
+
+fn match_referent_frame(
+    tokens: &[String],
+    frame: &OntologyFrame,
+    product: Option<String>,
+) -> Option<ActionIr> {
+    let act_idx = tokens
+        .iter()
+        .position(|t| frame.acts.iter().any(|act| act == t))?;
+    let rest = &tokens[act_idx + 1..];
+    if !rest
+        .iter()
+        .any(|t| frame.referents.iter().any(|row| row == t))
+    {
+        return None;
+    }
+    let referent = rest.iter().find(|t| *t == "these").cloned().or_else(|| {
+        rest.iter()
+            .find(|t| frame.referents.iter().any(|row| row == *t))
+            .cloned()
+    });
+    Some(ActionIr {
+        act: tokens[act_idx].clone(),
+        instrument: None,
+        size: None,
+        product,
+        referent,
+        frame_id: Some(frame.id.clone()),
+        order_type: None,
+    })
+}
+
+fn match_level_frame(
+    tokens: &[String],
+    frame: &OntologyFrame,
+    universe: &InstrumentUniverse,
+    product: Option<String>,
+) -> Option<(GrammarStatus, Option<ActionIr>)> {
+    let act_idx = tokens
+        .iter()
+        .position(|t| frame.acts.iter().any(|act| act == t))?;
+    let act = tokens[act_idx].clone();
+    let instrument = tokens.iter().find_map(|t| universe.canonical_instrument(t));
+    let level = tokens.iter().rev().find(|t| is_number_token(t)).cloned();
+    if instrument.is_none() {
+        return Some((GrammarStatus::None, None));
+    }
+    if level.is_some() {
+        return Some((
+            GrammarStatus::Matched,
+            Some(ActionIr {
+                act,
+                instrument,
+                size: level,
+                product,
+                referent: None,
+                frame_id: Some(frame.id.clone()),
+                order_type: None,
+            }),
+        ));
+    }
+    Some((
+        GrammarStatus::Partial,
+        Some(ActionIr {
+            act,
+            instrument,
+            size: None,
+            product,
+            referent: None,
+            frame_id: Some(frame.id.clone()),
+            order_type: None,
+        }),
+    ))
+}
+
+fn match_trade_frame(
+    tokens: &[String],
+    frame: &OntologyFrame,
+    universe: &InstrumentUniverse,
+    product: Option<String>,
+) -> Option<(GrammarStatus, Option<ActionIr>)> {
+    let (act, _) = find_frame_act(tokens, frame)?;
+    let instrument = tokens.iter().find_map(|t| universe.canonical_instrument(t));
+    let size = find_size_token(tokens);
+    let order_type = find_order_type(tokens);
+    if instrument.is_some() {
+        if frame.size.as_deref() == Some("required") && size.is_none() {
+            return Some((
+                GrammarStatus::Partial,
+                Some(ActionIr {
+                    act,
+                    instrument,
+                    size: None,
+                    product,
+                    referent: None,
+                    frame_id: Some(frame.id.clone()),
+                    order_type,
+                }),
+            ));
+        }
+        return Some((
+            GrammarStatus::Matched,
+            Some(ActionIr {
+                act,
+                instrument,
+                size,
+                product,
+                referent: None,
+                frame_id: Some(frame.id.clone()),
+                order_type,
+            }),
+        ));
+    }
+    Some((
+        GrammarStatus::Partial,
+        Some(ActionIr {
+            act,
+            instrument: None,
+            size,
+            product,
+            referent: None,
+            frame_id: Some(frame.id.clone()),
+            order_type,
+        }),
+    ))
+}
+
+fn find_frame_act(tokens: &[String], frame: &OntologyFrame) -> Option<(String, usize)> {
+    for i in 0..tokens.len() {
+        if frame.open_prefix
+            && tokens[i] == "open"
+            && i + 1 < tokens.len()
+            && frame.acts.iter().any(|act| act == &tokens[i + 1])
+        {
+            return Some((tokens[i + 1].clone(), i));
+        }
+        if frame.acts.iter().any(|act| act == &tokens[i]) {
+            return Some((tokens[i].clone(), i));
+        }
+    }
+    None
+}
+
+fn find_size_token(tokens: &[String]) -> Option<String> {
+    let ont = ontology();
+    tokens
+        .iter()
+        .find(|t| ont.size_words.contains(*t) || is_number_token(t))
+        .cloned()
+}
+
+fn find_order_type(tokens: &[String]) -> Option<String> {
+    let ont = ontology();
+    let max = tokens.len().min(4);
+    for width in (1..=max).rev() {
+        for window in tokens.windows(width) {
+            let key = window.join(" ");
+            if ont.kind_by_surface.get(&key).map(String::as_str) != Some("order_type") {
+                continue;
+            }
+            if let Some(entry) = ont
+                .entries
+                .iter()
+                .find(|row| row.kind == "order_type" && normalize_key(&row.surface_form) == key)
+            {
+                return Some(normalize_key(&entry.normalized_target));
+            }
+        }
+    }
+    None
+}
+
+fn is_product_token(token: &str) -> bool {
+    ontology().kind_by_surface.get(token).map(String::as_str) == Some("product")
+}
+
+fn is_question(raw: &str) -> bool {
+    let t = raw.trim().to_ascii_lowercase();
+    if t.ends_with('?') {
+        return true;
+    }
+    let first = t
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .find(|part| !part.is_empty())
+        .unwrap_or("");
+    matches!(first, "what" | "why" | "how" | "who" | "when" | "where")
+        || t.starts_with("walk me")
+        || t.starts_with("tell me")
+}
+
+fn is_lookup_tokens(tokens: &[String]) -> bool {
+    if tokens.len() != 1 {
+        return false;
+    }
+    matches!(
+        tokens[0].as_str(),
+        "b" | "p"
+            | "r"
+            | "a"
+            | "d"
+            | "balance"
+            | "positions"
+            | "risk"
+            | "available"
+            | "dollarpower"
+            | "commands"
+            | "shortcuts"
+    )
 }
 
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -602,10 +1440,16 @@ mod tests {
         repair(raw).text
     }
 
+    fn norm(raw: &str, channel: Channel) -> NormalizedUtterance {
+        normalize_utterance(raw, channel, &[], &[])
+    }
+
     #[test]
-    fn ontology_version_is_one() {
-        assert_eq!(ONTOLOGY_VERSION, 1);
+    fn ontology_version_is_two() {
+        assert_eq!(ONTOLOGY_VERSION, 2);
         assert!(!boostable_keyterms().is_empty());
+        assert!(!ontology().frames.is_empty());
+        assert!(!ontology().repairs.is_empty());
     }
 
     #[test]
@@ -640,6 +1484,12 @@ mod tests {
         assert_eq!(text("cancel these watches"), "cancel these watches");
         let out = repair("cancel these watches");
         assert!(out.hits.is_empty());
+        assert!(
+            out.proposed_confusables.is_empty(),
+            "slot-gate: these must not propose ETH"
+        );
+        let watch = repair("watch these");
+        assert!(watch.proposed_confusables.is_empty());
     }
 
     #[test]
@@ -669,6 +1519,8 @@ mod tests {
         assert!(lower.iter().any(|t| t == "eth"));
         assert!(lower.iter().any(|t| t == "buy"));
         assert!(lower.iter().any(|t| t == "worth"));
+        assert!(lower.iter().any(|t| t == "twap"));
+        assert!(lower.iter().any(|t| t == "dca"));
         assert!(!lower.iter().any(|t| t == "beef" || t == "these"));
         assert!(terms.len() <= EXTRA_KEYTERM_BUDGET);
     }
@@ -707,10 +1559,137 @@ mod tests {
     }
 
     #[test]
+    fn confusable_entries_are_speech_channel() {
+        let ont = ontology();
+        for entry in &ont.entries {
+            if entry.kind == "confusable" {
+                assert_eq!(entry.channels, vec!["speech".to_string()]);
+            } else {
+                assert!(entry.channels.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn intensifier_ranks_instruments_above_acts() {
         assert_eq!(intensifier_for("ETH"), 5);
         assert_eq!(intensifier_for("buy"), 3);
         assert_eq!(intensifier_for("worth"), 3);
         assert_eq!(intensifier_for("the loop"), 2);
+    }
+
+    #[test]
+    fn text_channel_does_not_propose_speech_confusables() {
+        let out = norm("buy fifty dollars worth of beef", Channel::Text);
+        assert_eq!(out.normalized_text, "buy fifty dollars worth of beef");
+        assert!(out.proposals.is_empty());
+        assert_eq!(out.channel, Channel::Text);
+    }
+
+    #[test]
+    fn text_ether_rewrites_to_eth() {
+        let out = norm("buy fifty dollars worth of ether", Channel::Text);
+        assert_eq!(out.normalized_text, "buy fifty dollars worth of ETH");
+        assert!(out.proposals.is_empty());
+        assert!(
+            out.slots
+                .iter()
+                .any(|s| s.kind == "instrument" && s.target == "ETH" && s.source == "alias")
+        );
+    }
+
+    #[test]
+    fn text_channel_skips_speech_size_mishear() {
+        let out = norm("buy 550 dollars worth of ETH", Channel::Text);
+        assert_eq!(out.normalized_text, "buy 550 dollars worth of ETH");
+        assert!(!out.slots.iter().any(|s| s.source == "size_rule"));
+        assert_eq!(out.grammar, GrammarStatus::Matched);
+        assert_eq!(out.action_ir.unwrap().size.as_deref(), Some("550"));
+    }
+
+    #[test]
+    fn lexicon_rewrite_on_both_channels() {
+        let lex = [LexiconEntry {
+            surface_form: "the loop".to_string(),
+            normalized_target: "WETH".to_string(),
+            kind: "instrument".to_string(),
+        }];
+        let out = normalize_utterance(
+            "buy fifty dollars worth of the loop",
+            Channel::Text,
+            &[],
+            &lex,
+        );
+        assert_eq!(out.normalized_text, "buy fifty dollars worth of WETH");
+        assert!(
+            out.slots
+                .iter()
+                .any(|s| s.source == "lexicon" && s.target == "WETH")
+        );
+    }
+
+    #[test]
+    fn grammar_matched_partial_none() {
+        let matched = norm("buy fifty dollars worth of ETH", Channel::Speech);
+        assert_eq!(matched.grammar, GrammarStatus::Matched);
+        let ir = matched.action_ir.expect("matched IR");
+        assert_eq!(ir.act, "buy");
+        assert_eq!(ir.instrument.as_deref(), Some("ETH"));
+        assert_eq!(ir.size.as_deref(), Some("fifty"));
+        assert_eq!(ir.frame_id.as_deref(), Some("buy_sell"));
+
+        let twap = norm("buy fifty ETH twap", Channel::Text);
+        assert_eq!(twap.action_ir.unwrap().order_type.as_deref(), Some("twap"));
+        let over_time = norm("buy fifty ETH over time", Channel::Text);
+        assert_eq!(
+            over_time.action_ir.unwrap().order_type.as_deref(),
+            Some("twap")
+        );
+        let dca = norm("dca buy fifty ETH", Channel::Text);
+        assert_eq!(dca.action_ir.unwrap().order_type.as_deref(), Some("dca"));
+        let dca_phrase = norm("dollar cost average buy fifty ETH", Channel::Text);
+        assert_eq!(
+            dca_phrase.action_ir.unwrap().order_type.as_deref(),
+            Some("dca")
+        );
+
+        let partial = norm("buy fifty", Channel::Text);
+        assert_eq!(partial.grammar, GrammarStatus::Partial);
+        assert!(partial.action_ir.unwrap().instrument.is_none());
+
+        let none = norm("what is ETH doing", Channel::Text);
+        assert_eq!(none.grammar, GrammarStatus::None);
+        assert!(none.action_ir.is_none());
+
+        let lookup = norm("positions", Channel::Text);
+        assert_eq!(lookup.grammar, GrammarStatus::None);
+
+        let cancel = norm("cancel these watches", Channel::Speech);
+        assert_eq!(cancel.grammar, GrammarStatus::Matched);
+        assert_eq!(cancel.action_ir.unwrap().referent.as_deref(), Some("these"));
+        assert!(cancel.proposals.is_empty());
+
+        let close = norm("close ETH", Channel::Text);
+        assert_eq!(close.grammar, GrammarStatus::Matched);
+        assert_eq!(close.action_ir.unwrap().act, "close");
+    }
+
+    #[test]
+    fn size_rule_slot_uses_size_rule_source() {
+        let out = norm("buy $550 worth of ETH", Channel::Speech);
+        assert_eq!(out.normalized_text, "buy fifty dollars worth of ETH");
+        assert!(
+            out.slots
+                .iter()
+                .any(|s| s.kind == "size" && s.source == "size_rule" && s.target == "fifty")
+        );
+    }
+
+    #[test]
+    fn json_channels_gate_confusables_not_hardcoded_speech_enum() {
+        let speech = norm("buy fifty dollars worth of beef", Channel::Speech);
+        assert_eq!(speech.proposals.len(), 1);
+        let text = norm("buy fifty dollars worth of beef", Channel::Text);
+        assert!(text.proposals.is_empty());
     }
 }

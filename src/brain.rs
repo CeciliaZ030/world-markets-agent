@@ -129,6 +129,7 @@ impl BrainClient {
         self.post("/v1/trades/stage", body)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn begin_execute(
         &self,
         account_id: u64,
@@ -138,6 +139,39 @@ impl BrainClient {
             "/v1/trades/begin",
             &json!({ "account_id": account_id, "instruction_id": instruction_id }),
         )
+    }
+
+    pub(crate) fn claim_slice(
+        &self,
+        account_id: u64,
+        instruction_id: &str,
+    ) -> Result<Value, String> {
+        self.post(
+            "/v1/trades/claim",
+            &json!({ "account_id": account_id, "instruction_id": instruction_id }),
+        )
+    }
+
+    pub(crate) fn record_slice(
+        &self,
+        account_id: u64,
+        instruction_id: &str,
+        body: &Value,
+    ) -> Result<Value, String> {
+        let mut payload = body.clone();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("account_id".to_string(), json!(account_id));
+            obj.insert("instruction_id".to_string(), json!(instruction_id));
+        }
+        self.post("/v1/trades/progress", &payload)
+    }
+
+    pub(crate) fn due_trades(&self, account_id: Option<u64>) -> Result<Value, String> {
+        let path = match account_id {
+            Some(id) => format!("/v1/trades/due?account_id={id}"),
+            None => "/v1/trades/due".to_string(),
+        };
+        self.get(&path)
     }
 
     pub(crate) fn complete_execute(
@@ -216,8 +250,49 @@ impl BrainClient {
             .unwrap_or_default())
     }
 
+    pub(crate) fn voice_context(&self, account_id: u64) -> Result<Value, String> {
+        self.get(&format!("/v1/voice/context?account_id={account_id}"))
+    }
+
     pub(crate) fn ingest_utterance(&self, body: &Value) -> Result<Value, String> {
         self.post("/v1/voice/utterance", body)
+    }
+
+    pub(crate) fn ontology_summary(&self) -> Result<Value, String> {
+        self.get("/v1/ontology/summary")
+    }
+
+    pub(crate) fn ontology_stats(
+        &self,
+        account_id: Option<u64>,
+        from: Option<&str>,
+        to: Option<&str>,
+        all: bool,
+    ) -> Result<Value, String> {
+        let mut path = "/v1/ontology/stats?".to_string();
+        let mut first = true;
+        let mut push = |key: &str, value: &str| {
+            if !first {
+                path.push('&');
+            }
+            first = false;
+            path.push_str(key);
+            path.push('=');
+            path.push_str(value);
+        };
+        if let Some(id) = account_id {
+            push("account_id", &id.to_string());
+        }
+        if let Some(from) = from.filter(|s| !s.is_empty()) {
+            push("from", from);
+        }
+        if let Some(to) = to.filter(|s| !s.is_empty()) {
+            push("to", to);
+        }
+        if all {
+            push("all", "1");
+        }
+        self.get(&path)
     }
 
     pub(crate) fn record_correction(&self, body: &Value) -> Result<Value, String> {

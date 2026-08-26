@@ -8,17 +8,13 @@ use base64::Engine;
 use serde_json::{Value, json};
 
 use crate::brain::BrainClient;
-use crate::speech_ontology::{self, Repair};
+use crate::speech_ontology::{self, Channel, LexiconEntry};
 use crate::stt::{self, SttErrorKind, Transcript};
 
 const CATALOG_TTL: Duration = Duration::from_secs(60);
 
 pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
     let brain = BrainClient::with_timeout(90);
-    let extra = seed_keyterms(account_id);
-    let keyterms = brain
-        .voice_keyterms(account_id, &extra)
-        .unwrap_or_else(|_| extra.clone());
     let typed = body
         .get("text")
         .and_then(Value::as_str)
@@ -29,15 +25,24 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let channel = if typed.is_some() {
+        Channel::Text
+    } else {
+        Channel::Speech
+    };
     let mut transcript = if let Some(text) = typed {
         Transcript {
             text: text.to_string(),
             words: Vec::new(),
             lang: "en".to_string(),
-            stt_version: "typed".to_string(),
+            stt_version: String::new(),
             keyterm_applied: false,
         }
     } else {
+        let extra = seed_keyterms(account_id);
+        let keyterms = brain
+            .voice_keyterms(account_id, &extra)
+            .unwrap_or_else(|_| extra.clone());
         let audio = decode_audio(body)?;
         let mime = body
             .get("mime")
@@ -52,35 +57,27 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
     }
 
     let catalog = cached_catalog_symbols();
-    let repair = if typed.is_some() {
-        Repair {
-            text: transcript.text.clone(),
-            hits: Vec::new(),
-            repaired_from: None,
-            proposed_confusables: Vec::new(),
-        }
+    let lexicon = lexicon_for(account_id, &brain);
+    let mut normalized =
+        speech_ontology::normalize_utterance(&transcript.text, channel, &catalog, &lexicon);
+    if typed.is_some() {
+        normalized.stt_version = None;
+        normalized.keyterm_applied = false;
     } else {
-        speech_ontology::repair_transcript(&transcript.text, &catalog)
-    };
-    let raw_text = transcript.text.clone();
-    transcript.text = repair.text.clone();
-    let proposed_confusables: Vec<Value> = repair
-        .proposed_confusables
+        normalized.stt_version = Some(transcript.stt_version.clone());
+        normalized.keyterm_applied = transcript.keyterm_applied;
+    }
+    let proposed_confusables: Vec<Value> = normalized
+        .proposals
         .iter()
         .map(|row| row.to_json())
         .collect();
-    let lexicon_hits: Vec<Value> = repair.hits.iter().map(|hit| hit.to_json()).collect();
-    let repaired_from = repair
-        .repaired_from
-        .as_deref()
-        .filter(|value| *value != transcript.text.as_str())
-        .or_else(|| {
-            if raw_text != transcript.text {
-                Some(raw_text.as_str())
-            } else {
-                None
-            }
-        });
+    let lexicon_hits: Vec<Value> = normalized
+        .lexicon_hits
+        .iter()
+        .map(|hit| hit.to_json())
+        .collect();
+    let slots: Vec<Value> = normalized.slots.iter().map(|row| row.to_json()).collect();
 
     let duration_secs = body
         .get("duration_secs")
@@ -107,20 +104,28 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
     let recorded = brain
         .ingest_utterance(&json!({
             "account_id": account_id,
-            "transcript": transcript.text,
-            "repaired_from": repaired_from,
+            "transcript": normalized.normalized_text,
+            "text": normalized.normalized_text,
+            "repaired_from": normalized.repaired_from,
             "words": words,
             "lang": transcript.lang,
-            "stt_version": transcript.stt_version,
-            "keyterm_applied": transcript.keyterm_applied,
+            "stt_version": normalized.stt_version,
+            "keyterm_applied": normalized.keyterm_applied,
             "duration_secs": duration_secs,
             "audio_base64": body.get("audio_base64"),
             "source": body.get("source").and_then(Value::as_str).unwrap_or("mini_app"),
             "foreign": false,
-            "lexicon_hits": lexicon_hits,
+            "channel": normalized.channel.as_str(),
+            "ontology_version": normalized.ontology_version,
+            "slots": slots,
+            "proposals": proposed_confusables,
             "proposed_confusables": proposed_confusables,
+            "grammar": normalized.grammar.as_str(),
+            "action_ir": normalized.action_ir.as_ref().map(|ir| ir.to_json()),
+            "lexicon_hits": lexicon_hits,
+            "unknown_instruments": normalized.unknown_instruments,
         }))
-        .unwrap_or_else(|_| json!({ "heard_echo": transcript.text }));
+        .unwrap_or_else(|_| json!({ "heard_echo": normalized.normalized_text }));
 
     let utterance_id = recorded
         .pointer("/utterance/id")
@@ -145,21 +150,30 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
 
     let send_payload = json!({
         "kind": "voice",
-        "message": transcript.text,
+        "message": normalized.normalized_text,
         "utterance_id": utterance_id,
         "correlation_id": correlation_id,
         "episode_id": episode_id,
+        "grammar": normalized.grammar.as_str(),
+        "action_ir": normalized.action_ir.as_ref().map(|ir| ir.to_json()),
+        "slots": slots,
+        "channel": normalized.channel.as_str(),
     });
 
     Ok(json!({
         "ok": true,
-        "transcript": transcript.text,
-        "heard_echo": recorded.get("heard_echo").and_then(Value::as_str).unwrap_or(&transcript.text),
+        "transcript": normalized.normalized_text,
+        "heard_echo": recorded.get("heard_echo").and_then(Value::as_str).unwrap_or(&normalized.normalized_text),
         "utterance_id": utterance_id,
         "episode_id": episode_id,
         "correlation_id": correlation_id,
-        "stt_version": transcript.stt_version,
-        "keyterm_applied": transcript.keyterm_applied,
+        "stt_version": normalized.stt_version,
+        "keyterm_applied": normalized.keyterm_applied,
+        "channel": normalized.channel.as_str(),
+        "grammar": normalized.grammar.as_str(),
+        "action_ir": normalized.action_ir.as_ref().map(|ir| ir.to_json()),
+        "slots": slots,
+        "proposals": proposed_confusables,
         "long_note": recorded.get("long_note"),
         "long_note_line": recorded.get("long_note_line"),
         "split_parse": recorded.get("split_parse"),
@@ -226,6 +240,15 @@ fn is_placeholder_transcript(text: &str) -> bool {
 
 fn seed_keyterms(account_id: u64) -> Vec<String> {
     speech_ontology::seed_keyterms(&cached_catalog_symbols(), &holdings(account_id))
+}
+
+fn lexicon_for(account_id: u64, brain: &BrainClient) -> Vec<LexiconEntry> {
+    brain
+        .voice_context(account_id)
+        .ok()
+        .and_then(|value| value.get("lexicon").and_then(Value::as_array).cloned())
+        .map(|rows| rows.iter().filter_map(LexiconEntry::from_json).collect())
+        .unwrap_or_default()
 }
 
 fn holdings(account_id: u64) -> Vec<String> {
@@ -320,5 +343,13 @@ mod tests {
         assert!(repair.hits.is_empty());
         assert_eq!(repair.proposed_confusables.len(), 1);
         assert_eq!(repair.proposed_confusables[0].target, "ETH");
+        let typed = speech_ontology::normalize_utterance(
+            "buy fifty dollars worth of beef",
+            speech_ontology::Channel::Text,
+            &[],
+            &[],
+        );
+        assert!(typed.proposals.is_empty());
+        assert_eq!(typed.channel, speech_ontology::Channel::Text);
     }
 }

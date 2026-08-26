@@ -97,6 +97,7 @@ async fn main() {
         desk_token: std::env::var("DESK_BRIDGE_TOKEN").unwrap_or_default(),
     };
 
+    let flush_account = state.account_id;
     let app = Router::new()
         .route("/api/v1/mini-app/auth", post(auth_handler))
         .route("/api/v1/mini-app/portfolio", get(portfolio_handler))
@@ -111,8 +112,13 @@ async fn main() {
         .route("/api/v1/mini-app/compose", post(compose_handler))
         .route("/api/v1/mini-app/voice", post(voice_handler))
         .route("/api/v1/mini-app/share", post(share_handler))
+        .route(
+            "/api/v1/mini-app/speech-ontology",
+            get(speech_ontology_handler),
+        )
         .route("/api/v1/desk/context", get(desk_context_handler))
         .route("/api/v1/mini-app/health", get(health_handler))
+        .route("/dev/ontology", get(dev_ontology_handler))
         .fallback(static_handler)
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -120,6 +126,17 @@ async fn main() {
     let bind = std::env::var("MINI_APP_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     let addr: SocketAddr = bind.parse().expect("MINI_APP_BIND must be host:port");
     tracing::info!("mini app listening on {addr}");
+    if let Some(account_id) = flush_account {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                ticker.tick().await;
+                let _ =
+                    spawn_blocking(move || world_markets::mini_app::flush_due_trades(account_id))
+                        .await;
+            }
+        });
+    }
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("bind mini-app port");
@@ -135,6 +152,76 @@ async fn shutdown_signal() {
 
 async fn health_handler() -> Json<Value> {
     Json(json!({ "ok": true }))
+}
+
+const SPEECH_ONTOLOGY_JSON: &str = include_str!("../../assets/speech_ontology.json");
+
+async fn speech_ontology_handler() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+        .body(axum::body::Body::from(SPEECH_ONTOLOGY_JSON))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+const DEV_ONTOLOGY_HTML: &str = include_str!("dev_ontology.html");
+
+#[derive(Debug, Deserialize)]
+struct DevOntologyQuery {
+    #[serde(default)]
+    preview: Option<String>,
+}
+
+fn localhost_host(headers: &HeaderMap) -> bool {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let host = host.split(':').next().unwrap_or(host);
+    host == "127.0.0.1" || host == "localhost" || host == "::1"
+}
+
+async fn dev_ontology_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DevOntologyQuery>,
+) -> Response {
+    if !state.dev_bypass || !localhost_host(&headers) || query.preview.as_deref() != Some("dev") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let account_id = state.account_id;
+    match spawn_blocking(move || {
+        let summary = world_markets::mini_app::ontology_summary();
+        let stats = world_markets::mini_app::ontology_stats(account_id, None, None, false);
+        json!({
+            "summary": summary.unwrap_or_else(|err| json!({ "ok": false, "error": err })),
+            "stats": stats.unwrap_or_else(|err| json!({ "ok": false, "error": err })),
+            "account_id": account_id,
+        })
+    })
+    .await
+    {
+        Ok(payload) => {
+            let mut data = payload;
+            let error = data
+                .pointer("/summary/error")
+                .and_then(Value::as_str)
+                .or_else(|| data.pointer("/stats/error").and_then(Value::as_str))
+                .map(str::to_string);
+            if let Some(err) = error {
+                if let Some(obj) = data.as_object_mut() {
+                    obj.insert("error".into(), json!(err));
+                }
+            }
+            let html = DEV_ONTOLOGY_HTML.replace("__ONTOLOGY_PAYLOAD__", &data.to_string());
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(axum::body::Body::from(html))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 async fn auth_handler(State(state): State<AppState>, Json(body): Json<AuthRequest>) -> Response {
@@ -362,7 +449,7 @@ async fn compose_handler(
     let chat_id = session_telegram_user(&state, &headers);
     let bot_token = state.bot_token.clone();
     let kind = body.kind.clone().unwrap_or_default();
-    let payload = json!({
+    let mut payload = json!({
         "account_id": account_id,
         "correlation_id": body.correlation_id,
         "kind": body.kind,
@@ -380,25 +467,58 @@ async fn compose_handler(
                 .ok_or_else(|| "instruction_id required".to_string())?;
             return world_markets::mini_app::flush_staged_trade(account_id, instruction_id);
         }
-        let message = payload
+        let mut message = payload
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        if matches!(kind.as_str(), "text" | "imperative" | "conditional") && !message.is_empty() {
+            if let Ok(ingested) = world_markets::mini_app::ingest_voice_note(
+                account_id,
+                &json!({ "text": message, "source": "mini_app" }),
+            ) {
+                if let Some(text) = ingested.get("transcript").and_then(Value::as_str) {
+                    message = text.to_string();
+                }
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("message".into(), json!(message.clone()));
+                    if let Some(id) = ingested.get("utterance_id") {
+                        obj.insert("utterance_ref".into(), id.clone());
+                    }
+                    if let Some(slots) = ingested.get("slots") {
+                        obj.insert("slots".into(), slots.clone());
+                    }
+                    if let Some(proposals) = ingested
+                        .get("proposals")
+                        .or_else(|| ingested.get("proposed_confusables"))
+                    {
+                        obj.insert("proposals".into(), proposals.clone());
+                    }
+                    obj.insert("channel".into(), json!("text"));
+                    if let Some(ir) = ingested.get("action_ir") {
+                        obj.insert("action_ir".into(), ir.clone());
+                    }
+                    if let Some(grammar) = ingested.get("grammar") {
+                        obj.insert("grammar".into(), grammar.clone());
+                    }
+                }
+            }
+        }
         if !matches!(
             kind.as_str(),
-            "question" | "pause" | "resume" | "cancel" | "flush_execute"
+            "question" | "pause" | "resume" | "cancel" | "flush_execute" | "archive"
         ) && !message.is_empty()
         {
             if let Some(handled) =
                 world_markets::mini_app::submit_heard(account_id, &message, Some(&payload))
             {
                 let skip = handled.get("skip_llm") == Some(&json!(true));
+                let heard_kind = handled.get("kind").and_then(Value::as_str).unwrap_or("");
                 let remaining = handled
                     .get("remaining_text")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                if skip || handled.get("kind").and_then(Value::as_str) == Some("cant") {
+                if skip || heard_kind == "cant" {
                     if let Some(chat_id) = chat_id {
                         if let Some(reply) = handled.get("message").and_then(Value::as_str) {
                             let _ = world_markets::mini_app::post_chat_lines(
@@ -408,7 +528,8 @@ async fn compose_handler(
                             );
                         }
                     }
-                    if !remaining.is_empty() && chat_id.is_none() {
+                    // Remainder after a wall only — near-match waits for a chip.
+                    if heard_kind == "cant" && !remaining.is_empty() && chat_id.is_none() {
                         let _ = dispatch_local_agent_turn(remaining);
                     }
                     return Ok(handled);
@@ -427,6 +548,20 @@ async fn compose_handler(
             }
         }
         let value = world_markets::mini_app::submit_compose(&payload)?;
+        if chat_id.is_none()
+            && value.get("recorded") == Some(&json!(true))
+            && !matches!(
+                kind.as_str(),
+                "cancel" | "archive" | "flush_execute" | "question"
+            )
+        {
+            let sentence = value
+                .pointer("/instruction/sentence")
+                .or_else(|| payload.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let _ = dispatch_local_agent_turn(&prompt_with_ir(sentence, payload.get("action_ir")));
+        }
         if kind == "cancel" {
             let command = value
                 .pointer("/thread/command")
@@ -574,11 +709,17 @@ async fn voice_handler(
                 "utterance_ref": utterance_id,
                 "peek": chat_id.is_some(),
                 "proposed_confusables": value.get("proposed_confusables"),
+                "proposals": value.get("proposals").or_else(|| value.get("proposed_confusables")),
+                "slots": value.get("slots"),
+                "channel": value.get("channel").cloned().unwrap_or(json!("speech")),
             });
             let handled = world_markets::mini_app::submit_heard(account_id, &heard, Some(&extra));
             if let Some(handled) = handled {
                 if let Some(obj) = value.as_object_mut() {
-                    obj.insert("voice_kind".into(), handled.get("kind").cloned().unwrap_or(json!("")));
+                    obj.insert(
+                        "voice_kind".into(),
+                        handled.get("kind").cloned().unwrap_or(json!("")),
+                    );
                     obj.insert("heard_handled".into(), handled.clone());
                     if handled.get("skip_llm") == Some(&json!(true)) {
                         obj.insert("skip_send_data".into(), json!(chat_id.is_none()));
@@ -591,10 +732,10 @@ async fn voice_handler(
                     .unwrap_or("")
                     .to_string();
                 if chat_id.is_none() {
-                    if !remaining.is_empty() {
-                        let _ = dispatch_local_agent_turn(&remaining);
-                    }
                     if kind == "cant" || kind == "unclear" || kind == "near_match" {
+                        if kind == "cant" && !remaining.is_empty() {
+                            let _ = dispatch_local_agent_turn(&remaining);
+                        }
                         if let Some(msg) = handled.get("message").and_then(Value::as_str) {
                             if let Some(obj) = value.as_object_mut() {
                                 obj.insert("thread_message".into(), json!(msg));
@@ -639,7 +780,7 @@ async fn voice_handler(
                     tracing::warn!(error = %err, "voice heard-echo failed");
                 }
                 Ok(value)
-            } else if dispatch_local_agent_turn(&heard) {
+            } else if dispatch_local_agent_turn(&prompt_with_ir(&heard, value.get("action_ir"))) {
                 if let Some(obj) = value.as_object_mut() {
                     obj.insert("dispatched".to_string(), json!(true));
                 }
@@ -696,6 +837,14 @@ async fn voice_handler(
             tracing::error!(error = %err, "voice note join failed");
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
         }
+    }
+}
+
+fn prompt_with_ir(text: &str, ir: Option<&Value>) -> String {
+    let text = text.trim();
+    match ir.filter(|value| value.is_object()) {
+        Some(ir) => format!("{text}\n[world_ir] {ir}"),
+        None => text.to_string(),
     }
 }
 
@@ -966,6 +1115,14 @@ mod tests {
     }
 
     #[test]
+    fn speech_ontology_is_get() {
+        let src = include_str!("main.rs");
+        assert!(src.contains(r#"/api/v1/mini-app/speech-ontology"#));
+        assert!(src.contains("get(speech_ontology_handler)"));
+        assert!(src.contains("assets/speech_ontology.json"));
+    }
+
+    #[test]
     fn voice_is_not_a_ledger_route() {
         let src = include_str!("main.rs");
         assert!(src.contains(r#".route("/api/v1/mini-app/voice", post(voice_handler))"#));
@@ -976,6 +1133,17 @@ mod tests {
             "voice handler must not call The Desk"
         );
         assert!(src.contains(r#".route("/api/v1/desk/context", get(desk_context_handler))"#));
+    }
+
+    #[test]
+    fn dev_ontology_is_get_before_static_fallback() {
+        let src = include_str!("main.rs");
+        let route = src.find(r#".route("/dev/ontology", get(dev_ontology_handler))"#);
+        let fallback = src.find(".fallback(static_handler)");
+        assert!(route.is_some() && fallback.is_some());
+        assert!(route.unwrap() < fallback.unwrap());
+        assert!(src.contains("MINI_APP_DEV_BYPASS") || src.contains("dev_bypass"));
+        assert!(src.contains("preview"));
     }
 
     #[test]
@@ -1015,5 +1183,27 @@ mod tests {
         assert!(src.contains("aomi-run"));
         assert!(src.contains("--prompt"));
         assert!(src.contains("live_text"));
+    }
+
+    #[test]
+    fn local_typed_compose_dispatches_aomi_run_after_ledger_write() {
+        let src = include_str!("main.rs");
+        let compose = src
+            .split("async fn compose_handler")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn share_handler").next())
+            .expect("compose_handler body");
+        assert!(
+            compose.contains("submit_compose"),
+            "typed compose must write the ledger"
+        );
+        assert!(
+            compose.contains("dispatch_local_agent_turn"),
+            "local typed compose must start an agent turn after the ledger write"
+        );
+        assert!(
+            compose.contains("instruction/sentence"),
+            "dispatch the recorded sentence, not a second store"
+        );
     }
 }

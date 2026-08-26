@@ -12,13 +12,19 @@ import {
   confirmInstruction,
   getInstruction,
   listInstructions,
+  listDueTrades,
+  openInstructions,
   pauseInstruction,
   resumeInstruction,
   stageTrade,
   beginExecute,
+  claimSlice,
+  recordSlice,
   completeExecute,
   summary,
   transition,
+  upsertCant,
+  archiveInstruction,
 } from "../src/instructions.js";
 import { cancelTask } from "../src/watches.js";
 
@@ -177,4 +183,211 @@ test("after the delay begin then complete fills the staged trade", () => {
   assert.equal(done.instruction.sentence, sentence);
   assert.equal(done.instruction.progress_pct, 100);
   assert.equal(done.instruction.avg_price, "12");
+});
+
+test("cant is terminal, visible, and omitted from holding", () => {
+  const account = "24-cant";
+  const recorded = upsertCant(account, {
+    asked_entity: "beef",
+    heard: "buy fifty of beef",
+    sentence: "Buy fifty of beef.",
+    cant_kind: "no_market",
+  });
+  assert.equal(recorded.ok, true);
+  assert.equal(recorded.instruction.status, "cant");
+  assert.equal(recorded.instruction.display_status, "can't");
+  const got = summary(account);
+  assert.equal(got.holding, 0);
+  assert.equal(got.needs_you, 0);
+  assert.equal(listInstructions(account).filter((row) => row.status === "cant").length, 1);
+  assert.throws(() => {
+    transition({ status: "cant" }, "watching", 1);
+  });
+});
+
+test("archive hides done and cant from the ledger", () => {
+  const account = "25-archive";
+  const cant = upsertCant(account, {
+    asked_entity: "soy",
+    heard: "buy soy",
+    sentence: "Buy soy.",
+    cant_kind: "no_market",
+  });
+  const id = cant.instruction.instruction_id;
+  assert.equal(listInstructions(account).some((row) => row.instruction_id === id), true);
+  const watching = composeDraft(account, {
+    kind: "watch",
+    message: "If ETH drops, tell me",
+    correlation_id: "c-arch",
+  });
+  assert.equal(archiveInstruction(account, watching.instruction.instruction_id).ok, false);
+  const archived = archiveInstruction(account, id);
+  assert.equal(archived.ok, true);
+  assert.equal(listInstructions(account).some((row) => row.instruction_id === id), false);
+  const again = archiveInstruction(account, id);
+  assert.equal(again.ok, true);
+  assert.equal(again.already, true);
+});
+
+test("openInstructions is compact drafts and pending pause, not watching", () => {
+  const account = "26-open";
+  assert.deepEqual(openInstructions(account), []);
+  const drafted = composeDraft(account, {
+    kind: "conditional",
+    message: "If ETH touches 3400, close half the perp",
+    correlation_id: "c-open",
+    instrument: "ETH",
+  });
+  const id = drafted.instruction.instruction_id;
+  const open = openInstructions(account);
+  assert.equal(open.length, 1);
+  assert.equal(open[0].instruction_id, id);
+  assert.equal(open[0].status, "with_aomi");
+  assert.equal(open[0].sentence, "If ETH touches 3400, close half the perp");
+  assert.equal(open[0].correlation_id, "c-open");
+  assert.equal("trail" in open[0], false);
+  confirmInstruction(account, {
+    instruction_id: id,
+    watch_id: "w-open",
+    confirm_ref: "w-open",
+  });
+  assert.deepEqual(openInstructions(account), []);
+  composeDraft(account, {
+    kind: "pause",
+    instruction_id: id,
+    message: "pause it",
+    correlation_id: "c-pause",
+  });
+  const paused = openInstructions(account);
+  assert.equal(paused.length, 1);
+  assert.equal(paused[0].instruction_id, id);
+  assert.equal(paused[0].pending, "pause");
+});
+
+test("TWAP stage keeps slice_n and recordSlice stays executing until the last fill", () => {
+  const account = "27-twap";
+  const t0 = 1_700_000_200;
+  const staged = stageTrade(
+    account,
+    {
+      sentence: "Buy 1000 ETH",
+      instrument: "ETH",
+      params: {
+        order_type: "twap",
+        quantity: "1000",
+        schedule: { slices: 3, interval_secs: 60, quantity_per_slice: "333.333333", filled_quantity: "0" },
+      },
+    },
+    t0,
+  );
+  assert.equal(staged.instruction.slice_n, 3);
+  assert.equal(staged.instruction.order_type, "twap");
+  const id = staged.instruction.instruction_id;
+  const claimed = claimSlice(account, id, t0 + 3);
+  assert.equal(claimed.ok, true);
+  assert.equal(claimed.first, true);
+  assert.equal(claimed.slice_i, 1);
+  assert.equal(claimed.last, false);
+  const mid = recordSlice(
+    account,
+    id,
+    {
+      slice_i: 1,
+      avg_price: "2400",
+      filled_quantity: "333.333333",
+      fill: { hash: "0x1", quantity: "333.333333", price: "2400" },
+      receipt: "slice 1 of 3",
+    },
+    t0 + 4,
+  );
+  assert.equal(mid.ok, true);
+  assert.equal(mid.more, true);
+  assert.equal(mid.instruction.status, "executing");
+  assert.equal(mid.instruction.slice_i, 1);
+  assert.equal(mid.instruction.child_fills.length, 1);
+  assert.equal(mid.next_slice_at, t0 + 4 + 60);
+  const tooSoon = claimSlice(account, id, t0 + 10);
+  assert.equal(tooSoon.ok, false);
+  assert.equal(tooSoon.error, "too_soon");
+  const second = claimSlice(account, id, t0 + 4 + 60);
+  assert.equal(second.ok, true);
+  assert.equal(second.slice_i, 2);
+  recordSlice(
+    account,
+    id,
+    {
+      slice_i: 2,
+      avg_price: "2410",
+      filled_quantity: "666.666666",
+      fill: { hash: "0x2", quantity: "333.333333", price: "2420" },
+    },
+    t0 + 64,
+  );
+  const lastClaim = claimSlice(account, id, t0 + 64 + 60);
+  assert.equal(lastClaim.last, true);
+  const last = recordSlice(
+    account,
+    id,
+    {
+      slice_i: 3,
+      avg_price: "2415",
+      filled_quantity: "1000",
+      fill: { hash: "0x3", quantity: "333.333334", price: "2425" },
+    },
+    t0 + 124,
+  );
+  assert.equal(last.more, false);
+  const done = completeExecute(
+    account,
+    id,
+    { receipt: "filled · 0x3", avg_price: "2415" },
+    t0 + 125,
+  );
+  assert.equal(done.instruction.status, "done");
+  assert.equal(done.instruction.progress_pct, 100);
+});
+
+test("cancel drops an executing TWAP so remaining slices do not fire", () => {
+  const account = "28-twap-cancel";
+  const t0 = 1_700_000_300;
+  const staged = stageTrade(
+    account,
+    {
+      sentence: "Buy 10 ETH over time",
+      params: { order_type: "twap", schedule: { slices: 4, interval_secs: 30 } },
+    },
+    t0,
+  );
+  const id = staged.instruction.instruction_id;
+  assert.equal(beginExecute(account, id, t0 + 3).ok, true);
+  const cancelled = cancelTask(account, staged.instruction.task_id);
+  assert.equal(cancelled.ok, true);
+  const next = claimSlice(account, id, t0 + 40);
+  assert.equal(next.ok, false);
+  assert.equal(next.error, "cancelled");
+});
+
+test("listDueTrades returns pending after the delay and executing when the next slice is due", () => {
+  const account = "29-due";
+  const t0 = 1_700_000_400;
+  const staged = stageTrade(
+    account,
+    {
+      sentence: "DCA 7 ETH",
+      params: { order_type: "dca", schedule: { slices: 2, interval_secs: 10, cadence: "daily" } },
+    },
+    t0,
+  );
+  const id = staged.instruction.instruction_id;
+  assert.equal(listDueTrades(account, t0 + 1).length, 0);
+  assert.equal(listDueTrades(account, t0 + 3).some((row) => row.instruction_id === id), true);
+  claimSlice(account, id, t0 + 3);
+  recordSlice(
+    account,
+    id,
+    { slice_i: 1, fill: { hash: "0xa", quantity: "3.5", price: "1" }, filled_quantity: "3.5" },
+    t0 + 3,
+  );
+  assert.equal(listDueTrades(account, t0 + 4).length, 0);
+  assert.equal(listDueTrades(account, t0 + 3 + 10).some((row) => row.instruction_id === id), true);
 });

@@ -3,6 +3,7 @@
  * Used to seed STT keyterms globally (not persisted per account).
  */
 
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,6 +19,67 @@ export const ONTOLOGY_VERSION = file.version;
 
 export function ontologyEntries() {
   return file.entries || [];
+}
+
+/** Omitted or empty channels means both speech and text. */
+export function channelsOf(entry) {
+  const raw = Array.isArray(entry?.channels) ? entry.channels : [];
+  const out = [];
+  const seen = new Set();
+  for (const row of raw) {
+    const key = String(row || "")
+      .trim()
+      .toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(key);
+  }
+  if (!out.length) return ["speech", "text"];
+  out.sort();
+  return out;
+}
+
+/** Hash of sorted entries plus frames and repairs. Snapshot when any of these change. */
+export function ontologyFingerprint() {
+  const rows = ontologyEntries()
+    .map((entry) =>
+      [
+        normalizeKey(entry.surface_form),
+        String(entry.kind || ""),
+        String(entry.normalized_target || ""),
+        channelsOf(entry).join(","),
+      ].join("\0"),
+    )
+    .sort();
+  const frames = JSON.stringify(file.frames || []);
+  const repairs = JSON.stringify(file.repairs || []);
+  return createHash("sha256")
+    .update(`${rows.join("\n")}\n${frames}\n${repairs}`)
+    .digest("hex");
+}
+
+export function ontologyFrames() {
+  return file.frames || [];
+}
+
+export function entryCounts() {
+  const counts_by_kind = {};
+  let channels_speech = 0;
+  let channels_text = 0;
+  const entries = ontologyEntries();
+  for (const entry of entries) {
+    const kind = entry.kind || "unknown";
+    counts_by_kind[kind] = (counts_by_kind[kind] || 0) + 1;
+    const channels = channelsOf(entry);
+    if (channels.includes("speech")) channels_speech += 1;
+    if (channels.includes("text")) channels_text += 1;
+  }
+  return {
+    counts_by_kind,
+    entry_count: entries.length,
+    channels_speech,
+    channels_text,
+  };
 }
 
 function normalizeKey(surface) {
@@ -79,12 +141,13 @@ export function kindRank(kind) {
   const rank = {
     instrument: 0,
     act: 1,
-    size_frame: 2,
-    size: 3,
-    unit: 3,
-    product: 4,
-    level: 5,
-    phrase: 6,
+    order_type: 2,
+    size_frame: 3,
+    size: 4,
+    unit: 4,
+    product: 5,
+    level: 6,
+    phrase: 7,
   };
   return rank[kind] ?? 9;
 }
@@ -97,7 +160,7 @@ function isBoostToken(term) {
 /** Single-token, non-confusable surfaces for Deepgram keywords. */
 export function ontologyKeyterms() {
   const ranked = [...ontologyEntries()]
-    .filter((row) => row.kind !== "confusable")
+    .filter((row) => row.kind !== "confusable" && channelsOf(row).includes("speech"))
     .sort((a, b) => {
       const d = kindRank(a.kind) - kindRank(b.kind);
       if (d !== 0) return d;

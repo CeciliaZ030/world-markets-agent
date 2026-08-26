@@ -12,6 +12,7 @@ const {
   exportEval,
   ingestUtterance,
   keyterms,
+  lexiconOf,
   recordCorrection,
   setConsent,
   upsertLexicon,
@@ -129,4 +130,46 @@ test("audio blob is written under the brain dir", () => {
   assert.ok(out.utterance.audio_ref);
   const abs = path.join(dir, out.utterance.audio_ref);
   assert.equal(fs.readFileSync(abs, "utf8"), "ogg-bytes");
+});
+
+test("upsertLexicon mutates and saves", () => {
+  const first = upsertLexicon("27", {
+    surface_form: "the loop",
+    normalized_target: "WETH",
+    kind: "instrument",
+    source: "confirmed",
+  });
+  assert.equal(first.ok, true);
+  assert.equal(first.lexicon.length, 1);
+  assert.equal(first.lexicon[0].surface_form, "the loop");
+  assert.equal(first.lexicon[0].normalized_target, "WETH");
+  assert.equal(first.lexicon[0].source, "confirmed");
+  assert.ok(first.lexicon[0].first_seen);
+
+  const again = upsertLexicon("27", {
+    surface_form: "the loop",
+    normalized_target: "WETH",
+    kind: "instrument",
+    source: "confirmed",
+  });
+  assert.equal(again.lexicon.length, 1);
+  assert.ok(again.lexicon[0].confidence > first.lexicon[0].confidence);
+
+  const extra = upsertLexicon("27", {
+    surface_form: "loop coin",
+    normalized_target: "WETH",
+    kind: "instrument",
+  });
+  assert.equal(extra.lexicon.length, 2);
+
+  const saved = JSON.parse(
+    fs.readFileSync(path.join(dir, "voice", "27.json"), "utf8"),
+  );
+  assert.equal(saved.lexicon.length, 2);
+  assert.ok(
+    saved.lexicon.some(
+      (row) => row.surface_form === "the loop" && row.normalized_target === "WETH",
+    ),
+  );
+  assert.deepEqual(lexiconOf("27"), saved.lexicon);
 });

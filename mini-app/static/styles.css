@@ -204,8 +204,28 @@ body.locked { overflow: hidden; }
   margin-top: 1px;
   color: var(--accent);
 }
-.glyph.faint { color: var(--faint); }
-.glyph.pos { color: var(--pos); }
+.glyph.count {
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+}
+.count-chip {
+  flex: 0 0 auto;
+  min-width: 28px;
+  text-align: right;
+  font-size: 18px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  letter-spacing: 0.02em;
+}
+.swipe-chip.archive {
+  background: var(--neg);
+  width: 88px;
+}
+.row[data-swipe="archive"] {
+  touch-action: pan-y;
+}
 .spin {
   width: 13px;
   height: 13px;
@@ -810,6 +830,33 @@ body.locked { overflow: hidden; }
   text-transform: lowercase;
   color: var(--faint);
 }
+.near-match {
+  padding: 0 14px 10px;
+}
+.near-match .frame {
+  font-size: 12px;
+  color: var(--mute);
+  margin-bottom: 8px;
+  line-height: 1.4;
+}
+.near-match-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.near-chip {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--ink);
+  font-size: 12px;
+  padding: 7px 12px;
+  cursor: pointer;
+}
+.near-chip.escape {
+  color: var(--faint);
+  background: transparent;
+}
 .signed {
   display: inline-block;
   font-family: var(--mono);
@@ -964,13 +1011,17 @@ body.home-v7 .toast {
   color: var(--accent);
   animation: pulse-dot 1.6s infinite;
 }
-.listen-words {
-  font-size: 17px;
+.voice-dock .listen-words {
+  min-height: 44px;
+  max-width: 280px;
+  font-size: 16px;
   font-weight: 600;
-  line-height: 1.45;
-  min-height: 50px;
-  max-width: 100%;
+  line-height: 1.4;
+  text-align: center;
+  color: var(--ink);
+  pointer-events: none;
 }
+.voice-dock .listen-words[hidden] { display: none; }
 .listen-caret {
   color: var(--accent);
   animation: blink 1s step-end infinite;
@@ -1035,7 +1086,7 @@ body.home-v7 .toast {
   pointer-events: none;
 }
 .voice-hero .mic-svg { position: relative; z-index: 1; }
-.voice-hero .wave, .voice-hero .rip, .voice-hero .check {
+.voice-hero .wave, .voice-hero .rip, .voice-hero .check, .voice-hero .sending-spin {
   display: none;
 }
 .voice-dock.listening .voice-hero {
@@ -1058,6 +1109,22 @@ body.home-v7 .toast {
 .voice-dock.drafted .voice-halo, .voice-dock.drafted .mic-svg,
 .voice-dock.drafted .wave, .voice-dock.drafted .rip { display: none; }
 .voice-dock.drafted .check { display: block; font-size: 38px; font-weight: 700; }
+.voice-dock.sending .voice-hero {
+  background: radial-gradient(circle at 50% 32%, #1d2632, #12171f);
+  border-color: rgba(77, 163, 255, 0.55);
+  color: var(--accent);
+  animation: fadein 0.12s;
+}
+.voice-dock.sending .voice-halo, .voice-dock.sending .mic-svg,
+.voice-dock.sending .wave, .voice-dock.sending .rip, .voice-dock.sending .check { display: none; }
+.voice-dock.sending .sending-spin {
+  display: block;
+  width: 28px;
+  height: 28px;
+  margin: 0;
+  border-width: 3px;
+}
+.voice-dock.sending .voice-status { color: var(--accent); }
 
 .rip {
   position: absolute;
