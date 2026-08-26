@@ -124,6 +124,9 @@ fi
 PLUGIN="$(dev_plugin_path)"
 PROVIDER="$(dev_llm_provider)"
 
+# Seed post-trade RAPV from live RAPV when ATLAS projection fails (stubbed evm-core).
+export WORLD_DEV_SEED_POST_TRADE_RAPV="${WORLD_DEV_SEED_POST_TRADE_RAPV:-1}"
+
 cat <<EOF
 Starting agent CLI (type messages here — same thread as Mini App compose/voice).
 Quit the REPL or Ctrl+C to stop brain, sidecar, and mini-app.

@@ -103,6 +103,7 @@ pub(crate) struct PostTradeProjection {
 }
 
 const POST_TRADE_SOURCE: &str = "world-markets-reporting";
+const DEV_SEED_SOURCE: &str = "world-markets-dev-seed";
 
 pub(crate) fn project_post_trade(
     client: &WorldClient,
@@ -191,6 +192,34 @@ fn project_from_account(
         source: POST_TRADE_SOURCE,
         is_estimate: true,
     })
+}
+
+/// Local harness only. When `WORLD_DEV_SEED_POST_TRADE_RAPV` is set, a failed
+/// ATLAS projection falls back to live RAPV so the mandate floor can pass in
+/// `aomi-run` (stubbed evm-core). Production stays fail-closed.
+pub(crate) fn dev_seed_post_trade_rapv_enabled() -> bool {
+    matches!(
+        std::env::var("WORLD_DEV_SEED_POST_TRADE_RAPV")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+pub(crate) fn dev_seed_rapv(account: &Account) -> Option<Decimal> {
+    if !dev_seed_post_trade_rapv_enabled() {
+        return None;
+    }
+    parse_decimal(
+        &account.risk_adjusted_portfolio_value,
+        "risk_adjusted_portfolio_value",
+    )
+    .ok()
+}
+
+pub(crate) fn dev_seed_source() -> &'static str {
+    DEV_SEED_SOURCE
 }
 
 fn apply_intent(
@@ -1160,5 +1189,15 @@ mod tests {
             relative <= Decimal::new(5, 3),
             "ATLAS evaluate(1) {derived} must stay within 50 bps of live RAPV {live} (delta {delta})"
         );
+    }
+
+    #[test]
+    fn dev_seed_rapv_uses_live_reading_when_enabled() {
+        let account = usdt_account(Decimal::from(9_000));
+        unsafe { std::env::remove_var("WORLD_DEV_SEED_POST_TRADE_RAPV") };
+        assert!(dev_seed_rapv(&account).is_none());
+        unsafe { std::env::set_var("WORLD_DEV_SEED_POST_TRADE_RAPV", "1") };
+        assert_eq!(dev_seed_rapv(&account), Some(Decimal::from(9_000)));
+        unsafe { std::env::remove_var("WORLD_DEV_SEED_POST_TRADE_RAPV") };
     }
 }

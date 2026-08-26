@@ -17,7 +17,7 @@ test("once watch fires with copy and is spent", () => {
   isolatedDir();
   process.env.WORLD_WATCH_FIRE_CEILING = "5";
   const now = 1_700_000_000;
-  recordMark({ symbol: "ETH", mark: "110", ts: now });
+  recordMark({ symbol: "ETH", mark: "90", ts: now - 10 });
   const set = setWatch("17", {
     phrase: "above 100",
     symbol: "ETH",
@@ -26,6 +26,7 @@ test("once watch fires with copy and is spent", () => {
   });
   assert.equal(set.stored, true);
   assert.match(set.message, /Watching/);
+  recordMark({ symbol: "ETH", mark: "110", ts: now });
   evaluateAccount("17", now);
   const items = listWatches("17");
   assert.equal(items[0].status, "spent");
@@ -40,7 +41,7 @@ test("N+1 fire is held then flushed as a bundle with copy", () => {
   isolatedDir();
   process.env.WORLD_WATCH_FIRE_CEILING = "1";
   const now = 1_710_000_000;
-  recordMark({ symbol: "ETH", mark: "110", ts: now });
+  recordMark({ symbol: "ETH", mark: "90", ts: now - 10 });
   setWatch("18", {
     id: "w-a",
     phrase: "above 100",
@@ -55,6 +56,7 @@ test("N+1 fire is held then flushed as a bundle with copy", () => {
     mark_at_set: "90",
     expires_at: now + 10 * 86400,
   });
+  recordMark({ symbol: "ETH", mark: "110", ts: now });
   evaluateAccount("18", now);
   const first = peek();
   assert.equal(first.length, 1);
@@ -88,16 +90,71 @@ test("expired watch enqueues the expiry message", () => {
   drain(50);
 });
 
+test("already-true watch is not armed", () => {
+  isolatedDir();
+  process.env.WORLD_WATCH_FIRE_CEILING = "5";
+  const now = 1_740_000_000;
+  recordMark({ symbol: "ETH", mark: "2465.71", ts: now });
+  const set = setWatch("21", {
+    phrase: "tell me if ETH drops below 3000",
+    symbol: "ETH",
+    mark_at_set: "2465.71",
+    expires_at: now + 30 * 86400,
+  });
+  assert.equal(set.stored, false);
+  assert.equal(set.already_true, true);
+  assert.equal(set.now, "2465.71");
+  assert.match(set.message, /already true/);
+  assert.deepEqual(set.controls, ["Watch the next crossing", "Change the level"]);
+  assert.equal(listWatches("21").length, 0);
+  evaluateAccount("21", now);
+  assert.equal(peek().length, 0);
+});
+
+test("watch the next crossing arms an edge trigger", () => {
+  isolatedDir();
+  process.env.WORLD_WATCH_FIRE_CEILING = "5";
+  const now = 1_750_000_000;
+  recordMark({ symbol: "ETH", mark: "2465.71", ts: now });
+  const set = setWatch("22", {
+    phrase: "tell me if ETH drops below 3000",
+    symbol: "ETH",
+    mark_at_set: "2465.71",
+    fire_on_transition: true,
+    expires_at: now + 30 * 86400,
+  });
+  assert.equal(set.stored, true);
+  assert.equal(set.watch.fire_on_transition, true);
+  assert.equal(set.watch.predicate_was_false, false);
+  evaluateAccount("22", now);
+  assert.equal(listWatches("22")[0].status, "active");
+  assert.equal(peek().length, 0);
+
+  recordMark({ symbol: "ETH", mark: "3100", ts: now + 60 });
+  evaluateAccount("22", now + 60);
+  assert.equal(listWatches("22")[0].predicate_was_false, true);
+  assert.equal(peek().length, 0);
+
+  recordMark({ symbol: "ETH", mark: "2465.71", ts: now + 120 });
+  evaluateAccount("22", now + 120);
+  assert.equal(listWatches("22")[0].status, "spent");
+  const out = peek();
+  assert.equal(out.length, 1);
+  assert.equal(out[0].kind, "watch_fired");
+  drain(50);
+});
+
 test("funding watch compares ingested 8h rate as percent", () => {
   isolatedDir();
   process.env.WORLD_WATCH_FIRE_CEILING = "5";
   const now = 1_730_000_000;
-  recordFunding({ symbol: "ETH", rate: "0.02", ts: now });
+  recordFunding({ symbol: "ETH", rate: "0.005", ts: now - 10 });
   setWatch("20", {
     phrase: "funding above 0.01%",
     symbol: "ETH",
     expires_at: now + 86400,
   });
+  recordFunding({ symbol: "ETH", rate: "0.02", ts: now });
   evaluateAccount("20", now);
   const items = listWatches("20");
   assert.equal(items[0].status, "spent");

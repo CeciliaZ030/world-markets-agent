@@ -87,4 +87,7 @@ if [[ ! -f "$PLUGIN" ]]; then
   PLUGIN="target/debug/libworld_markets.so"
 fi
 
+# Seed post-trade RAPV from live RAPV when ATLAS projection fails (stubbed evm-core).
+export WORLD_DEV_SEED_POST_TRADE_RAPV="${WORLD_DEV_SEED_POST_TRADE_RAPV:-1}"
+
 aomi-run "$PLUGIN" --env-file .env --provider openrouter "$@"

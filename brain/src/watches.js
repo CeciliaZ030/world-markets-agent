@@ -113,6 +113,7 @@ export function setWatch(accountId, body) {
     predicate = resolved.predicate;
   }
   const fireMode = body.fire_mode === "repeats" ? "repeats" : "once";
+  const fireOnTransition = Boolean(body.fire_on_transition);
   const watch = {
     id:
       body.id ||
@@ -121,6 +122,7 @@ export function setWatch(accountId, body) {
     original_phrase: String(body.phrase || predicate.resolved || ""),
     predicate,
     fire_mode: fireMode,
+    fire_on_transition: fireOnTransition,
     created_at: now,
     expires_at: Number(body.expires_at) || now + DEFAULT_TTL_SECS,
     status: "active",
@@ -130,12 +132,33 @@ export function setWatch(accountId, body) {
     instruction_id: body.instruction_id || null,
     correlation_id: body.correlation_id || null,
   };
+  const atSet = evaluatePredicate(watch, now);
+  const liveNow = body.mark_at_set ?? atSet.live ?? null;
+  const alreadyTrue = Boolean(atSet.ready && atSet.true);
+  if (alreadyTrue && !fireOnTransition) {
+    return attachSetCopy({
+      ok: true,
+      stored: false,
+      already_true: true,
+      now: liveNow,
+      symbol: body.symbol,
+      predicate,
+      watch: { ...watch, status: "not_armed" },
+    });
+  }
+  watch.predicate_was_false = fireOnTransition ? false : !alreadyTrue;
   const data = loadWatches(accountId);
   data.items = data.items || [];
   data.items.push(watch);
   saveWatches(accountId, data);
   attachWatch(accountId, watch, now);
-  return attachSetCopy({ ok: true, stored: true, watch });
+  return attachSetCopy({
+    ok: true,
+    stored: true,
+    already_true: false,
+    now: liveNow,
+    watch,
+  });
 }
 
 export function cancelWatch(accountId, id) {
@@ -243,14 +266,14 @@ function evaluatePredicate(watch, now) {
   switch (p.kind) {
     case "price_level": {
       const mark = latestMark(p.symbol);
-      const live = mark ? num(mark.mark) : null;
+      const live = mark ? num(mark.mark) : num(watch.mark_at_set);
       const level = num(p.level);
       if (live == null || level == null) return { ready: false };
       return {
         ready: true,
         true: cmp(p.op, live, level),
-        live: mark.mark,
-        live_ts: mark.ts,
+        live: mark ? mark.mark : watch.mark_at_set,
+        live_ts: mark ? mark.ts : null,
       };
     }
     case "pct_move": {
@@ -412,8 +435,11 @@ export function evaluateAccount(
       changed = true;
       continue;
     }
-    const mayFire =
-      watch.fire_mode === "once" ? true : Boolean(watch.predicate_was_false);
+    const mayFire = watch.fire_on_transition
+      ? Boolean(watch.predicate_was_false)
+      : watch.fire_mode === "once"
+        ? true
+        : Boolean(watch.predicate_was_false);
     if (!mayFire) continue;
     watch.predicate_was_false = false;
     watch.last_fired_at = now;

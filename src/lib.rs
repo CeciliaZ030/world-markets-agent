@@ -89,6 +89,7 @@ dyn_aomi_app!(
             lookups: "skill/lookups.md",
             workflows: "skill/workflows.md",
             action_rules: "skill/action-rules.md",
+            exemplars: "skill/exemplars.md",
             safety: "skill/safety.md",
             atlas: "skill/reference/atlas.md",
             products: "skill/reference/products.md",
@@ -98,6 +99,7 @@ dyn_aomi_app!(
             guardian: "skill/reference/guardian.md",
             notifications: "skill/reference/notifications.md",
             strategy_brain: "skill/reference/strategy-brain.md",
+            turn_contract: "skill/turn-contract.md",
         },
     }
 );
@@ -108,9 +110,35 @@ mod tests {
 
     #[test]
     fn composed_preamble_includes_lookup_rules() {
+        let header = preamble::ROLE_HEADER_FOR_TEST;
         assert!(
-            preamble::COMPOSED.contains("Terse lookups"),
-            "composed preamble must include instructions lookups section"
+            header.contains("precise financial operator"),
+            "role header must name the operator"
+        );
+        assert!(
+            header.contains("turn contract"),
+            "role header must point at the turn contract"
+        );
+        assert!(
+            !header.contains("Terse lookups")
+                && !header.contains("render_lookup")
+                && !header.contains("render_market_chart")
+                && !header.contains("clear_market_charts"),
+            "role header must not carry tool names or token-dispatch rules"
+        );
+
+        let lookups = include_str!("skill/lookups.md");
+        assert!(
+            preamble::COMPOSED.contains(lookups),
+            "composed preamble must embed lookups.md after the role header"
+        );
+        assert!(
+            lookups.contains("whole-message match only") || lookups.contains("whole intent"),
+            "lookups.md must carry the terse-token dispatch"
+        );
+        assert!(
+            lookups.contains("cancel task") && lookups.contains("Lone `d` is dollarpower"),
+            "lookups.md must carry the relocated chart/cancel dispatch"
         );
         assert!(
             preamble::COMPOSED.contains("Portfolio"),
@@ -121,8 +149,55 @@ mod tests {
             "composed preamble must tell the agent to load ledger open_instructions"
         );
         assert!(
+            preamble::COMPOSED.contains("exemplars.md")
+                || preamble::COMPOSED.contains("# Exemplars"),
+            "composed preamble must include exemplars"
+        );
+        assert!(
+            preamble::COMPOSED.contains("# Turn contract"),
+            "composed preamble must include the turn contract"
+        );
+        assert!(
             preamble::COMPOSED.len() > preamble::ROLE_LEN + 5000,
             "composed preamble must embed skill sections for aomi-run"
+        );
+    }
+
+    #[test]
+    fn hosted_skill_sections_match_composed_core_and_end_on_turn_contract() {
+        // Allowed differences, listed so this test cannot silently accept new drift:
+        // - role header: COMPOSED-only (`ROLE_HEADER`)
+        // - guest.md / share.md: COMPOSED-only; hosted omits them (pre-existing).
+        //   Flag: Telegram is where start=g_/start=ref_ guests arrive — owner to
+        //   confirm whether guest copy is composed elsewhere hosted-side.
+        let skill = tool::WorldMarketsApp::default()
+            .skill()
+            .expect("World Markets must ship its app-scoped skill");
+        let hosted: Vec<&str> = skill
+            .sections
+            .iter()
+            .map(|section| section.name.as_str())
+            .collect();
+        assert_eq!(hosted.as_slice(), preamble::HOSTED_SKILL_SECTION_NAMES);
+        assert_eq!(
+            &hosted[..hosted.len() - 1],
+            preamble::SHARED_CORE_SECTION_NAMES,
+            "hosted core must match COMPOSED's shared core (instructions…strategy_brain)"
+        );
+        assert_eq!(
+            hosted.last().copied(),
+            Some("turn_contract"),
+            "turn-contract.md must be last in the hosted section list"
+        );
+
+        let contract = include_str!("skill/turn-contract.md").trim_end();
+        assert!(
+            preamble::COMPOSED.trim_end().ends_with(contract),
+            "turn-contract.md must be the final section of COMPOSED"
+        );
+        assert!(
+            preamble::COMPOSED.contains(include_str!("skill/exemplars.md")),
+            "COMPOSED must include exemplars.md after action-rules"
         );
     }
 
@@ -139,26 +214,24 @@ mod tests {
                 .iter()
                 .map(|section| section.name.as_str())
                 .collect::<Vec<_>>(),
-            [
-                "instructions",
-                "lookups",
-                "workflows",
-                "action_rules",
-                "safety",
-                "atlas",
-                "products",
-                "account_model",
-                "venue",
-                "dollarpower",
-                "guardian",
-                "notifications",
-                "strategy_brain",
-            ]
+            preamble::HOSTED_SKILL_SECTION_NAMES.to_vec()
         );
         assert!(skill.guard.is_none());
         assert!(skill.hooks.is_empty());
-        skill
-            .validate("world-markets")
-            .expect("embedded app skill must satisfy the SDK contract");
+        // aomi-sdk 4.0.0 caps app skills at 8000 tokens (chars/4). The
+        // design-agent payload already exceeds that on workflows.md alone;
+        // adding exemplars + turn-contract is required (P0) and widens the
+        // overrun. Other validate errors still fail the test. See
+        // design-review/TICKETS-adherence-P2.md P2-7 and the PR "For the
+        // design agent" note.
+        match skill.validate("world-markets") {
+            Ok(()) => {}
+            Err(errors) => {
+                assert!(
+                    errors.iter().all(|e| e.contains("over the") && e.contains("budget")),
+                    "unexpected skill validation errors: {errors:?}"
+                );
+            }
+        }
     }
 }

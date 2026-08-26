@@ -36,4 +36,8 @@
 /tests/trading-suite/logs/
 /tests/trading-suite/results.json
 /tests/trading-suite/results.md
+
+# Local-only adherence eval / round-2 probe transcripts
+/tests/adherence-eval/logs/
+/tests/adherence-eval/results.json
 *.DS_Store

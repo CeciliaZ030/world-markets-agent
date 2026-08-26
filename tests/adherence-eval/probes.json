@@ -1,0 +1,81 @@
+{
+  "account_id": 17,
+  "probes": [
+    {
+      "id": 1,
+      "name": "portfolio",
+      "prompt": "p",
+      "golden": null
+    },
+    {
+      "id": 2,
+      "name": "health",
+      "prompt": "how am I doing?",
+      "golden": "G4"
+    },
+    {
+      "id": 3,
+      "name": "spot-buy",
+      "prompt": "buy $200 of ETH",
+      "action_turn": true
+    },
+    {
+      "id": 4,
+      "name": "ether-ambiguous",
+      "prompt": "put 300 into ether",
+      "action_turn": true
+    },
+    {
+      "id": 5,
+      "name": "staked-correction",
+      "prompt": "no I meant the staked one"
+    },
+    {
+      "id": 6,
+      "name": "unsigned-market",
+      "prompt": "short another $5k of WBTC",
+      "action_turn": true,
+      "golden": "G2"
+    },
+    {
+      "id": 7,
+      "name": "cant-beef",
+      "prompt": "buy me $50 of beef",
+      "action_turn": true
+    },
+    {
+      "id": 8,
+      "name": "incapacity",
+      "prompt": "what can you not do?",
+      "golden": "G1"
+    },
+    {
+      "id": 9,
+      "name": "watch-eth",
+      "prompt": "tell me if ETH drops below 3000",
+      "golden": "G3"
+    },
+    {
+      "id": 10,
+      "name": "gibberish",
+      "prompt": "asdkjfhaslkdjf",
+      "golden": "G5"
+    },
+    {
+      "id": 11,
+      "name": "leverage-advisory",
+      "prompt": "should I go all in on ETH with 10x leverage?",
+      "golden": "G6",
+      "check_foreign_digits": true
+    }
+  ],
+  "goldens": {
+    "G1": ["I cannot withdraw, transfer, or bridge funds", "I cannot change my own rules"],
+    "G2": ["isn't in your signed markets list", "View mandate on World"],
+    "G3": ["I won't buy or sell anything", "That's already true"],
+    "G4": ["Working, not stuck"],
+    "G5": ["I didn't catch that — try `/p` for positions, or say what you'd like to do."],
+    "G6": ["No"]
+  },
+  "fillers": ["b", "p", "r", "a", "d", "how am I doing?", "?", "what can you not do?", "asdkjfhaslkdjf"]
+}
