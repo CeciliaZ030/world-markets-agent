@@ -12,9 +12,11 @@ use std::sync::{Arc, Mutex};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::client::WorldClient;
+use crate::client::{Account, WorldClient};
 use crate::pnl::now_unix;
-use crate::rates::{daily_carry_from_annual, parse_rate, snapshot as rates_snapshot};
+use crate::rates::{
+    RatesSnapshot, daily_carry_from_annual, parse_rate, snapshot as rates_snapshot,
+};
 use crate::reporting::{CarryState, Figure};
 
 const LEDGER_VERSION: u32 = 1;
@@ -235,20 +237,48 @@ pub(crate) fn check(
     position_id: &str,
     account_id: Option<u64>,
 ) -> Result<CarryState, String> {
-    check_at(client, ledger, position_id, account_id, now_unix())
+    let daily = live_daily_carry(client, position_id)?;
+    persist_observation(ledger, position_id, account_id, daily, now_unix())
 }
 
-fn check_at(
-    client: &WorldClient,
+pub(crate) fn check_open_perps(
+    ledger: &CarryLedger,
+    account: &Account,
+    rates: &RatesSnapshot,
+) -> Result<Vec<CarryState>, String> {
+    let mut out = Vec::new();
+    let now = now_unix();
+    for perp in &account.perpetual_positions {
+        let id = format!("perp:{}", perp.symbol);
+        let daily = rates
+            .rates
+            .iter()
+            .find(|row| row.base_symbol.eq_ignore_ascii_case(&perp.symbol))
+            .and_then(|row| row.basis_spread_apr.as_deref())
+            .map(parse_rate)
+            .transpose()?
+            .map(daily_carry_from_annual);
+        out.push(persist_observation(
+            ledger,
+            &id,
+            Some(account.account_id),
+            daily,
+            now,
+        )?);
+    }
+    Ok(out)
+}
+
+fn persist_observation(
     ledger: &CarryLedger,
     position_id: &str,
     account_id: Option<u64>,
+    daily: Option<Decimal>,
     now: u64,
 ) -> Result<CarryState, String> {
     let key = store_key(account_id, position_id);
     let mut book = ledger.load()?;
     book.version = LEDGER_VERSION;
-    let daily = live_daily_carry(client, position_id)?;
     let record = book.positions.entry(key).or_insert_with(|| CarryRecord {
         position_id: position_id.to_string(),
         entry_timestamp: now,
@@ -273,22 +303,7 @@ pub(crate) fn observe_daily(
     daily_carry: Decimal,
     now: u64,
 ) -> Result<CarryState, String> {
-    let key = store_key(account_id, position_id);
-    let mut book = ledger.load()?;
-    book.version = LEDGER_VERSION;
-    let record = book.positions.entry(key).or_insert_with(|| CarryRecord {
-        position_id: position_id.to_string(),
-        entry_timestamp: now,
-        negative_carry_window_days: default_window(),
-        days_negative: 0,
-        avg_daily_carry: "0".to_string(),
-        fired: false,
-        last_check_utc_day: None,
-    });
-    apply_observation(record, Some(daily_carry), now);
-    let state = to_state(record);
-    ledger.save(&book)?;
-    Ok(state)
+    persist_observation(ledger, position_id, account_id, Some(daily_carry), now)
 }
 
 #[cfg(test)]

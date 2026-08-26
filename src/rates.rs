@@ -10,22 +10,17 @@ use std::str::FromStr;
 use rust_decimal::Decimal;
 use serde::Serialize;
 
-use crate::client::{Asset, BASE_TOKEN_ID, CHAIN_ID, WorldClient, asset_by_symbol};
+use crate::client::{Asset, BASE_TOKEN_ID, CHAIN_ID, LendBookRates, WorldClient, asset_by_symbol};
 
 /// 365 × 3 eight-hour funding intervals. Simple, non-compounded.
 pub(crate) const FUNDING_PERIODS_PER_YEAR: i64 = 1095;
 
 pub(crate) const RATES_DESCRIPTION: &str = "\
-Return live per-asset venue rates and the two composed spreads the strategy brain ranks on. \
-All figures are decimal strings computed in Rust. \
+Live per-asset venue rates and the two composed spreads the strategy brain ranks on. \
 Classic basis: borrow quote at borrow_apr, buy spot, short perp at funding_annualized; net = basis_spread_apr. \
-Yield-bearing basis: hold a yield-bearing spot asset (earning native_yield_apy), short perp (earning funding), optionally borrow to lever; net = yield_basis_spread_apr. \
-Do not sum lend_apr with native_yield_apy — lending transfers the token and its staking accrual to the counterparty. \
-Funding is per-8h; annualize as ×1095 (simple, non-compounded). Lend/borrow rates are natively annualized. \
-×1095 is simple annualization, not compounding, so a receipt never overstates. \
-Native yield is operator config (WORLD_NATIVE_YIELDS) or none; missing is null, never invented. \
-borrow_apr on each row is the quote (USDT) taker-borrow rate used by classic basis. lend_apr is this asset's taker-lend book rate. \
-Never executes.";
+Yield-bearing basis: hold yield-bearing spot (native_yield_apy), short perp, optionally borrow; net = yield_basis_spread_apr. \
+Do not sum lend_apr with native_yield_apy. Funding per-8h annualizes ×1095 (simple annualization, not compounded). \
+Native yield is WORLD_NATIVE_YIELDS or null. borrow_apr is quote taker-borrow; lend_apr is this asset's taker-lend. Never executes.";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct AssetRates {
@@ -60,6 +55,12 @@ pub(crate) fn parse_rate(raw: &str) -> Result<Decimal, String> {
 
 pub(crate) fn annualize_funding_8h(rate_8h: Decimal) -> Decimal {
     rate_8h * Decimal::from(FUNDING_PERIODS_PER_YEAR)
+}
+
+/// 8h funding as a percent (0.0001 → `"0.01"`), matching watch `rate_pct`.
+pub(crate) fn eight_hour_rate_as_pct(rate_8h: &str) -> Option<String> {
+    let rate = parse_rate(rate_8h).ok()?;
+    Some((rate * Decimal::from(100)).normalize().to_string())
 }
 
 pub(crate) fn classic_basis_spread(funding_annualized: Decimal, borrow_apr: Decimal) -> Decimal {
@@ -123,14 +124,25 @@ pub(crate) fn snapshot(
         .ok_or_else(|| "[world-markets] quote token is missing from the asset list".to_string())?;
     let quote_borrow = client.lend_book_rates(quote.token_id)?.borrow_apr;
     let native_table = load_native_yields();
+    let now = client.block_timestamp()?;
+    let token_ids: Vec<u32> = selected.iter().map(|asset| asset.token_id).collect();
+    let funding_ids: Vec<u32> = token_ids
+        .iter()
+        .copied()
+        .filter(|id| *id != BASE_TOKEN_ID)
+        .collect();
+    let from = now.saturating_sub(8 * 3600);
+    let _ = client.funding_rate_histories(from, now, &funding_ids)?;
+    let books = client.lend_book_rates_many(&token_ids)?;
     let mut rates = Vec::new();
-    for asset in selected {
-        rates.push(compose_asset(
+    for (asset, book) in selected.into_iter().zip(books) {
+        rates.push(compose_asset_with_book(
             client,
             &asset,
             &quote.symbol,
             quote_borrow.as_deref(),
             &native_table,
+            book,
         )?);
     }
     Ok(RatesSnapshot {
@@ -159,12 +171,13 @@ fn select_assets(assets: &[Asset], symbols: Option<&[String]>) -> Result<Vec<Ass
     }
 }
 
-fn compose_asset(
+fn compose_asset_with_book(
     client: &WorldClient,
     asset: &Asset,
     quote_symbol: &str,
     quote_borrow_apr: Option<&str>,
     native_table: &BTreeMap<String, String>,
+    book: LendBookRates,
 ) -> Result<AssetRates, String> {
     let funding_rate_8h = client.current_funding_rate_8h(asset.token_id)?;
     let funding_annualized = funding_rate_8h
@@ -173,7 +186,6 @@ fn compose_asset(
         .transpose()?
         .map(annualize_funding_8h)
         .map(dec_string);
-    let book = client.lend_book_rates(asset.token_id)?;
     let lend_apr = book.lend_apr;
     let borrow_apr = quote_borrow_apr.map(ToString::to_string);
     let (native_yield_apy, native_yield_source) = native_for(&asset.symbol, native_table);
@@ -223,6 +235,11 @@ mod tests {
             annualize_funding_8h(eight_h).normalize().to_string(),
             "0.1095"
         );
+    }
+
+    #[test]
+    fn eight_hour_rate_as_pct_matches_watch_rate_pct() {
+        assert_eq!(eight_hour_rate_as_pct("0.0001").as_deref(), Some("0.01"));
     }
 
     #[test]

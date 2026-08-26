@@ -17,6 +17,10 @@
 # Execution sidecar
 /sidecar/node_modules/
 
+# Brain sidecar (unsigned news / watches)
+/brain/node_modules/
+
+
 # The Desk (voice client) local runtime
 /desk/.venv/
 /desk/.env
@@ -32,3 +36,4 @@
 /tests/trading-suite/logs/
 /tests/trading-suite/results.json
 /tests/trading-suite/results.md
+*.DS_Store

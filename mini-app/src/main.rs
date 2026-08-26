@@ -1,9 +1,12 @@
-//! Telegram Mini App server: portfolio snapshot and interactive charts.
+//! Telegram Mini App server: portfolio snapshot, instruction ledger, charts.
 //!
 //! Init-data HMAC follows Telegram's WebApp algorithm (HMAC-SHA256 keyed by
 //! `WebAppData`, then HMAC of the sorted data-check string). The Mini App spec's
 //! shorter "HMAC with the bot token as key" does not match Telegram and would
 //! reject every real session.
+//!
+//! `/api/v1/mini-app/ledger*` is GET-only. Compose writes go through
+//! `POST /api/v1/mini-app/compose` (Telegram sendData ingress), never `/ledger*`.
 
 mod auth;
 
@@ -12,7 +15,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -78,6 +81,13 @@ async fn main() {
         .route("/api/v1/mini-app/auth", post(auth_handler))
         .route("/api/v1/mini-app/portfolio", get(portfolio_handler))
         .route("/api/v1/mini-app/chart", get(chart_handler))
+        .route(
+            "/api/v1/mini-app/ledger/summary",
+            get(ledger_summary_handler),
+        )
+        .route("/api/v1/mini-app/ledger/{id}", get(ledger_one_handler))
+        .route("/api/v1/mini-app/ledger", get(ledger_handler))
+        .route("/api/v1/mini-app/compose", post(compose_handler))
         .route("/api/v1/mini-app/health", get(health_handler))
         .fallback(static_handler)
         .layer(CorsLayer::permissive())
@@ -163,7 +173,17 @@ async fn portfolio_handler(State(state): State<AppState>, headers: HeaderMap) ->
         tracing::error!("WORLD_ACCOUNT_ID is not set");
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed");
     };
-    match spawn_blocking(move || world_markets::mini_app::load_portfolio(account_id)).await {
+    match spawn_blocking(move || {
+        let mut portfolio = world_markets::mini_app::load_portfolio(account_id)?;
+        if let Ok(ledger) = world_markets::mini_app::load_ledger(account_id)
+            && let Some(counts) = ledger.get("watch_counts").and_then(Value::as_object)
+        {
+            world_markets::mini_app::apply_watch_counts(&mut portfolio, counts);
+        }
+        Ok::<_, String>(portfolio)
+    })
+    .await
+    {
         Ok(Ok(portfolio)) => Json(portfolio).into_response(),
         Ok(Err(err)) => {
             tracing::error!(error = %err, "portfolio fetch failed");
@@ -200,6 +220,119 @@ async fn chart_handler(
         }
         Err(err) => {
             tracing::error!(error = %err, "chart task join failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
+        }
+    }
+}
+
+async fn ledger_summary_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !session_ok(&state, &headers) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let Some(account_id) = state.account_id else {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed");
+    };
+    match spawn_blocking(move || world_markets::mini_app::load_ledger_summary(account_id)).await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, "ledger summary failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "ledger summary join failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
+        }
+    }
+}
+
+async fn ledger_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !session_ok(&state, &headers) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let Some(account_id) = state.account_id else {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed");
+    };
+    match spawn_blocking(move || world_markets::mini_app::load_ledger(account_id)).await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, "ledger fetch failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "ledger join failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
+        }
+    }
+}
+
+async fn ledger_one_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !session_ok(&state, &headers) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let Some(account_id) = state.account_id else {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed");
+    };
+    match spawn_blocking(move || world_markets::mini_app::load_instruction(account_id, &id)).await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(err)) if err.contains("not_found") => json_error(StatusCode::NOT_FOUND, "not_found"),
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, "ledger item failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "ledger item join failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ComposeRequest {
+    #[serde(default)]
+    correlation_id: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    message: String,
+    #[serde(default)]
+    instruction_id: Option<String>,
+    #[serde(default)]
+    fire_kind: Option<String>,
+    #[serde(default)]
+    instrument: Option<String>,
+}
+
+async fn compose_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ComposeRequest>,
+) -> Response {
+    if !session_ok(&state, &headers) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let Some(account_id) = state.account_id else {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed");
+    };
+    let payload = json!({
+        "account_id": account_id,
+        "correlation_id": body.correlation_id,
+        "kind": body.kind,
+        "message": body.message,
+        "instruction_id": body.instruction_id,
+        "fire_kind": body.fire_kind,
+        "instrument": body.instrument,
+    });
+    match spawn_blocking(move || world_markets::mini_app::submit_compose(&payload)).await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, "compose failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "compose join failed");
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
         }
     }
@@ -267,5 +400,32 @@ fn mime_for(path: &str) -> &'static str {
         "svg" => "image/svg+xml",
         "json" => "application/json",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ledger_routes_are_get_only() {
+        let src = include_str!("main.rs");
+        assert!(src.contains("get(ledger_summary_handler)"));
+        assert!(src.contains("get(ledger_one_handler)"));
+        assert!(src.contains("get(ledger_handler)"));
+        for line in src.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || trimmed.starts_with("//!") {
+                continue;
+            }
+            if !trimmed.contains("/api/v1/mini-app/ledger") && !trimmed.contains("ledger_") {
+                continue;
+            }
+            assert!(
+                !trimmed.contains("post(")
+                    && !trimmed.contains("put(")
+                    && !trimmed.contains("patch(")
+                    && !trimmed.contains("delete("),
+                "ledger route must not mutate: {trimmed}"
+            );
+        }
     }
 }

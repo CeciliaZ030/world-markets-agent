@@ -11,7 +11,9 @@ use rust_decimal::Decimal;
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
+use serde_json::Value;
 
+use crate::brain::BrainClient;
 use crate::client::{Account, Asset, BASE_TOKEN_ID, WorldClient};
 use crate::liquidation_risk::{self, PortfolioMetrics};
 use crate::lookups::notional_usdt;
@@ -25,6 +27,9 @@ pub struct PortfolioResponse {
     pub total_usd_value: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_change_24h_pct: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub floor: Option<String>,
+    pub flags: MiniFlags,
     pub block_number: u64,
 }
 
@@ -37,6 +42,14 @@ pub struct PositionRow {
     pub leverage: Option<String>,
     pub change_direction: Option<String>,
     pub asset_type: String,
+    pub group: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
+    pub can_exit: bool,
+    pub watch_count: u32,
+    pub keywords: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -57,11 +70,19 @@ pub struct RiskSnapshot {
     pub is_estimate: bool,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MiniFlags {
+    pub primary_view: String,
+    pub jobline_negative: bool,
+    pub family: String,
+}
+
 struct PositionDraft {
     symbol: String,
     quantity: Decimal,
     usd: Decimal,
     asset_type: &'static str,
+    side: Option<String>,
 }
 
 fn shared_client() -> &'static WorldClient {
@@ -234,6 +255,7 @@ fn assemble(
                 quantity: qty.abs(),
                 usd,
                 asset_type: "perp",
+                side: Some(perp.side.clone()),
             }),
             Err(_) => had_unpriced = true,
         }
@@ -253,6 +275,7 @@ fn assemble(
                     quantity: lender.abs(),
                     usd,
                     asset_type: "lend",
+                    side: None,
                 }),
                 Err(_) => had_unpriced = true,
             }
@@ -265,6 +288,7 @@ fn assemble(
                     quantity: borrower.abs(),
                     usd,
                     asset_type: "borrow",
+                    side: None,
                 }),
                 Err(_) => had_unpriced = true,
             }
@@ -287,6 +311,7 @@ fn assemble(
                 quantity: qty.abs(),
                 usd,
                 asset_type: "spot",
+                side: None,
             }),
             Err(_) => had_unpriced = true,
         }
@@ -310,6 +335,17 @@ fn assemble(
             leverage: None,
             change_direction: None,
             asset_type: row.asset_type.to_string(),
+            group: group_for(row.asset_type).to_string(),
+            extra: extra_for(&row.symbol, row.asset_type, floor),
+            side: row.side.clone(),
+            can_exit: row.asset_type != "lend",
+            watch_count: 0,
+            keywords: format!(
+                "{} {} {}",
+                row.symbol,
+                row.asset_type,
+                row.side.as_deref().unwrap_or("")
+            ),
         });
     }
 
@@ -357,6 +393,8 @@ fn assemble(
         },
         total_usd_value: two_dp(total),
         total_change_24h_pct: None,
+        floor: floor.map(two_dp),
+        flags: mini_flags(),
         block_number,
     })
 }
@@ -371,6 +409,87 @@ pub fn spec_band(score: u8) -> &'static str {
         6..=8 => "elevated",
         _ => "high",
     }
+}
+
+pub fn mini_flags() -> MiniFlags {
+    MiniFlags {
+        primary_view: std::env::var("WORLD_MINI_PRIMARY_VIEW")
+            .ok()
+            .filter(|v| v == "portfolio" || v == "ledger")
+            .unwrap_or_else(|| "ledger".to_string()),
+        jobline_negative: std::env::var("WORLD_MINI_JOBLINE_NEGATIVE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+        family: std::env::var("WORLD_MINI_FAMILY")
+            .ok()
+            .filter(|v| v == "violet" || v == "blue")
+            .unwrap_or_else(|| "blue".to_string()),
+    }
+}
+
+fn group_for(asset_type: &str) -> &'static str {
+    match asset_type {
+        "perp" => "positions",
+        "lend" | "borrow" => "lending",
+        _ => "holdings",
+    }
+}
+
+fn extra_for(symbol: &str, asset_type: &str, floor: Option<Decimal>) -> Option<String> {
+    let upper = symbol.to_ascii_uppercase();
+    if upper.contains("STETH") {
+        return Some("accrues in price".to_string());
+    }
+    if upper.contains("XETH") {
+        return Some("borrow leg backs it".to_string());
+    }
+    match asset_type {
+        "perp" => floor.map(|value| format!("floor ${}", two_dp(value))),
+        "lend" => Some("fixed term".to_string()),
+        "spot" => Some("free collateral".to_string()),
+        _ => None,
+    }
+}
+
+pub fn apply_watch_counts(
+    portfolio: &mut PortfolioResponse,
+    counts: &serde_json::Map<String, Value>,
+) {
+    for row in &mut portfolio.positions {
+        let key = row.symbol.to_ascii_uppercase();
+        let n = counts
+            .get(&key)
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                counts.iter().find_map(|(k, v)| {
+                    if key.contains(&k.to_ascii_uppercase())
+                        || k.to_ascii_uppercase().contains(&key)
+                    {
+                        v.as_u64()
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or(0) as u32;
+        row.watch_count = n;
+    }
+}
+
+pub fn load_ledger_summary(account_id: u64) -> Result<Value, String> {
+    BrainClient::from_env().ledger_summary(account_id)
+}
+
+pub fn load_ledger(account_id: u64) -> Result<Value, String> {
+    BrainClient::from_env().ledger(account_id)
+}
+
+pub fn load_instruction(account_id: u64, id: &str) -> Result<Value, String> {
+    BrainClient::from_env().ledger_one(account_id, id)
+}
+
+pub fn submit_compose(body: &Value) -> Result<Value, String> {
+    BrainClient::from_env().compose(body)
 }
 
 fn risk_score(metrics: &PortfolioMetrics, eligible: bool) -> u8 {
@@ -479,6 +598,38 @@ mod tests {
     fn money_always_two_dp() {
         assert_eq!(two_dp(Decimal::from(8432)), "8432.00");
         assert_eq!(two_dp(Decimal::new(84325, 1)), "8432.50");
+    }
+
+    #[test]
+    fn copy_module_strings_have_no_exclamation() {
+        let src = include_str!("../mini-app/static/copy.js");
+        let mut quoted = String::new();
+        let mut in_str = false;
+        let mut chars = src.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                if in_str && let Some(next) = chars.next() {
+                    quoted.push(next);
+                }
+                continue;
+            }
+            if ch == '"' {
+                if in_str {
+                    quoted.push('\n');
+                }
+                in_str = !in_str;
+                continue;
+            }
+            if in_str {
+                quoted.push(ch);
+            }
+        }
+        for line in quoted.lines() {
+            assert!(
+                !line.contains('!'),
+                "copy strings must not use exclamation marks: {line}"
+            );
+        }
     }
 
     #[test]

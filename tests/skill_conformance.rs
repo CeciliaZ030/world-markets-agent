@@ -238,6 +238,25 @@ fn load_bearing_strings_present() {
     assert!(wf.contains("I'll only message you if"));
 }
 
+#[test]
+fn research_watch_task_workflows_present() {
+    let wf = skill("workflows.md");
+    assert!(wf.contains("get_world_research"));
+    assert!(wf.contains("cause_established"));
+    assert!(wf.contains("set_world_watch"));
+    assert!(wf.contains("get_world_tasks"));
+    assert!(wf.contains("I won't buy or sell anything"));
+    assert!(wf.contains("paste `message`"));
+    assert!(wf.contains("portfolio_now"));
+    assert!(wf.contains("on-chain ✓"));
+    let safety = skill("safety.md");
+    assert!(safety.contains("Never predict") || safety.contains("never predict"));
+    assert!(safety.contains("never trades") || safety.contains("never trade"));
+    let notes = skill("reference/notifications.md");
+    assert!(notes.contains("solicited"));
+    assert!(notes.contains("not the digest") || notes.contains("Not the weekly digest"));
+}
+
 /// §10.8 — the notification budget is stated: one weekly digest, silent renewals,
 /// guardian exempt from bundling.
 #[test]
@@ -286,6 +305,8 @@ fn lookup_formats_present() {
         "Holdings",
         "Perps",
         "No open positions",
+        "render_lookup",
+        "paste `message`",
     ] {
         assert!(lookups.contains(phrase), "missing lookup format: {phrase}");
     }

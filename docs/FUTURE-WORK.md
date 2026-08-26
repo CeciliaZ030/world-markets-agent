@@ -120,6 +120,64 @@ When Aomi documents image/photo delivery from tool results, or alongside the sha
 
 ---
 
+## Terse lookup short-circuit (500ms)
+
+### Current state
+
+`render_lookup` fills the one-line `b`/`p`/`r`/`a`/`d`/`?` templates in Rust and returns `{ skip_llm, message }`. `warm_account` prefetches the live account into the 8s RPC cache. Skill copy tells the model to paste `message` verbatim.
+
+### Observations
+
+Two LLM hops plus the 8k skill still dominate Telegram latency. Plugin-side cache hits are milliseconds; a cold public-RPC account read is already hundreds of ms. The 500ms budget only closes if the host skips the model on whole-message tokens.
+
+### Future intention
+
+Hosted Aomi (not `aomi-run`) should call `render_lookup` with `text` = the user message **on every inbound chat**, not only terse tokens. Unmatched messages prefetch the account in the background. The plugin also refreshes every 60s while the session is active and rebuilds the cache after trades. When `skip_llm` is true, send `message` and do not invoke the LLM.
+
+### When to revisit
+
+When staging Telegram is wired to this contract, or when measuring p50 time-to-first-byte on terse tokens. Do not cache RAPV/NAV across blocks as "live" without an age qualifier.
+
+
+---
+
+## News sources (brain sidecar)
+
+### Current state
+
+Research, watches, mark history, and preferences live in an unsigned Node process (`brain/`, default `http://127.0.0.1:8788`). It never holds `WORLD_PRIVATE_KEY` and never places an order. The plugin is an HTTP client (`src/brain.rs`).
+
+News is a **registry**. Each source is `brain/src/news/<id>.js` implementing `{ id, fetch({ symbol, windowSecs, now }) }`. Register it in `brain/src/news/index.js` (`SOURCES`) and enable with `WORLD_NEWS_SOURCES` (comma-separated). Contract: `brain/src/news/source.js`.
+
+**Default source today:** CryptoCompare's public news list (`https://min-api.cryptocompare.com/data/v2/news/`, no API key). `cause_established` is true only when a headline names the asset *and* uses a causal cue (`after`, `amid`, `due to`, …). Headlines without a cause still appear in `sources[]` but do not flip the flag.
+
+Portfolio before→after risk / dollarpower is `POST /v1/portfolio-impact`. Live `before` (RAPV, liquidation risk) is passed through from `get_world_account` via `get_world_research.portfolio_now`. `after` stays absent unless `WORLD_IMPACT_SDK_MODULE` points at an adapter that calls `@composite/sdk` with before/after snapshots. Never invent a post-move score in the message layer.
+
+The Aomi host must drain `POST /v1/outbound/drain` (or `drain_world_outbound`) to deliver watch fires. Watch fires are solicited and must not share accounting with the weekly digest.
+
+### How to add a news source (TODO — owner)
+
+1. Add `brain/src/news/<id>.js` that default-exports `{ id, async fetch(query) }`. Return `{ status: "ok"|"timeout"|"unavailable", items: [{ name, url, ts, title, cause }] }`. Leave `cause` null unless the outlet attributed one — never invent a cause or a price.
+2. Import and list it in `SOURCES` in `brain/src/news/index.js`.
+3. Set `WORLD_NEWS_SOURCES=cryptocompare,<id>` (or replace the default).
+4. Add a unit test in `brain/test/` that the module is registered.
+5. Prefer a licensed wire, World-operated feed, or a source that returns structured causes over another headline dump.
+
+Do **not** scrape paywalled articles, and do not let the model fill `cause_established`.
+
+### Future intention
+
+- Replace / supplement CryptoCompare with the in-house news process once it exists.
+- Wire `@composite/sdk` (or `@wcm-inc/sdk`) into `brain/src/impact.js` so research can cite live before→after risk and dollarpower for a stated mark move.
+- Host Telegram delivery of the outbound queue, 24/7, independent of a chat session.
+
+### When to revisit
+
+When a news vendor is chosen, when Composite SDK snapshot-in functions are available, or when hosted Aomi can drain outbound pushes.
+
+
+---
+
 ## Template for new entries
 
 ```markdown

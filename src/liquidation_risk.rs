@@ -49,16 +49,16 @@ pub(crate) fn compute_metrics(
         .iter()
         .find(|asset| asset.token_id == BASE_TOKEN_ID)
         .ok_or_else(|| "[world-markets] base token config is missing".to_string())?;
-    let state = build_state(client, account, assets)?;
-    let nav = evaluate(&state, assets, client, base, time_sec, 0.0)?;
+    let state = build_state(client, account, assets, time_sec)?;
+    let nav = evaluate(&state, assets, base, 0.0)?;
     let prv = parse_decimal(
         &account.risk_adjusted_portfolio_value,
         "risk_adjusted_portfolio_value",
     )
     .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
-    let val_at_max = evaluate(&state, assets, client, base, time_sec, MAX_SCORE)?;
+    let val_at_max = evaluate(&state, assets, base, MAX_SCORE)?;
     let risk = calculate_liquidation_risk(nav, prv, val_at_max, |multiplier| {
-        evaluate(&state, assets, client, base, time_sec, multiplier)
+        evaluate(&state, assets, base, multiplier)
     })?;
     Ok(PortfolioMetrics {
         net_asset_value: format_decimal(nav, base.position_decimals),
@@ -161,12 +161,12 @@ fn project_from_account(
         .iter()
         .find(|asset| asset.token_id == BASE_TOKEN_ID)
         .ok_or_else(|| "[world-markets] base token config is missing".to_string())?;
-    let current_state = build_state(client, account, assets)?;
-    let eval_before = evaluate(&current_state, assets, client, quote_asset, time_sec, 1.0)?;
+    let current_state = build_state(client, account, assets, time_sec)?;
+    let eval_before = evaluate(&current_state, assets, quote_asset, 1.0)?;
     let mut projected = account.clone();
     apply_intent(&mut projected, intent, borrow_rate_raw, time_sec)?;
-    let projected_state = build_state(client, &projected, assets)?;
-    let eval_after = evaluate(&projected_state, assets, client, quote_asset, time_sec, 1.0)?;
+    let projected_state = build_state(client, &projected, assets, time_sec)?;
+    let eval_after = evaluate(&projected_state, assets, quote_asset, 1.0)?;
     let live_rapv = parse_decimal(
         &account.risk_adjusted_portfolio_value,
         "risk_adjusted_portfolio_value",
@@ -176,24 +176,10 @@ fn project_from_account(
         .checked_add(eval_after)
         .and_then(|value| value.checked_sub(eval_before))
         .ok_or_else(|| "[world-markets] post-trade RAPV overflow".to_string())?;
-    let nav = evaluate(&projected_state, assets, client, quote_asset, time_sec, 0.0)?;
-    let val_at_max = evaluate(
-        &projected_state,
-        assets,
-        client,
-        quote_asset,
-        time_sec,
-        MAX_SCORE,
-    )?;
+    let nav = evaluate(&projected_state, assets, quote_asset, 0.0)?;
+    let val_at_max = evaluate(&projected_state, assets, quote_asset, MAX_SCORE)?;
     let risk = calculate_liquidation_risk(nav, post_rapv, val_at_max, |multiplier| {
-        evaluate(
-            &projected_state,
-            assets,
-            client,
-            quote_asset,
-            time_sec,
-            multiplier,
-        )
+        evaluate(&projected_state, assets, quote_asset, multiplier)
     })?;
     let risk_display = format_risk_score(risk);
     let liquidation_risk = parse_decimal(&risk_display, "liquidation_risk")
@@ -553,6 +539,7 @@ struct TokenState {
     lend_rate_raw: u16,
     perp: Option<PerpetualPosition>,
     mark_price: Decimal,
+    funding_history_rate: Decimal,
 }
 
 struct PortfolioState {
@@ -563,6 +550,7 @@ fn build_state(
     client: &WorldClient,
     account: &Account,
     assets: &[Asset],
+    time_sec: u64,
 ) -> Result<PortfolioState, String> {
     let balances: BTreeMap<u32, &Balance> =
         account.balances.iter().map(|b| (b.token_id, b)).collect();
@@ -577,23 +565,63 @@ fn build_state(
         .map(|p| (p.token_id, p))
         .collect::<BTreeMap<_, _>>();
 
+    let active: Vec<&Asset> = assets
+        .iter()
+        .filter(|asset| {
+            balances.contains_key(&asset.token_id)
+                || lending.contains_key(&asset.token_id)
+                || perps.contains_key(&asset.token_id)
+        })
+        .collect();
+    let marks = client.mark_prices(active.iter().map(|asset| asset.token_id))?;
+
+    let funding_ids: Vec<u32> = active
+        .iter()
+        .filter_map(|asset| {
+            let perp = perps.get(&asset.token_id)?;
+            has_perp_elapsed_funding_interval(time_sec, perp.funding_start_time)
+                .then_some(asset.token_id)
+        })
+        .collect();
+    let mut funding_by_token: BTreeMap<u32, Decimal> = BTreeMap::new();
+    for token_id in funding_ids {
+        let perp = perps.get(&token_id).ok_or_else(|| {
+            format!("[world-markets] missing perp while fetching funding for {token_id}")
+        })?;
+        let asset = active
+            .iter()
+            .find(|asset| asset.token_id == token_id)
+            .ok_or_else(|| {
+                format!("[world-markets] missing asset while fetching funding for {token_id}")
+            })?;
+        funding_by_token.insert(
+            token_id,
+            funding_history_rate(client, perp, asset, time_sec)?,
+        );
+    }
+
     let mut tokens = BTreeMap::new();
-    for asset in assets {
-        let has_activity = balances.contains_key(&asset.token_id)
-            || lending.contains_key(&asset.token_id)
-            || perps.contains_key(&asset.token_id);
-        if !has_activity {
-            continue;
-        }
+    for asset in active {
         let balance_vault = balances
             .get(&asset.token_id)
             .and_then(|b| b.balance_raw.parse().ok())
             .unwrap_or(0);
         let lend = lending.get(&asset.token_id);
         let perp = perps.get(&asset.token_id).cloned().cloned();
-        let (_raw, mark) = client.mark_price(asset.token_id)?;
+        let (_raw, mark) = marks
+            .get(&asset.token_id)
+            .cloned()
+            .ok_or_else(|| format!("[world-markets] missing mark for token {}", asset.token_id))?;
         let mark_price = parse_decimal(&mark, "mark_price")
             .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        let funding_history_rate = if perp.is_some() {
+            funding_by_token
+                .get(&asset.token_id)
+                .copied()
+                .unwrap_or(Decimal::ZERO)
+        } else {
+            Decimal::ZERO
+        };
         tokens.insert(
             asset.token_id,
             TokenState {
@@ -603,6 +631,7 @@ fn build_state(
                 lend_rate_raw: lend.map(|l| l.highest_interest_rate_raw).unwrap_or(0),
                 perp,
                 mark_price,
+                funding_history_rate,
             },
         );
     }
@@ -612,9 +641,7 @@ fn build_state(
 fn evaluate(
     state: &PortfolioState,
     assets: &[Asset],
-    client: &WorldClient,
     base: &Asset,
-    time_sec: u64,
     risk_multiplier: f64,
 ) -> Result<Decimal, String> {
     let asset_map: BTreeMap<u32, &Asset> = assets.iter().map(|a| (a.token_id, a)).collect();
@@ -633,13 +660,12 @@ fn evaluate(
         let (mut high, mut low) =
             calc_spot_risk_bounds(effective, base_quantity, asset, base, risk_multiplier)?;
         if let Some(perp) = &token.perp {
-            let history_rate = funding_history_rate(client, perp, asset, time_sec)?;
             let (high_perp, low_perp) = calc_perp_risk_bounds(
                 perp,
                 asset,
                 base,
                 token.mark_price,
-                history_rate,
+                token.funding_history_rate,
                 risk_multiplier,
             )?;
             high = add_dec(high, high_perp)?;
@@ -690,6 +716,13 @@ where
     Ok(MAX_SCORE - mapped)
 }
 
+fn sum_funding_rates(rates: &[u64]) -> Decimal {
+    rates
+        .iter()
+        .map(|rate| Decimal::from(*rate) / Decimal::from(FUNDING_RATE_DIVISOR))
+        .sum()
+}
+
 fn funding_history_rate(
     client: &WorldClient,
     perp: &PerpetualPosition,
@@ -700,10 +733,7 @@ fn funding_history_rate(
         return Ok(Decimal::ZERO);
     }
     let rates = client.funding_rate_history(perp.funding_start_time, time_sec, asset.token_id)?;
-    Ok(rates
-        .iter()
-        .map(|rate| Decimal::from(*rate) / Decimal::from(FUNDING_RATE_DIVISOR))
-        .sum())
+    Ok(sum_funding_rates(&rates))
 }
 
 fn has_perp_elapsed_funding_interval(current_sec: u64, position_start_sec: u64) -> bool {
@@ -1017,12 +1047,12 @@ mod tests {
         let usdt = usdt_asset();
         let account = usdt_account(Decimal::from(1_000));
         let assets = [usdt.clone()];
-        let before_state = build_state(&client, &account, &assets).unwrap();
-        let before = evaluate(&before_state, &assets, &client, &usdt, 0, 1.0).unwrap();
+        let before_state = build_state(&client, &account, &assets, 0).unwrap();
+        let before = evaluate(&before_state, &assets, &usdt, 1.0).unwrap();
         let mut projected = account.clone();
         apply_lend_supply(&mut projected, &usdt, Decimal::from(100)).unwrap();
-        let after_state = build_state(&client, &projected, &assets).unwrap();
-        let after = evaluate(&after_state, &assets, &client, &usdt, 0, 1.0).unwrap();
+        let after_state = build_state(&client, &projected, &assets, 0).unwrap();
+        let after = evaluate(&after_state, &assets, &usdt, 1.0).unwrap();
         assert_eq!(before - after, Decimal::from(2));
         let projection = project_from_account(
             &client,
@@ -1046,6 +1076,50 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_uses_stored_funding_without_rpc() {
+        let usdt = usdt_asset();
+        let mut weth = usdt_asset();
+        weth.token_id = 2;
+        weth.symbol = "WETH".to_string();
+        weth.name = "WETH".to_string();
+        weth.risk_price_percent = 5;
+        weth.risk_slippage_percent = 1.0;
+        let perp = PerpetualPosition {
+            token_id: 2,
+            symbol: "WETH".to_string(),
+            quantity_raw: 10_000,
+            quantity: "1".to_string(),
+            side: "long".to_string(),
+            entry_price_raw: 0,
+            entry_price: "3000".to_string(),
+            funding_start_time: 0,
+            owed_nom_raw: "0".to_string(),
+            owed_nom: "0".to_string(),
+            owed_base_raw: "0".to_string(),
+        };
+        let mut tokens = BTreeMap::new();
+        tokens.insert(
+            2,
+            TokenState {
+                balance_vault: 0,
+                lend_borrower_raw: 0,
+                lend_lender_raw: 0,
+                lend_rate_raw: 0,
+                perp: Some(perp),
+                mark_price: Decimal::from(3000),
+                funding_history_rate: Decimal::ZERO,
+            },
+        );
+        let value = evaluate(
+            &PortfolioState { tokens },
+            &[usdt.clone(), weth],
+            &usdt,
+            0.0,
+        );
+        assert!(value.is_ok(), "{value:?}");
+    }
+
+    #[test]
     fn lend_supply_fails_closed_when_available_is_insufficient() {
         let usdt = usdt_asset();
         let mut account = usdt_account(Decimal::from(10));
@@ -1065,8 +1139,8 @@ mod tests {
             .find(|asset| asset.token_id == BASE_TOKEN_ID)
             .unwrap();
         let time_sec = client.block_timestamp().unwrap();
-        let state = build_state(&client, &account, &assets).unwrap();
-        let derived = evaluate(&state, &assets, &client, quote, time_sec, 1.0).unwrap();
+        let state = build_state(&client, &account, &assets, time_sec).unwrap();
+        let derived = evaluate(&state, &assets, quote, 1.0).unwrap();
         let live = parse_decimal(
             &account.risk_adjusted_portfolio_value,
             "risk_adjusted_portfolio_value",

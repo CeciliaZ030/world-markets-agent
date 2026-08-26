@@ -1,9 +1,12 @@
+use alloy_primitives::Address;
 use aomi_sdk::schemars::JsonSchema;
 use aomi_sdk::*;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::str::FromStr;
 
+use crate::brain::BrainClient;
 use crate::client::{Account, AccountAccess, CHAIN_ID, WorldClient, asset_by_symbol};
 use crate::execution::{
     CancelOrderRequest, CloseLoanRequest, ExecutionClient, PayInterestRequest, PlaceOrderRequest,
@@ -32,6 +35,8 @@ pub(crate) struct WorldMarketsApp {
     carry_ledger: crate::carry::CarryLedger,
     loan_origins: crate::loans::LoanOriginStore,
     execution: ExecutionClient,
+    warmer: crate::warm::AccountWarmer,
+    brain: BrainClient,
 }
 
 struct LiveVerdictInput<'a> {
@@ -52,6 +57,36 @@ pub(crate) struct GetWorldAccount;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct GetWorldAccountArgs {
+    /// World account ID. Optional when handover account context is available.
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    /// Expected owner wallet. This does not replace the acting wallet authorization check.
+    #[serde(default)]
+    pub(crate) wallet_address: Option<String>,
+}
+
+pub(crate) struct RenderLookup;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct RenderLookupArgs {
+    /// Whole user message. Host short-circuit: pass this and send `message` when `skip_llm`.
+    #[serde(default)]
+    pub(crate) text: Option<String>,
+    /// Explicit token (`b`/`p`/`r`/`a`/`d`/`index`) when the model already classified the lookup.
+    #[serde(default)]
+    pub(crate) token: Option<String>,
+    /// World account ID. Optional when handover account context is available.
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    /// Expected owner wallet. This does not replace the acting wallet authorization check.
+    #[serde(default)]
+    pub(crate) wallet_address: Option<String>,
+}
+
+pub(crate) struct WarmAccount;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct WarmAccountArgs {
     /// World account ID. Optional when handover account context is available.
     #[serde(default)]
     pub(crate) account_id: Option<u64>,
@@ -90,6 +125,23 @@ impl DynAomiTool for GetWorldRates {
 
     fn run(app: &WorldMarketsApp, args: Self::Args, _ctx: DynToolCallCtx) -> Result<Value, String> {
         let snapshot = crate::rates::snapshot(&app.client, args.assets.as_deref())?;
+        let funding: Vec<serde_json::Value> = snapshot
+            .rates
+            .iter()
+            .filter_map(|row| {
+                row.funding_rate_8h.as_ref().and_then(|rate| {
+                    crate::rates::eight_hour_rate_as_pct(rate).map(|pct| {
+                        json!({
+                            "symbol": row.base_symbol,
+                            "rate": pct,
+                        })
+                    })
+                })
+            })
+            .collect();
+        if !funding.is_empty() {
+            let _ = app.brain.ingest(&json!({ "funding": funding }));
+        }
         serde_json::to_value(&snapshot)
             .map_err(|e| format!("[world-markets] failed to encode rates snapshot: {e}"))
     }
@@ -111,12 +163,11 @@ impl DynAomiTool for GetWorldLoans {
     type App = WorldMarketsApp;
     type Args = GetWorldLoansArgs;
     const NAME: &'static str = "get_world_loans";
-    const DESCRIPTION: &'static str = "List this account's individual lend and borrow loans with fixed rate_apr, matures_at (unix seconds), time_remaining_seconds, extensible, and counterparty. get_world_account only exposes aggregated lend/borrow quantities, so this tool is required for roll timing. World loans are a 10-day term. When the contract does not expose start time, maturity is first-seen plus 10 days and extensible defaults true. Never executes.";
+    const DESCRIPTION: &'static str = "Individual lend/borrow loans: rate_apr, matures_at, time_remaining_seconds, extensible, counterparty. Aggregates on get_world_account are not enough for roll timing. 10-day term; missing start → first-seen+10d, extensible true. Never executes.";
 
     fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
         let access = app.access(args.account_id, args.wallet_address.as_deref(), &ctx)?;
-        let assets = app.client.assets()?;
-        let account = app.client.account(access.account_id, &assets)?;
+        let (assets, account) = app.live_account(&access)?;
         let snapshot = crate::loans::snapshot(&app.client, &app.loan_origins, &account, &assets)?;
         serde_json::to_value(&snapshot)
             .map_err(|e| format!("[world-markets] failed to encode loans snapshot: {e}"))
@@ -329,6 +380,30 @@ impl WorldMarketsApp {
         value_u64(Some(&Value::String(raw)))
     }
 
+    fn note_activity(&self, ctx: &DynToolCallCtx, explicit_id: Option<u64>) {
+        let account_id = Self::account_id(ctx, explicit_id);
+        self.warmer.touch(account_id);
+        self.warmer.ensure_loop(self.client.clone());
+    }
+
+    fn kick_prefetch(&self, ctx: &DynToolCallCtx, explicit_id: Option<u64>) {
+        self.note_activity(ctx, explicit_id);
+        self.warmer.kick_prefetch(self.client.clone());
+    }
+
+    fn refresh_after_trade(
+        &self,
+        ctx: &DynToolCallCtx,
+        account_id: Option<u64>,
+        wallet_address: Option<&str>,
+    ) {
+        self.client.invalidate_volatile();
+        self.warmer.clear_refresh();
+        if let Ok((_, _, access)) = self.inspect_account(account_id, wallet_address, ctx) {
+            self.warmer.mark_refreshed(access.account_id);
+        }
+    }
+
     fn brief(ctx: &DynToolCallCtx) -> Option<Value> {
         ctx.attribute_path(&["handover_brief"])
             .or_else(|| ctx.attribute_path(&["brief"]))
@@ -342,6 +417,7 @@ impl WorldMarketsApp {
         wallet_address: Option<&str>,
         ctx: &DynToolCallCtx,
     ) -> Result<AccountAccess, String> {
+        self.note_activity(ctx, account_id);
         let account_id = Self::account_id(ctx, account_id);
         let owner_wallet = wallet_address
             .map(ToString::to_string)
@@ -349,6 +425,140 @@ impl WorldMarketsApp {
         let actor = ctx.attribute_string(&["domain", "evm", "address"]);
         self.client
             .resolve_account(account_id, owner_wallet.as_deref(), actor.as_deref())
+    }
+
+    fn live_account(
+        &self,
+        access: &AccountAccess,
+    ) -> Result<(Vec<crate::client::Asset>, Account), String> {
+        let assets = self.client.assets()?;
+        let owner = Address::from_str(&access.owner)
+            .map_err(|e| format!("[world-markets] invalid owner address: {e}"))?;
+        let account = self
+            .client
+            .account_with_owner(access.account_id, owner, &assets)?;
+        Ok((assets, account))
+    }
+
+    fn inspect_account(
+        &self,
+        account_id: Option<u64>,
+        wallet_address: Option<&str>,
+        ctx: &DynToolCallCtx,
+    ) -> Result<(Value, Account, AccountAccess), String> {
+        let access = self.access(account_id, wallet_address, ctx)?;
+        let (assets, account) = self.live_account(&access)?;
+        let block_number = self.client.block_number()?;
+        let metrics = crate::liquidation_risk::compute_metrics(
+            &self.client,
+            &account,
+            &assets,
+            block_number,
+        )?;
+        let lookups = crate::lookups::compute_lookups(
+            &self.client,
+            &account,
+            &assets,
+            &metrics.net_asset_value,
+            block_number,
+        )?;
+        let liquidation_risk = metrics.liquidation_risk.clone();
+        let payload = json!({
+            "source": "world-markets-contract",
+            "chain_id": CHAIN_ID,
+            "exchange": self.client.exchange(),
+            "block_number": block_number,
+            "standing_brief": WorldMarketsApp::brief(ctx),
+            "access": access,
+            "account": account,
+            "metrics": metrics,
+            "lookups": lookups,
+        });
+        self.warmer.mark_refreshed(access.account_id);
+        let idle_quote = account
+            .balances
+            .iter()
+            .find(|b| b.symbol.eq_ignore_ascii_case("USDT"))
+            .map(|b| b.balance.clone());
+        let loan_fingerprints: Vec<String> = account
+            .lending_positions
+            .iter()
+            .map(|p| format!("{}:{}:{}", p.symbol, p.borrower_quantity, p.lender_quantity))
+            .collect();
+        let _ = self.brain.ingest(&json!({
+            "account_id": access.account_id,
+            "rapv": account.risk_adjusted_portfolio_value,
+            "liquidation_risk": liquidation_risk,
+            "idle_quote": idle_quote,
+            "loan_fingerprints": loan_fingerprints,
+            "marks": account.perpetual_positions.iter().map(|p| json!({
+                "symbol": p.symbol,
+            })).collect::<Vec<_>>(),
+        }));
+        Ok((payload, account, access))
+    }
+
+    fn render_terse_lookup(
+        &self,
+        kind: crate::lookups::LookupKind,
+        account_id: Option<u64>,
+        wallet_address: Option<&str>,
+        ctx: &DynToolCallCtx,
+    ) -> Result<String, String> {
+        use crate::lookups::{self, LookupKind};
+        match kind {
+            LookupKind::Index => Ok(lookups::INDEX_LINE.to_string()),
+            LookupKind::Available => Ok(lookups::render_available(None)),
+            LookupKind::Dollarpower => {
+                let portfolio_id = WorldMarketsApp::account_id(ctx, account_id)
+                    .map(|id| id.to_string())
+                    .unwrap_or_default();
+                let dp = self.reporting.dollarpower(&portfolio_id);
+                Ok(lookups::render_dollarpower(
+                    &dp.ratio.value,
+                    &dp.committed.value,
+                    dp.committed.is_estimate,
+                    &dp.effective.value,
+                    dp.effective.is_estimate,
+                ))
+            }
+            LookupKind::Balance | LookupKind::Risk | LookupKind::Positions => {
+                let access = self.access(account_id, wallet_address, ctx)?;
+                let (assets, account) = self.live_account(&access)?;
+                let block_number = self.client.block_number()?;
+                match kind {
+                    LookupKind::Positions => {
+                        let lookups_data = lookups::compute_lookups(
+                            &self.client,
+                            &account,
+                            &assets,
+                            &account.risk_adjusted_portfolio_value,
+                            block_number,
+                        )?;
+                        Ok(lookups::render_positions(&lookups_data.positions))
+                    }
+                    LookupKind::Balance | LookupKind::Risk => {
+                        let metrics = crate::liquidation_risk::compute_metrics(
+                            &self.client,
+                            &account,
+                            &assets,
+                            block_number,
+                        )?;
+                        if kind == LookupKind::Balance {
+                            Ok(lookups::render_balance(&metrics.net_asset_value))
+                        } else {
+                            Ok(lookups::render_risk(
+                                &metrics.liquidation_risk,
+                                account.eligible_for_liquidation,
+                            ))
+                        }
+                    }
+                    LookupKind::Index | LookupKind::Available | LookupKind::Dollarpower => {
+                        unreachable!("non-account kinds handled above")
+                    }
+                }
+            }
+        }
     }
 
     fn snapshot_effect_plan(
@@ -373,8 +583,7 @@ impl WorldMarketsApp {
         }
 
         let access = self.access(args.account_id, args.wallet_address.as_deref(), ctx)?;
-        let assets = self.client.assets()?;
-        let account = self.client.account(access.account_id, &assets)?;
+        let (assets, account) = self.live_account(&access)?;
         let block = self.client.block_number()?;
         let base = asset_by_symbol(&assets, &args.base_symbol)?;
         let quote = asset_by_symbol(&assets, &args.quote_symbol)?;
@@ -464,8 +673,7 @@ impl WorldMarketsApp {
         }
 
         let access = self.access(args.account_id, args.wallet_address.as_deref(), ctx)?;
-        let assets = self.client.assets()?;
-        let account = self.client.account(access.account_id, &assets)?;
+        let (assets, account) = self.live_account(&access)?;
         let base = asset_by_symbol(&assets, &args.base_symbol)?;
         let quote = asset_by_symbol(&assets, &args.quote_symbol)?;
         let market = self
@@ -602,8 +810,7 @@ impl WorldMarketsApp {
         let access = self.access(account_id, wallet_address, ctx)?;
         let mandate = Mandate::bound(ctx.attribute_path(&["handover_mandate"]))
             .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
-        let assets = self.client.assets()?;
-        let account = self.client.account(access.account_id, &assets)?;
+        let (_assets, account) = self.live_account(&access)?;
         let rapv = parse_decimal(
             &account.risk_adjusted_portfolio_value,
             "risk_adjusted_portfolio_value",
@@ -644,11 +851,8 @@ impl DynAomiTool for ListWorldAssets {
     const NAME: &'static str = "list_world_assets";
     const DESCRIPTION: &'static str = "List live World Markets assets and their token IDs, symbols, addresses, decimals, and risk parameters.";
 
-    fn run(
-        app: &WorldMarketsApp,
-        _args: Self::Args,
-        _ctx: DynToolCallCtx,
-    ) -> Result<Value, String> {
+    fn run(app: &WorldMarketsApp, _args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        app.kick_prefetch(&ctx, None);
         Ok(json!({
             "source": "world-markets-contract",
             "chain_id": CHAIN_ID,
@@ -666,30 +870,169 @@ impl DynAomiTool for GetWorldAccount {
     const DESCRIPTION: &'static str = "Inspect a live World account after proving that the active actor is its owner or an on-chain permitted trader.";
 
     fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
-        let access = app.access(args.account_id, args.wallet_address.as_deref(), &ctx)?;
-        let assets = app.client.assets()?;
-        let account = app.client.account(access.account_id, &assets)?;
-        let block_number = app.client.block_number()?;
-        let metrics =
-            crate::liquidation_risk::compute_metrics(&app.client, &account, &assets, block_number)?;
-        let lookups = crate::lookups::compute_lookups(
-            &app.client,
-            &account,
-            &assets,
-            &metrics.net_asset_value,
-            block_number,
-        )?;
-        Ok(json!({
+        let before = app.client.rpc_stats();
+        let (mut payload, _, _) =
+            app.inspect_account(args.account_id, args.wallet_address.as_deref(), &ctx)?;
+        attach_rpc_trace(&app.client, before, &mut payload);
+        Ok(payload)
+    }
+}
+
+impl DynAomiTool for RenderLookup {
+    type App = WorldMarketsApp;
+    type Args = RenderLookupArgs;
+    const NAME: &'static str = "render_lookup";
+    const DESCRIPTION: &'static str = "Whole-message terse lookup (b/p/r/a/d, word forms, ?/commands). Host: call on every user message with text=user message; if skip_llm, send message and do not call the LLM. Unmatched messages still prefetch the account. Model: paste message verbatim. Never executes.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let kind = args
+            .token
+            .as_deref()
+            .and_then(crate::lookups::parse_lookup_token)
+            .or_else(|| {
+                args.text
+                    .as_deref()
+                    .and_then(crate::lookups::parse_lookup_text)
+            });
+        let Some(kind) = kind else {
+            app.kick_prefetch(&ctx, args.account_id);
+            return Ok(json!({
+                "source": "world-markets-lookup",
+                "executable": false,
+                "matched": false,
+                "skip_llm": false,
+                "reply_verbatim": false,
+            }));
+        };
+        app.note_activity(&ctx, args.account_id);
+        let before = app.client.rpc_stats();
+        let message =
+            app.render_terse_lookup(kind, args.account_id, args.wallet_address.as_deref(), &ctx)?;
+        let mut payload = json!({
+            "source": "world-markets-lookup",
+            "executable": false,
+            "matched": true,
+            "skip_llm": true,
+            "reply_verbatim": true,
+            "token": kind.token(),
+            "message": message,
+        });
+        attach_rpc_trace(&app.client, before, &mut payload);
+        Ok(payload)
+    }
+}
+
+impl DynAomiTool for WarmAccount {
+    type App = WorldMarketsApp;
+    type Args = WarmAccountArgs;
+    const NAME: &'static str = "warm_account";
+    const DESCRIPTION: &'static str = "Prefetch live account, metrics, and marks into the RPC cache. Host: call at the start of every user message (render_lookup also does this). Plugin also refreshes every 60s while the session is active and after trades. Never a user-facing reply. Never executes.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let before = app.client.rpc_stats();
+        let (payload, _, access) =
+            app.inspect_account(args.account_id, args.wallet_address.as_deref(), &ctx)?;
+        let mut out = json!({
             "source": "world-markets-contract",
-            "chain_id": CHAIN_ID,
-            "exchange": app.client.exchange(),
-            "block_number": block_number,
-            "standing_brief": WorldMarketsApp::brief(&ctx),
-            "access": access,
-            "account": account,
-            "metrics": metrics,
-            "lookups": lookups,
-        }))
+            "executable": false,
+            "warmed": true,
+            "account_id": access.account_id,
+            "block_number": payload.get("block_number"),
+        });
+        attach_rpc_trace(&app.client, before, &mut out);
+        Ok(out)
+    }
+}
+
+pub(crate) struct GetHealthSnapshot;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct GetHealthSnapshotArgs {
+    /// World account ID. Optional when handover account context is available.
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    /// Expected owner wallet. This does not replace the acting wallet authorization check.
+    #[serde(default)]
+    pub(crate) wallet_address: Option<String>,
+    /// Optional position filter for the PnL section (symbol or `perp:SYMBOL`).
+    #[serde(default)]
+    pub(crate) position: Option<String>,
+}
+
+impl DynAomiTool for GetHealthSnapshot {
+    type App = WorldMarketsApp;
+    type Args = GetHealthSnapshotArgs;
+    const NAME: &'static str = "get_health_snapshot";
+    const DESCRIPTION: &'static str =
+        "Health card in one call (account, pnl, dollarpower). Never executes.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let before = app.client.rpc_stats();
+        let (mut payload, account, access) =
+            app.inspect_account(args.account_id, args.wallet_address.as_deref(), &ctx)?;
+        let pnl = crate::pnl::report(
+            &app.client,
+            &app.pnl_ledger,
+            &account,
+            args.position.as_deref(),
+        )?;
+        let dollarpower = app.reporting.dollarpower(&access.account_id.to_string());
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("pnl".to_string(), json!(pnl));
+            obj.insert("dollarpower".to_string(), json!(dollarpower));
+            obj.insert("executable".to_string(), json!(false));
+        }
+        attach_rpc_trace(&app.client, before, &mut payload);
+        Ok(payload)
+    }
+}
+
+pub(crate) struct GetStrategySnapshot;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct GetStrategySnapshotArgs {
+    /// World account ID. Optional when handover account context is available.
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    /// Expected owner wallet. This does not replace the acting wallet authorization check.
+    #[serde(default)]
+    pub(crate) wallet_address: Option<String>,
+    /// Base symbols for rates (e.g. ["WETH","WBTC"]). Omit for every listed asset.
+    #[serde(default)]
+    pub(crate) assets: Option<Vec<String>>,
+}
+
+impl DynAomiTool for GetStrategySnapshot {
+    type App = WorldMarketsApp;
+    type Args = GetStrategySnapshotArgs;
+    const NAME: &'static str = "get_strategy_snapshot";
+    const DESCRIPTION: &'static str =
+        "Strategy refresh in one call (account, rates, loans, carry). Never executes.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let before = app.client.rpc_stats();
+        let (mut payload, account, _access) =
+            app.inspect_account(args.account_id, args.wallet_address.as_deref(), &ctx)?;
+        let rates = crate::rates::snapshot(&app.client, args.assets.as_deref())?;
+        let assets = app.client.assets()?;
+        let loans = crate::loans::snapshot(&app.client, &app.loan_origins, &account, &assets)?;
+        let carry = crate::carry::check_open_perps(&app.carry_ledger, &account, &rates)?;
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert(
+                "rates".to_string(),
+                serde_json::to_value(&rates)
+                    .map_err(|e| format!("[world-markets] failed to encode rates snapshot: {e}"))?,
+            );
+            obj.insert(
+                "loans".to_string(),
+                serde_json::to_value(&loans)
+                    .map_err(|e| format!("[world-markets] failed to encode loans snapshot: {e}"))?,
+            );
+            obj.insert("carry".to_string(), json!(carry));
+            obj.insert("executable".to_string(), json!(false));
+        }
+        attach_rpc_trace(&app.client, before, &mut payload);
+        Ok(payload)
     }
 }
 
@@ -709,6 +1052,11 @@ impl DynAomiTool for GetWorldMarket {
             .transpose()?;
         let product = args.product.to_ascii_lowercase();
         let market = app.client.market(&product, base, quote)?;
+        let _ = app.brain.ingest(&json!({
+            "symbol": market.base_token.symbol,
+            "token_id": market.base_token.token_id,
+            "mark": market.mark_price,
+        }));
         Ok(json!({
             "source": "world-markets-contract",
             "chain_id": CHAIN_ID,
@@ -775,8 +1123,7 @@ impl DynAomiTool for ExecuteWorldOrder {
             return Err("[world-markets] quantity must be greater than zero".to_string());
         }
         let access = app.access(args.account_id, args.wallet_address.as_deref(), &ctx)?;
-        let assets = app.client.assets()?;
-        let account = app.client.account(access.account_id, &assets)?;
+        let (assets, account) = app.live_account(&access)?;
         let base = asset_by_symbol(&assets, &args.base_symbol)?;
         let quote_symbol = args
             .quote_symbol
@@ -809,6 +1156,7 @@ impl DynAomiTool for ExecuteWorldOrder {
             order_type,
             slippage: args.slippage.clone(),
         })?;
+        app.refresh_after_trade(&ctx, args.account_id, args.wallet_address.as_deref());
         Ok(execution_ok(
             &access,
             &verdict,
@@ -870,6 +1218,7 @@ impl DynAomiTool for CancelWorldOrder {
             price: args.interest_rate.clone(),
             interest_rate: args.interest_rate.clone(),
         })?;
+        app.refresh_after_trade(&ctx, args.account_id, args.wallet_address.as_deref());
         Ok(json!({
             "source": "world-markets-execution",
             "executable": true,
@@ -892,8 +1241,7 @@ impl DynAomiTool for ExecuteWorldSwap {
             return Err("[world-markets] amount_in must be greater than zero".to_string());
         }
         let access = app.access(args.account_id, args.wallet_address.as_deref(), &ctx)?;
-        let assets = app.client.assets()?;
-        let account = app.client.account(access.account_id, &assets)?;
+        let (assets, account) = app.live_account(&access)?;
         let token_in = asset_by_symbol(&assets, &args.token_in_symbol)?;
         let token_out = asset_by_symbol(&assets, &args.token_out_symbol)?;
         let usdt_in = token_in.symbol.eq_ignore_ascii_case("USDT");
@@ -942,6 +1290,7 @@ impl DynAomiTool for ExecuteWorldSwap {
             amount_in: args.amount_in.clone(),
             slippage: args.slippage.clone(),
         })?;
+        app.refresh_after_trade(&ctx, args.account_id, args.wallet_address.as_deref());
         Ok(execution_ok(
             &access,
             &verdict,
@@ -965,8 +1314,7 @@ impl DynAomiTool for RenewWorldLoans {
         let access = app.access(args.account_id, args.wallet_address.as_deref(), &ctx)?;
         let mandate = Mandate::bound(ctx.attribute_path(&["handover_mandate"]))
             .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
-        let assets = app.client.assets()?;
-        let account = app.client.account(access.account_id, &assets)?;
+        let (_assets, account) = app.live_account(&access)?;
         let rapv = parse_decimal(
             &account.risk_adjusted_portfolio_value,
             "risk_adjusted_portfolio_value",
@@ -1007,6 +1355,7 @@ impl DynAomiTool for RenewWorldLoans {
             token_ids,
             max_hours_remaining: args.within_hours,
         })?;
+        app.refresh_after_trade(&ctx, args.account_id, args.wallet_address.as_deref());
         Ok(json!({
             "source": "world-markets-execution",
             "executable": true,
@@ -1035,6 +1384,7 @@ impl DynAomiTool for PayWorldLoanInterest {
             position_id: None,
             extend_period: args.extend_period,
         })?;
+        app.refresh_after_trade(&ctx, args.account_id, args.wallet_address.as_deref());
         Ok(json!({
             "source": "world-markets-execution",
             "executable": true,
@@ -1062,6 +1412,7 @@ impl DynAomiTool for CloseWorldLoan {
             token_ids,
             position_id: numeric_position_id(args.position_id.as_deref()),
         })?;
+        app.refresh_after_trade(&ctx, args.account_id, args.wallet_address.as_deref());
         Ok(json!({
             "source": "world-markets-execution",
             "executable": true,
@@ -1130,8 +1481,7 @@ impl DynAomiTool for GetWorldPnl {
 
     fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
         let access = app.access(args.account_id, args.wallet_address.as_deref(), &ctx)?;
-        let assets = app.client.assets()?;
-        let account = app.client.account(access.account_id, &assets)?;
+        let (_assets, account) = app.live_account(&access)?;
         let pnl = crate::pnl::report(
             &app.client,
             &app.pnl_ledger,
@@ -1159,6 +1509,18 @@ impl DynAomiTool for GetWorldPnl {
 // All numeric arguments are decimal strings so no f64 rounding enters a receipt.
 // Every result carries `source` and `executable: false`.
 // ============================================================================
+
+fn attach_rpc_trace(client: &WorldClient, before: crate::rpc::RpcStats, value: &mut Value) {
+    if !crate::rpc::trace_enabled() {
+        return;
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "rpc".to_string(),
+            json!(client.rpc_stats().saturating_sub(&before)),
+        );
+    }
+}
 
 /// Parse a decimal string tool argument, surfacing a clear error to the model.
 fn report_decimal(value: &str, field: &'static str) -> Result<Decimal, String> {
@@ -1595,6 +1957,341 @@ impl DynAomiTool for ClearMarketCharts {
     }
 }
 
+pub(crate) struct GetWorldResearch;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct GetWorldResearchArgs {
+    /// Base asset symbol (e.g. WETH). Resolved via list_world_assets when unfamiliar.
+    pub(crate) base_symbol: String,
+    /// Lookback window: 1d (default), 1w, or 1m.
+    #[serde(default)]
+    pub(crate) lookback: Option<String>,
+    /// Product type: spot, perp (default), or lend.
+    #[serde(default)]
+    pub(crate) product: Option<String>,
+    /// Quote asset. Defaults to USDT.
+    #[serde(default)]
+    pub(crate) quote_symbol: Option<String>,
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    #[serde(default)]
+    pub(crate) wallet_address: Option<String>,
+}
+
+impl DynAomiTool for GetWorldResearch {
+    type App = WorldMarketsApp;
+    type Args = GetWorldResearchArgs;
+    const NAME: &'static str = "get_world_research";
+    const DESCRIPTION: &'static str = "Research a World market move: live mark, stored window change, cited news, and mandate-gated action-door data. Never predicts. Never executes.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let assets = app.client.assets()?;
+        let lookback = args.lookback.as_deref().unwrap_or("1d");
+        let product = args.product.as_deref().unwrap_or("perp");
+        let quote = args.quote_symbol.as_deref().unwrap_or("USDT");
+        let inspected = app
+            .inspect_account(args.account_id, args.wallet_address.as_deref(), &ctx)
+            .ok();
+        let account = inspected.as_ref().map(|(_, account, _)| account.clone());
+        let portfolio_now = inspected.as_ref().map(|(payload, _, _)| {
+            json!({
+                "rapv": payload.pointer("/account/risk_adjusted_portfolio_value"),
+                "liquidation_risk": payload.pointer("/metrics/liquidation_risk"),
+                "source": "get_world_account",
+            })
+        });
+        let mandate = Mandate::bound(ctx.attribute_path(&["handover_mandate"])).ok();
+        crate::research::compose(
+            &app.client,
+            &app.brain,
+            &args.base_symbol,
+            lookback,
+            product,
+            quote,
+            account.as_ref(),
+            mandate.as_ref(),
+            &assets,
+            portfolio_now.as_ref(),
+        )
+    }
+}
+
+pub(crate) struct GetWorldTasks;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct GetWorldTasksArgs {
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    /// Expected owner wallet. Authorization still uses the acting wallet.
+    #[serde(default)]
+    pub(crate) wallet_address: Option<String>,
+}
+
+impl DynAomiTool for GetWorldTasks {
+    type App = WorldMarketsApp;
+    type Args = GetWorldTasksArgs;
+    const NAME: &'static str = "get_world_tasks";
+    const DESCRIPTION: &'static str = "List watches, unsigned preferences, and signed on-chain policies. Policies are read-only from chat. Never executes.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        app.note_activity(&ctx, args.account_id);
+        let _owner = args.wallet_address.as_deref();
+        let account_id = WorldMarketsApp::account_id(&ctx, args.account_id);
+        let mandate = Mandate::bound(ctx.attribute_path(&["handover_mandate"]));
+        let brief = WorldMarketsApp::brief(&ctx);
+        Ok(crate::tasks::compose(
+            &app.brain,
+            account_id,
+            mandate,
+            brief.as_ref(),
+        ))
+    }
+}
+
+pub(crate) struct SetWorldWatch;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct SetWorldWatchArgs {
+    /// User's original phrasing of the trigger.
+    pub(crate) phrase: String,
+    /// Asset symbol to watch (e.g. WETH).
+    pub(crate) symbol: String,
+    /// once (default) or repeats.
+    #[serde(default)]
+    pub(crate) fire_mode: Option<String>,
+    /// Ledger instruction id from a mini-app compose, when confirming the same row.
+    #[serde(default)]
+    pub(crate) instruction_id: Option<String>,
+    /// Correlation id from mini-app sendData.
+    #[serde(default)]
+    pub(crate) correlation_id: Option<String>,
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub(crate) wallet_address: Option<String>,
+}
+
+impl DynAomiTool for SetWorldWatch {
+    type App = WorldMarketsApp;
+    type Args = SetWorldWatchArgs;
+    const NAME: &'static str = "set_world_watch";
+    const DESCRIPTION: &'static str = "Store an exact, tool-checkable watch. Vague triggers return a clarifying question and store nothing. Send `message` and `controls` verbatim. A watch messages; it never trades.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let account_id = WorldMarketsApp::account_id(&ctx, args.account_id)
+            .ok_or_else(|| "[world-markets] account_id is required to set a watch".to_string())?;
+        let _owner = args.wallet_address.as_deref();
+        let assets = app.client.assets().unwrap_or_default();
+        let token_id = asset_by_symbol(&assets, &args.symbol)
+            .ok()
+            .map(|a| a.token_id);
+        let mark_at_set = token_id.and_then(|id| app.client.mark_price(id).ok().map(|(_, m)| m));
+        if let Some(mark) = mark_at_set.as_ref()
+            && let Some(id) = token_id
+        {
+            let _ = app.brain.ingest(&json!({
+                "symbol": args.symbol,
+                "token_id": id,
+                "mark": mark,
+            }));
+        }
+        let result = app.brain.set_watch(&json!({
+            "account_id": account_id,
+            "phrase": args.phrase,
+            "symbol": args.symbol,
+            "token_id": token_id,
+            "fire_mode": args.fire_mode,
+            "mark_at_set": mark_at_set,
+            "instruction_id": args.instruction_id,
+            "correlation_id": args.correlation_id,
+        }))?;
+        Ok(json!({
+            "source": "world-markets-brain",
+            "executable": false,
+            "result": result,
+            "message": result.get("message"),
+            "controls": result.get("controls"),
+            "preview_only": true,
+        }))
+    }
+}
+
+pub(crate) struct SetWorldPreference;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct SetWorldPreferenceArgs {
+    /// Preference text to persist (unsigned, never a policy).
+    pub(crate) text: String,
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+}
+
+impl DynAomiTool for SetWorldPreference {
+    type App = WorldMarketsApp;
+    type Args = SetWorldPreferenceArgs;
+    const NAME: &'static str = "set_world_preference";
+    const DESCRIPTION: &'static str =
+        "Persist an unsigned chat preference. Never a signed policy. Never executes.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let account_id = WorldMarketsApp::account_id(&ctx, args.account_id).ok_or_else(|| {
+            "[world-markets] account_id is required to store a preference".to_string()
+        })?;
+        let result = app.brain.set_preference(&json!({
+            "account_id": account_id,
+            "text": args.text,
+        }))?;
+        Ok(json!({
+            "source": "world-markets-brain",
+            "executable": false,
+            "on_chain": false,
+            "result": result,
+        }))
+    }
+}
+
+pub(crate) struct CancelWorldTask;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct CancelWorldTaskArgs {
+    /// watch, preference, or policy. Policy is always blocked.
+    pub(crate) kind: String,
+    /// Item id from get_world_tasks.
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+}
+
+impl DynAomiTool for CancelWorldTask {
+    type App = WorldMarketsApp;
+    type Args = CancelWorldTaskArgs;
+    const NAME: &'static str = "cancel_world_task";
+    const DESCRIPTION: &'static str =
+        "Cancel a watch or preference. Policy edits are blocked — they must be signed on World.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let kind = args.kind.to_ascii_lowercase();
+        if kind == "policy" || kind == "policies" {
+            let mandate =
+                Mandate::bound(ctx.attribute_path(&["handover_mandate"])).map_err(|verdict| {
+                    format!("[world-markets] {}: {}", verdict.rule, verdict.detail)
+                })?;
+            return Ok(crate::tasks::policy_edit_block(&mandate));
+        }
+        let account_id = WorldMarketsApp::account_id(&ctx, args.account_id)
+            .ok_or_else(|| "[world-markets] account_id is required to cancel a task".to_string())?;
+        let result = if kind == "preference" || kind == "preferences" {
+            app.brain.cancel_preference(account_id, &args.id)?
+        } else {
+            app.brain.cancel_watch(account_id, &args.id)?
+        };
+        Ok(json!({
+            "source": "world-markets-brain",
+            "executable": false,
+            "result": result,
+        }))
+    }
+}
+
+pub(crate) struct PauseWorldWatch;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct PauseWorldWatchArgs {
+    /// Instruction id from the ledger (preferred).
+    #[serde(default)]
+    pub(crate) instruction_id: Option<String>,
+    /// Watch id from get_world_tasks, if the instruction id is unknown.
+    #[serde(default)]
+    pub(crate) id: Option<String>,
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+}
+
+impl DynAomiTool for PauseWorldWatch {
+    type App = WorldMarketsApp;
+    type Args = PauseWorldWatchArgs;
+    const NAME: &'static str = "pause_world_watch";
+    const DESCRIPTION: &'static str = "Pause a confirmed watch after the user signed the thread confirm. Never call from the Mini App. A paused watch does not check. Never executes.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let account_id = WorldMarketsApp::account_id(&ctx, args.account_id)
+            .ok_or_else(|| "[world-markets] account_id is required to pause a watch".to_string())?;
+        let result = app.brain.pause_watch(
+            account_id,
+            args.id.as_deref(),
+            args.instruction_id.as_deref(),
+        )?;
+        Ok(json!({
+            "source": "world-markets-brain",
+            "executable": false,
+            "result": result,
+        }))
+    }
+}
+
+pub(crate) struct ResumeWorldWatch;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct ResumeWorldWatchArgs {
+    #[serde(default)]
+    pub(crate) instruction_id: Option<String>,
+    #[serde(default)]
+    pub(crate) id: Option<String>,
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+}
+
+impl DynAomiTool for ResumeWorldWatch {
+    type App = WorldMarketsApp;
+    type Args = ResumeWorldWatchArgs;
+    const NAME: &'static str = "resume_world_watch";
+    const DESCRIPTION: &'static str = "Resume a paused watch after the user signed the thread confirm. Never call from the Mini App. Never executes.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let account_id = WorldMarketsApp::account_id(&ctx, args.account_id).ok_or_else(|| {
+            "[world-markets] account_id is required to resume a watch".to_string()
+        })?;
+        let result = app.brain.resume_watch(
+            account_id,
+            args.id.as_deref(),
+            args.instruction_id.as_deref(),
+        )?;
+        Ok(json!({
+            "source": "world-markets-brain",
+            "executable": false,
+            "result": result,
+        }))
+    }
+}
+
+pub(crate) struct DrainWorldOutbound;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct DrainWorldOutboundArgs {
+    /// Max messages to drain (default 50).
+    #[serde(default)]
+    pub(crate) limit: Option<u32>,
+}
+
+impl DynAomiTool for DrainWorldOutbound {
+    type App = WorldMarketsApp;
+    type Args = DrainWorldOutboundArgs;
+    const NAME: &'static str = "drain_world_outbound";
+    const DESCRIPTION: &'static str = "Host drain of solicited watch messages. Send each item's `message` verbatim. Separate from the weekly digest budget. Never executes.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, _ctx: DynToolCallCtx) -> Result<Value, String> {
+        let items = app.brain.drain_outbound(args.limit.unwrap_or(50))?;
+        Ok(json!({
+            "source": "world-markets-brain",
+            "executable": false,
+            "channel": "watch",
+            "counts_against_weekly_digest": false,
+            "result": items,
+        }))
+    }
+}
+
 fn value_u64(value: Option<&Value>) -> Option<u64> {
     value.and_then(|value| {
         value.as_u64().or_else(|| {
@@ -1935,6 +2632,312 @@ mod tests {
             state_attributes: Default::default(),
             secrets: Default::default(),
         }
+    }
+
+    #[test]
+    fn render_lookup_unmatched_does_not_skip_llm() {
+        let app = WorldMarketsApp::default();
+        let value = RenderLookup::run(
+            &app,
+            RenderLookupArgs {
+                text: Some("how am I doing?".into()),
+                token: None,
+                account_id: None,
+                wallet_address: None,
+            },
+            empty_ctx("render_lookup"),
+        )
+        .unwrap();
+        assert_eq!(value["matched"], false);
+        assert_eq!(value["skip_llm"], false);
+        assert_eq!(value["executable"], false);
+        assert!(value.get("message").is_none());
+        assert!(
+            app.warmer.never_refreshed(),
+            "unit tests must not block on a live prefetch"
+        );
+    }
+
+    #[test]
+    fn render_lookup_falls_through_invalid_token_to_text() {
+        let app = WorldMarketsApp::default();
+        let value = RenderLookup::run(
+            &app,
+            RenderLookupArgs {
+                text: Some("?".into()),
+                token: Some("nope".into()),
+                account_id: None,
+                wallet_address: None,
+            },
+            empty_ctx("render_lookup"),
+        )
+        .unwrap();
+        assert_eq!(value["token"], "index");
+        assert_eq!(value["skip_llm"], true);
+    }
+
+    #[test]
+    fn render_lookup_index_and_dollarpower_skip_llm_without_account() {
+        let app = WorldMarketsApp::default();
+        let index = RenderLookup::run(
+            &app,
+            RenderLookupArgs {
+                text: Some("?".into()),
+                token: None,
+                account_id: None,
+                wallet_address: None,
+            },
+            empty_ctx("render_lookup"),
+        )
+        .unwrap();
+        assert_eq!(index["matched"], true);
+        assert_eq!(index["skip_llm"], true);
+        assert_eq!(index["reply_verbatim"], true);
+        assert_eq!(index["token"], "index");
+        assert_eq!(index["message"], crate::lookups::INDEX_LINE);
+
+        let dp = RenderLookup::run(
+            &app,
+            RenderLookupArgs {
+                text: None,
+                token: Some("d".into()),
+                account_id: None,
+                wallet_address: None,
+            },
+            empty_ctx("render_lookup"),
+        )
+        .unwrap();
+        assert_eq!(dp["token"], "d");
+        assert_eq!(dp["skip_llm"], true);
+        let line = dp["message"].as_str().unwrap();
+        assert!(line.starts_with("Dollarpower `"));
+        assert!(line.contains("is doing the work of"));
+
+        let available = RenderLookup::run(
+            &app,
+            RenderLookupArgs {
+                text: Some("/a".into()),
+                token: None,
+                account_id: None,
+                wallet_address: None,
+            },
+            empty_ctx("render_lookup"),
+        )
+        .unwrap();
+        assert_eq!(available["message"], crate::lookups::AVAILABLE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn render_lookup_prefers_explicit_token_over_unmatched_text() {
+        let app = WorldMarketsApp::default();
+        let value = RenderLookup::run(
+            &app,
+            RenderLookupArgs {
+                text: Some("what's my balance?".into()),
+                token: Some("index".into()),
+                account_id: None,
+                wallet_address: None,
+            },
+            empty_ctx("render_lookup"),
+        )
+        .unwrap();
+        assert_eq!(value["token"], "index");
+        assert_eq!(value["skip_llm"], true);
+        assert_eq!(value["message"], crate::lookups::INDEX_LINE);
+    }
+
+    #[test]
+    fn render_lookup_local_path_is_far_under_500ms() {
+        use std::time::Instant;
+        let app = WorldMarketsApp::default();
+        let start = Instant::now();
+        for text in ["?", "commands", "d", "/a", "how am I doing?"] {
+            let value = RenderLookup::run(
+                &app,
+                RenderLookupArgs {
+                    text: Some(text.into()),
+                    token: None,
+                    account_id: None,
+                    wallet_address: None,
+                },
+                empty_ctx("render_lookup"),
+            )
+            .unwrap();
+            if text == "how am I doing?" {
+                assert_eq!(value["skip_llm"], false);
+            } else {
+                assert_eq!(value["skip_llm"], true, "{text}");
+            }
+        }
+        let elapsed = start.elapsed();
+        println!("local render_lookup loop {elapsed:?}");
+        assert!(
+            elapsed.as_millis() < 50,
+            "CPU-only lookups must be << 500ms, took {elapsed:?}"
+        );
+    }
+
+    fn lookup_args(text: &str, account_id: Option<u64>) -> RenderLookupArgs {
+        RenderLookupArgs {
+            text: Some(text.into()),
+            token: None,
+            account_id,
+            wallet_address: None,
+        }
+    }
+
+    fn restore_account_id(previous: Option<String>) {
+        match previous {
+            Some(value) => unsafe { std::env::set_var("WORLD_ACCOUNT_ID", value) },
+            None => unsafe { std::env::remove_var("WORLD_ACCOUNT_ID") },
+        }
+    }
+
+    #[test]
+    #[ignore = "requires live UniFi RPC"]
+    fn live_lookup_warm_path_meets_500ms_plugin_budget() {
+        use std::time::Instant;
+
+        let previous = std::env::var("WORLD_ACCOUNT_ID").ok();
+        let app = WorldMarketsApp::default();
+        let account_id = WorldMarketsApp::account_id_from_env()
+            .or_else(|| app.client.latest_account_id().ok())
+            .expect("need WORLD_ACCOUNT_ID or a live latest account");
+        unsafe {
+            std::env::set_var("WORLD_ACCOUNT_ID", account_id.to_string());
+        }
+
+        let cold_app = WorldMarketsApp::default();
+        let before_cold = cold_app.client.rpc_stats();
+        let t_cold = Instant::now();
+        let cold_b = RenderLookup::run(
+            &cold_app,
+            lookup_args("b", Some(account_id)),
+            empty_ctx("render_lookup"),
+        );
+        let cold_ms = t_cold.elapsed();
+        let cold_rpc = cold_app.client.rpc_stats().saturating_sub(&before_cold);
+        match &cold_b {
+            Ok(value) => println!(
+                "cold render_lookup \"b\" {cold_ms:?} posts={} hits={} misses={} post_ms={} message={}",
+                cold_rpc.posts,
+                cold_rpc.hits,
+                cold_rpc.misses,
+                cold_rpc.post_ms,
+                value["message"].as_str().unwrap_or("")
+            ),
+            Err(err) => {
+                restore_account_id(previous);
+                panic!("cold render_lookup b failed: {err}");
+            }
+        }
+
+        let before = app.client.rpc_stats();
+        let t0 = Instant::now();
+        let warmed = WarmAccount::run(
+            &app,
+            WarmAccountArgs {
+                account_id: Some(account_id),
+                wallet_address: None,
+            },
+            empty_ctx("warm_account"),
+        );
+        let warm_ms = t0.elapsed();
+        let warm_rpc = app.client.rpc_stats().saturating_sub(&before);
+        let warmed = match warmed {
+            Ok(value) => value,
+            Err(err) => {
+                restore_account_id(previous);
+                panic!("warm_account failed: {err}");
+            }
+        };
+        assert_eq!(warmed["warmed"], true);
+        assert_eq!(warmed["account_id"], account_id);
+        println!(
+            "warm_account {warm_ms:?} posts={} hits={} misses={} post_ms={}",
+            warm_rpc.posts, warm_rpc.hits, warm_rpc.misses, warm_rpc.post_ms
+        );
+
+        let mut failures = Vec::new();
+        for text in ["b", "p", "r", "d", "a", "?"] {
+            let before = app.client.rpc_stats();
+            let t = Instant::now();
+            let result = RenderLookup::run(
+                &app,
+                lookup_args(text, Some(account_id)),
+                empty_ctx("render_lookup"),
+            );
+            let elapsed = t.elapsed();
+            let rpc = app.client.rpc_stats().saturating_sub(&before);
+            let result = match result {
+                Ok(value) => value,
+                Err(err) => {
+                    failures.push(format!("{text}: {err}"));
+                    continue;
+                }
+            };
+            let message = result["message"].as_str().unwrap_or("");
+            println!(
+                "render_lookup {text:?} {elapsed:?} posts={} hits={} misses={} post_ms={} message={message}",
+                rpc.posts, rpc.hits, rpc.misses, rpc.post_ms
+            );
+            if result["skip_llm"] != true {
+                failures.push(format!("{text}: skip_llm was not true"));
+            }
+            if matches!(text, "b" | "p" | "r") && rpc.posts != 0 {
+                failures.push(format!(
+                    "{text}: expected 0 RPC posts after warm, got {}",
+                    rpc.posts
+                ));
+            }
+            if elapsed.as_millis() >= 500 {
+                failures.push(format!(
+                    "{text}: plugin path {elapsed:?} exceeded 500ms budget"
+                ));
+            }
+            match text {
+                "b" => {
+                    if !message.starts_with("Portfolio `") {
+                        failures.push(format!("b: bad message {message}"));
+                    }
+                }
+                "r" => {
+                    if !message.contains("liquidation risk")
+                        && !message.contains("Liquidation risk")
+                    {
+                        failures.push(format!("r: bad message {message}"));
+                    }
+                }
+                "d" => {
+                    if !message.starts_with("Dollarpower `") {
+                        failures.push(format!("d: bad message {message}"));
+                    }
+                }
+                "a" => {
+                    if message != crate::lookups::AVAILABLE_UNAVAILABLE {
+                        failures.push(format!("a: bad message {message}"));
+                    }
+                }
+                "?" => {
+                    if message != crate::lookups::INDEX_LINE {
+                        failures.push(format!("?: bad message {message}"));
+                    }
+                }
+                "p" => {
+                    if message.is_empty() {
+                        failures.push("p: empty message".into());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        restore_account_id(previous);
+        assert!(
+            failures.is_empty(),
+            "live lookup timing failures:\n{}",
+            failures.join("\n")
+        );
     }
 
     // Task 2.1: a zero-edge slice through the TOOL returns the $0 null case,

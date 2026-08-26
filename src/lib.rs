@@ -1,5 +1,6 @@
 use aomi_sdk::*;
 
+mod brain;
 mod carry;
 mod chart;
 mod client;
@@ -15,7 +16,11 @@ mod pnl;
 mod preamble;
 mod rates;
 mod reporting;
+mod research;
+mod rpc;
+mod tasks;
 mod tool;
+mod warm;
 
 dyn_aomi_app!(
     app = tool::WorldMarketsApp,
@@ -25,6 +30,10 @@ dyn_aomi_app!(
     tools = [
         tool::ListWorldAssets,
         tool::GetWorldAccount,
+        tool::RenderLookup,
+        tool::WarmAccount,
+        tool::GetHealthSnapshot,
+        tool::GetStrategySnapshot,
         tool::GetWorldMarket,
         tool::GetWorldRates,
         tool::GetWorldLoans,
@@ -52,6 +61,14 @@ dyn_aomi_app!(
         tool::RenderMarketChart,
         tool::RefreshMarketUniverse,
         tool::ClearMarketCharts,
+        tool::GetWorldResearch,
+        tool::GetWorldTasks,
+        tool::SetWorldWatch,
+        tool::SetWorldPreference,
+        tool::CancelWorldTask,
+        tool::PauseWorldWatch,
+        tool::ResumeWorldWatch,
+        tool::DrainWorldOutbound,
     ],
     secrets = [tool::MARKET_DATA_API_KEY],
     namespaces = ["evm-core"],

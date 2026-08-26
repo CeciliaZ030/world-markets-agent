@@ -9,6 +9,10 @@ Live contract reads and execution (mandate-aware):
 
 - `list_world_assets`
 - `get_world_account`
+- `render_lookup`
+- `warm_account`
+- `get_health_snapshot`
+- `get_strategy_snapshot`
 - `get_world_market`
 - `get_world_rates`
 - `get_world_loans`
@@ -20,6 +24,12 @@ Live contract reads and execution (mandate-aware):
 - `renew_world_loans`
 - `get_world_agent_permission`
 - `get_world_open_orders`
+- `get_world_research`
+- `get_world_tasks`
+- `set_world_watch`
+- `set_world_preference`
+- `cancel_world_task`
+- `drain_world_outbound`
 
 Reporting-service tools (the honest-numbers layer — deterministic derived figures
 so the message layer never authors a number; see `src/skill/` and the
@@ -36,8 +46,9 @@ so the message layer never authors a number; see `src/skill/` and the
 
 Version 0.4 is mandate-aware. Local `aomi-run` can place, cancel, swap, and
 extend loans through a Node sidecar (`sidecar/`) that holds `WORLD_PRIVATE_KEY`
-and calls `@wcm-inc/sdk`. The Rust plugin never sees the key. Hosted Aomi
-signing is not in this release.
+and calls `@wcm-inc/sdk`. Research, watches, and preferences go through a
+second unsigned sidecar (`brain/`) that holds no key. The Rust plugin never
+sees the key. Hosted Aomi signing is not in this release.
 
 The mandate still fail-closes without a bound policy document. Post-trade RAPV is
 derived from ATLAS `evaluate` at unit risk, anchored to the live contract RAPV,
@@ -85,10 +96,30 @@ tools can submit.
 
 Smoke prompts:
 
-- `b` → one line: `Portfolio [#].` (calls `get_world_account`)
+- `b` → one line: `Portfolio [#].` (`render_lookup`; hosted Aomi should skip the LLM — see below)
 - "What can't you do?" → §6.1 incapacity message (no numbers)
-- "How am I doing?" → multi-line health card via `get_world_account` /
-  `get_world_pnl` / `get_dollarpower`
+- "How am I doing?" → health card via `get_health_snapshot`
+  (`get_world_account` / `get_world_pnl` / `get_dollarpower` in one call)
+
+### Fast lookups (host contract)
+
+Terse tokens (`b`/`p`/`r`/`a`/`d`, their word forms, `?` / commands / shortcuts) can
+answer in ~500ms only if the host **does not call the LLM**.
+
+1. On **every user message**, call `render_lookup` with `text` set to the whole message
+   (including greetings and health questions). Unmatched text still prefetches the account
+   so a later `b`/`p`/`r` is a cache hit.
+2. If `skip_llm` is true, send `message` verbatim and stop.
+3. Otherwise run the normal LLM loop (`how am I doing?`, previews, trades).
+
+The plugin keeps that cache warm: it refreshes every 60 seconds while the session is
+active (activity in the last 3 minutes) and rebuilds immediately after a successful
+trade, cancel, swap, or loan action. `warm_account` remains available if the host
+wants an explicit prefetch.
+
+`aomi-run` does not intercept; the model should still call `render_lookup` and paste
+`message`. Natural-language lookups ("what's my balance?") stay on the LLM path and
+may pass `token` (`b`/`p`/`r`/`a`/`d`) into `render_lookup`.
 
 PnL persistence (until Aomi host storage is agreed): realized and closed-position
 figures are written under `WORLD_PNL_DIR`, else

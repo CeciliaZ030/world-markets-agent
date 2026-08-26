@@ -1,14 +1,66 @@
-/* global Telegram, LightweightCharts */
+/* global Telegram, LightweightCharts, COPY, fillCopy */
 const tg = window.Telegram && window.Telegram.WebApp;
+const reduceMotion =
+  window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const C = COPY;
+/* copy.js already exports global `fill`; use fillCopy to avoid a duplicate binding. */
+
 if (tg) {
-  tg.ready();
-  tg.expand();
+  try {
+    tg.ready();
+    if (typeof tg.expand === "function" && tg.isExpanded) {
+      if (typeof tg.disableVerticalSwipes === "function") tg.disableVerticalSwipes();
+    }
+    if (typeof tg.onEvent === "function") {
+      tg.onEvent("viewportChanged", () => {
+        if (tg.isExpanded && typeof tg.disableVerticalSwipes === "function") {
+          try {
+            tg.disableVerticalSwipes();
+          } catch (_) {
+            /* ignore */
+          }
+        }
+        const was = state.compact;
+        state.compact = !tg.isExpanded;
+        if (was !== state.compact && state.view === "main") paint();
+      });
+    }
+  } catch (_) {
+    /* WebView without a live Telegram host */
+  }
 }
 
 const app = document.getElementById("app");
 let sessionToken = "";
 let chartHandle = null;
 let candleSeries = null;
+let pollTimer = null;
+let ageTimer = null;
+let toastTimer = null;
+let suppressClickUntil = 0;
+
+const state = {
+  view: "main",
+  tab: "ledger",
+  sheet: null,
+  detent: "half",
+  openSwipe: "",
+  search: "",
+  earlierOpen: false,
+  compose: null,
+  sent: null,
+  blocked: null,
+  toast: null,
+  compact: true,
+  riskOpen: false,
+  flags: { primary_view: "ledger", jobline_negative: false, family: "blue" },
+  portfolio: null,
+  ledger: [],
+  summary: { holding: 0, needs_you: 0, last_check_at: null },
+  ledgerStatus: "loading",
+  pending: {},
+  optimistic: [],
+};
 
 function haptic(kind, arg) {
   const h = tg && tg.HapticFeedback;
@@ -17,12 +69,9 @@ function haptic(kind, arg) {
     if (kind === "impact") h.impactOccurred(arg || "light");
     else if (kind === "notify") h.notificationOccurred(arg);
     else if (kind === "select") h.selectionChanged();
-  } catch (_) { /* WebView without haptics */ }
-}
-
-function closeChat() {
-  haptic("impact", "light");
-  if (tg && typeof tg.close === "function") tg.close();
+  } catch (_) {
+    /* no haptics */
+  }
 }
 
 function escapeHtml(s) {
@@ -33,7 +82,6 @@ function escapeHtml(s) {
     .replace(/"/g, "&quot;");
 }
 
-/** Presentation only: group the integer part of an API decimal string. */
 function usd(raw) {
   if (raw == null || raw === "") return "—";
   const negative = String(raw).charAt(0) === "-";
@@ -45,264 +93,1396 @@ function usd(raw) {
   return (negative ? "−" : "") + "$" + shown;
 }
 
-function dash(v) {
-  return v == null || v === "" ? "—" : v;
+function newId() {
+  if (crypto && crypto.randomUUID) return crypto.randomUUID();
+  return "c-" + Date.now() + "-" + Math.random().toString(16).slice(2, 8);
 }
 
-function topbar(titleHtml) {
-  return `<header class="topbar"><button type="button" class="exit" id="exit" aria-label="Close">×</button><div class="topbar-main">${titleHtml}</div></header>`;
+function nowSecs() {
+  return Math.floor(Date.now() / 1000);
 }
 
-function bindExit() {
-  const exit = document.getElementById("exit");
-  if (exit) exit.addEventListener("click", closeChat);
+function fmtDate(unix) {
+  if (!unix) return "—";
+  const d = new Date(Number(unix) * 1000);
+  const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  return months[d.getUTCMonth()] + " " + d.getUTCDate();
 }
 
-function bindRetry(handler) {
-  bindExit();
-  const retry = document.getElementById("retry");
-  if (retry) retry.addEventListener("click", handler);
-}
-
-function retryBlock() {
-  return `<div class="actions"><button type="button" id="retry">Retry</button></div>`;
-}
-
-function renderLoading() {
-  document.body.className = "";
-  app.innerHTML = `
-    ${topbar("<h1>Portfolio</h1>")}
-    <p class="muted">Loading...</p>
-    <div class="skel"></div>
-    <div class="skel" style="width:72%"></div>
-    <div class="skel" style="width:88%"></div>
-  `;
-  bindExit();
-}
-
-function renderError() {
-  haptic("notify", "error");
-  document.body.className = "";
-  app.innerHTML = `
-    ${topbar('<h1 class="error">Portfolio</h1>')}
-    <div class="center">
-      <p>Could not load portfolio</p>
-      <p class="sub">Try again or check back later.</p>
-    </div>
-    ${retryBlock()}
-  `;
-  bindRetry(() => boot());
-}
-
-function renderUnauthorized() {
-  document.body.className = "";
-  app.innerHTML = `
-    ${topbar("<h1>Portfolio</h1>")}
-    <div class="center">
-      <p>Session expired. Open from the bot again.</p>
-    </div>
-  `;
-  bindExit();
-}
-
-function renderEmpty() {
-  haptic("impact", "light");
-  document.body.className = "";
-  app.innerHTML = `
-    ${topbar("<h1>Portfolio</h1>")}
-    <div class="center">
-      <p>No open positions.</p>
-      <p class="sub">Your portfolio is empty.</p>
-    </div>
-  `;
-  bindExit();
-}
-
-function changeCell(p) {
-  if (p.change_24h_pct == null) return `<td class="chg num">—</td>`;
-  const dir = p.change_direction;
-  const cls = dir === "up" ? "up" : dir === "down" ? "down" : "";
-  const mark = dir === "up" ? "▲ " : dir === "down" ? "▼ " : "";
-  return `<td class="chg num ${cls}">${mark}${escapeHtml(p.change_24h_pct)}%</td>`;
-}
-
-function renderLoaded(data) {
-  haptic("impact", "light");
-  document.body.className = "";
-  const est = data.dollarpower && data.dollarpower.is_estimate;
-  const approx = est ? "≈ " : "";
-  const dp = data.dollarpower;
-  const risk = data.risk;
-  const fill = dp && dp.fill_pct != null ? dp.fill_pct : "0";
-  const ratio = Number(dp && dp.ratio);
-  if (Number.isFinite(ratio) && ratio < 2) haptic("notify", "warning");
-
-  const rows = (data.positions || [])
-    .map(
-      (p) => `
-      <tr class="pos">
-        <td class="sym">${escapeHtml(p.symbol)}</td>
-        <td class="qty num">${escapeHtml(p.quantity)}</td>
-        <td class="usd num">${usd(p.usd_value)}</td>
-        ${changeCell(p)}
-        <td class="lev num">${p.leverage == null ? "—" : escapeHtml(p.leverage) + "×"}</td>
-      </tr>`
-    )
-    .join("");
-
-  const headerChg =
-    data.total_change_24h_pct == null
-      ? "—"
-      : (Number(data.total_change_24h_pct) < 0 ? "▼ " : "▲ ") +
-        escapeHtml(data.total_change_24h_pct) +
-        "%";
-
-  const score = risk && risk.liquidation_score;
-  const distance =
-    score != null && score < 9 && risk.distance_from_floor_pct != null
-      ? `<div class="distance num">Liquidation distance: ${escapeHtml(
-          risk.distance_from_floor_pct
-        )}% from floor</div>`
-      : score != null && score >= 9
-        ? `<div class="distance high">Near liquidation.</div>`
-        : "";
-
-  const riskEst = risk && risk.is_estimate ? "≈ " : "";
-
-  app.innerHTML = `
-    ${topbar("<h1>Portfolio</h1>")}
-    <div class="pos-head"><span>Positions</span><span class="num">${headerChg}</span></div>
-    <table><tbody>${rows}</tbody></table>
-    <section class="block">
-      <div class="label">Dollarpower</div>
-      <div class="dp-top">
-        <div class="bar"><span style="width:${escapeHtml(fill)}%"></span></div>
-        <span class="dp-ratio num">${approx}${escapeHtml(dp.ratio)}×</span>
-      </div>
-      <div class="dp-dollars num">${approx}${usd(dp.equivalent_usd)} eq. / ${approx}${usd(dp.committed_usd)} committed</div>
-    </section>
-    <section class="block">
-      <div class="label">Risk</div>
-      <div class="risk-row">
-        <span class="dot ${escapeHtml(risk.band)}"></span>
-        <span class="${escapeHtml(risk.band)}">${riskEst}${escapeHtml(risk.band)}</span>
-      </div>
-      ${distance}
-    </section>
-  `;
-  bindExit();
-  app.querySelectorAll("tr.pos").forEach((row) => {
-    row.addEventListener("click", () => haptic("select"));
-  });
-}
-
-/** Localhost layout fixture only. Live numbers never come from this object. */
-const PREVIEW_LOADED = {
-  positions: [
-    {
-      symbol: "ETH",
-      quantity: "2.35",
-      usd_value: "8432.50",
-      change_24h_pct: "3.1",
-      leverage: "1.2",
-      change_direction: "up",
-      asset_type: "spot",
-    },
-    {
-      symbol: "USDC",
-      quantity: "12800",
-      usd_value: "12800.00",
-      change_24h_pct: null,
-      leverage: null,
-      change_direction: null,
-      asset_type: "spot",
-    },
-    {
-      symbol: "wstETH",
-      quantity: "4.0",
-      usd_value: "6100.00",
-      change_24h_pct: "0.8",
-      leverage: "1.0",
-      change_direction: "up",
-      asset_type: "spot",
-    },
-  ],
-  dollarpower: {
-    ratio: "6.8",
-    equivalent_usd: "43100.00",
-    committed_usd: "6338.00",
-    fill_pct: "15",
-    is_estimate: false,
-  },
-  risk: {
-    liquidation_score: 3,
-    band: "safe",
-    distance_from_floor_pct: "47",
-    is_estimate: false,
-  },
-  total_usd_value: "27332.50",
-  total_change_24h_pct: "1.8",
-};
-
-function previewCandles() {
-  const out = [];
-  let p = 100;
-  const end = Math.floor(Date.now() / 1000);
-  for (let i = 0; i < 48; i++) {
-    const o = p;
-    const c = o * (1 + Math.sin(i / 6) * 0.01 + (i % 5 === 0 ? -0.012 : 0.006));
-    out.push({
-      t: end - (47 - i) * 300,
-      o,
-      h: Math.max(o, c) * 1.004,
-      l: Math.min(o, c) * 0.996,
-      c,
-    });
-    p = c;
-  }
-  return {
-    symbol: "AAPL",
-    feed_symbol: "AAPL",
-    period: "d",
-    period_label: "1D",
-    bar_label: "5M",
-    source: "preview",
-    candles: out,
-  };
+function relCheck(at) {
+  if (!at) return null;
+  return Math.max(0, nowSecs() - Number(at));
 }
 
 function previewState() {
-  if (location.hostname !== "127.0.0.1" && location.hostname !== "localhost") {
-    return null;
-  }
+  if (location.hostname !== "127.0.0.1" && location.hostname !== "localhost") return null;
   return new URLSearchParams(location.search).get("preview");
 }
 
-function parseStartapp(raw) {
+function startParam() {
+  return (
+    (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) ||
+    new URLSearchParams(location.search).get("startapp") ||
+    ""
+  );
+}
+
+function parseChartStart(raw) {
   const m = String(raw || "").trim().match(/^(.+)_([dwm])$/i);
   if (!m) return null;
   return { symbol: m[1], period: m[2].toLowerCase() };
+}
+
+function instructionStart(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return null;
+  if (parseChartStart(s)) return null;
+  if (s.startsWith("i_")) return s.slice(2);
+  return s;
+}
+
+function heldCount() {
+  return instructions().filter((row) =>
+    ["with_aomi", "watching", "triggered", "awaiting_confirm", "executing", "paused"].includes(
+      row.status,
+    ),
+  ).length;
+}
+
+function instructions() {
+  const seen = new Set();
+  const out = [];
+  for (const row of state.optimistic.concat(state.ledger)) {
+    if (seen.has(row.instruction_id)) continue;
+    seen.add(row.instruction_id);
+    out.push(row);
+  }
+  return out;
+}
+
+function zoneOf(row) {
+  if (row.status === "awaiting_confirm" || row.status === "triggered" || row.status === "with_aomi") {
+    return "needs";
+  }
+  if (row.status === "executing") return "motion";
+  if (row.status === "watching" || row.status === "paused") return "watch";
+  const today = new Date().toISOString().slice(0, 10);
+  const changed = new Date((row.status_changed_at || row.updated_at || 0) * 1000)
+    .toISOString()
+    .slice(0, 10);
+  if (row.status === "done" && changed === today) return "done";
+  return "earlier";
+}
+
+function glyph(row) {
+  if (row.status === "awaiting_confirm" || row.status === "triggered") return { g: "!", cls: "" };
+  if (row.status === "with_aomi") return { g: "›", cls: "" };
+  if (row.status === "executing") return { g: "", spin: true };
+  if (row.status === "paused") return { g: "❚❚", cls: "faint" };
+  if (row.status === "done") return { g: "✓", cls: "pos" };
+  if (row.status === "expired") return { g: "·", cls: "faint" };
+  if (row.fire_kind === "act") return { g: "⏱", cls: "" };
+  return { g: "◎", cls: "" };
+}
+
+function chipClass(status) {
+  if (status === "watching") return "pos";
+  if (status === "paused") return "mute";
+  if (status === "done" || status === "expired") return "faint";
+  if (status === "blocked") return "neg";
+  return "";
+}
+
+function subLine(row) {
+  if (state.pending[row.instruction_id] === "pause") return C.sub.pendingPause;
+  if (state.pending[row.instruction_id] === "resume") return C.sub.pendingResume;
+  if (row.status === "with_aomi") return C.sub.withAomi;
+  if (row.status === "paused") return C.sub.paused;
+  if (row.status === "awaiting_confirm" || row.status === "triggered") {
+    return row.trigger_value
+      ? fillCopy(C.sub.needsYouAt, { value: row.trigger_value })
+      : C.sub.needsYou;
+  }
+  if (row.status === "executing") {
+    return fillCopy(C.sub.executing, {
+      i: row.slice_i || "—",
+      n: row.slice_n || "—",
+      price: row.avg_price || "—",
+    });
+  }
+  if (row.status === "done" && row.receipt) return row.receipt;
+  if (row.status === "expired") return fillCopy(C.sub.expired, { date: fmtDate(row.expires_at) });
+  if (row.status === "watching") {
+    const n = relCheck(row.check_stats && row.check_stats.last_check_at);
+    const stale = n != null && n > 120;
+    if (stale) return fillCopy(C.sub.watchingStale, { n: Math.round(n / 60) });
+    const dist =
+      row.distance && row.distance.mark
+        ? fillCopy(C.sub.watchingDist, { mark: usd(row.distance.mark).replace("$", "$"), pct: row.distance.pct })
+        : "";
+    const body =
+      n != null && n >= 60
+        ? fillCopy(C.sub.watchingSlow, { n: Math.round(n / 60), date: fmtDate(row.expires_at) })
+        : fillCopy(C.sub.watching, { n: n == null ? "—" : n, date: fmtDate(row.expires_at) });
+    return dist + body;
+  }
+  return "";
+}
+
+function heartbeatText() {
+  if (state.ledgerStatus === "loading") return { text: C.heartbeat.loading, dot: "well" };
+  if (state.ledgerStatus === "error") return { text: C.heartbeat.error, dot: "neg" };
+  if (state.ledgerStatus === "stale") return { text: C.heartbeat.stale, dot: "warn" };
+  const held = state.summary.holding || heldCount();
+  const needs = state.summary.needs_you || 0;
+  if (!held) return { text: C.heartbeat.empty, dot: "accent" };
+  const n = relCheck(state.summary.last_check_at);
+  if (needs === 1) return { text: fillCopy(C.heartbeat.holdingNeeds1, { held }), dot: "accent" };
+  if (needs > 1) return { text: fillCopy(C.heartbeat.holdingNeedsN, { held, n: needs }), dot: "accent" };
+  return {
+    text: fillCopy(C.heartbeat.holdingOk, { held, n: n == null ? "—" : n }),
+    dot: "accent",
+  };
+}
+
+function headerHtml(mode) {
+  const back = mode === "root" ? "⌄" : "‹";
+  return `<header class="header">
+    <button type="button" class="header-btn" id="backBtn" aria-label="Back">${back}</button>
+    <div class="header-main">
+      <h1 class="header-title">${escapeHtml(C.header.title)}</h1>
+      <p class="header-sub">${escapeHtml(C.header.subtitle)}</p>
+    </div>
+    <button type="button" class="header-btn" id="moreBtn" aria-label="More">⋯</button>
+  </header>`;
+}
+
+function bottomHtml() {
+  const label = state.sheet || state.view !== "main" ? C.bottom.inner : C.bottom.launch;
+  return `<button type="button" class="bottom-bar" id="bottomBtn">${escapeHtml(label)}</button>`;
+}
+
+function toastHtml() {
+  if (!state.toast) return "";
+  return `<div class="toast">${escapeHtml(state.toast)}</div>`;
+}
+
+function showToast(msg) {
+  state.toast = msg;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    state.toast = null;
+    paint();
+  }, 3200);
+  paint();
+}
+
+function goBack() {
+  haptic("impact", "light");
+  if (state.sheet === "picker") {
+    state.sheet = "position";
+    paint();
+    return;
+  }
+  if (state.sheet) {
+    state.sheet = null;
+    paint();
+    return;
+  }
+  if (state.view !== "main") {
+    state.view = "main";
+    paint();
+    return;
+  }
+  if (tg && typeof tg.close === "function") tg.close();
+}
+
+function bindChrome() {
+  const back = document.getElementById("backBtn");
+  if (back) back.onclick = goBack;
+  const bottom = document.getElementById("bottomBtn");
+  if (bottom) bottom.onclick = goBack;
+  const more = document.getElementById("moreBtn");
+  if (more) more.onclick = () => {};
+  if (tg && tg.BackButton) {
+    if (state.sheet || state.view !== "main") {
+      tg.BackButton.show();
+      tg.BackButton.onClick(goBack);
+    } else {
+      tg.BackButton.hide();
+    }
+  }
+}
+
+function paint() {
+  if (state.view === "compose") return renderCompose();
+  if (state.view === "sent") return renderSent();
+  if (state.view === "blocked") return renderBlocked();
+  renderMain();
+}
+
+function renderMain() {
+  document.body.className = state.sheet ? "locked" : "";
+  const hb = heartbeatText();
+  const held = heldCount();
+  const tab = state.tab;
+  const compact = state.compact && !state.sheet && tab === "ledger";
+  app.innerHTML =
+    headerHtml("root") +
+    `<div class="seg">
+      <button type="button" class="${tab === "ledger" ? "on" : ""}" data-tab="ledger">${escapeHtml(C.header.tabLedger)}<span class="held">${held}</span></button>
+      <button type="button" class="${tab === "portfolio" ? "on" : ""}" data-tab="portfolio">${escapeHtml(C.header.tabPortfolio)}</button>
+    </div>` +
+    (tab === "ledger" ? ledgerHtml(hb, compact) : portfolioHtml(hb)) +
+    (state.sheet ? sheetHtml() : "") +
+    toastHtml() +
+    bottomHtml();
+  bindChrome();
+  app.querySelectorAll("[data-tab]").forEach((btn) => {
+    btn.onclick = () => {
+      haptic("select");
+      state.tab = btn.getAttribute("data-tab");
+      state.openSwipe = "";
+      paint();
+    };
+  });
+  bindLedger();
+  bindPortfolio();
+  bindSheet();
+}
+
+function ledgerHtml(hb, compact) {
+  const p = state.portfolio;
+  const chg = p && p.total_change_24h_pct != null ? Number(p.total_change_24h_pct) : null;
+  const chgCls = chg == null ? "" : chg < 0 ? "down" : "up";
+  const chgTxt = chg == null ? "" : (chg < 0 ? "" : "+") + chg + "%";
+  const risk = p && p.risk ? p.risk.liquidation_score : "—";
+  const free = p && p.dollarpower ? usd(p.dollarpower.committed_usd) : "—";
+  const strip = p
+    ? `<div class="strip" id="strip"><span class="val num">${usd(p.total_usd_value)}</span><span class="chg num ${chgCls}">${escapeHtml(chgTxt)}</span><span class="meta">${escapeHtml(fillCopy(C.strip.riskFree, { risk, free }))}</span><span class="go">${escapeHtml(C.strip.trail)}</span></div>`
+    : "";
+  const rows = instructions();
+  const needs = rows.filter((r) => zoneOf(r) === "needs");
+  const motion = rows.filter((r) => zoneOf(r) === "motion");
+  const watch = rows.filter((r) => zoneOf(r) === "watch");
+  const done = rows.filter((r) => zoneOf(r) === "done");
+  const earlier = rows.filter((r) => zoneOf(r) === "earlier");
+  const paused = watch.filter((r) => r.status === "paused").length;
+  const watchingN = watch.length - paused;
+
+  if (compact) {
+    return (
+      `<div class="launch-label"><span>${escapeHtml(C.launch.label)}</span><span class="num">${new Date().toISOString().slice(11, 16)} UTC</span></div>` +
+      reportLine("!", C.launch.needs, needs) +
+      reportLine("⚙", C.launch.motion, motion) +
+      `<div class="report"><span class="g">◎</span><span>${escapeHtml(
+        fillCopy(C.launch.watching, {
+          n: watchingN,
+          p: paused,
+          list: watch.map((r) => r.sentence).slice(0, 3).join(" · ") || "—",
+        }),
+      )}</span></div>` +
+      reportLine("✓", C.launch.done, done, "pos") +
+      `<div class="heartbeat"><span class="dot ${hb.dot}"></span>${escapeHtml(hb.text)}</div>` +
+      strip +
+      `<p class="teach">${escapeHtml(C.launch.hint)}</p>`
+    );
+  }
+
+  if (state.ledgerStatus === "loading") {
+    return strip + `<div class="heartbeat"><span class="dot well"></span>${escapeHtml(C.heartbeat.loading)}</div><div class="skel"></div><div class="skel" style="width:70%"></div>`;
+  }
+  if (state.ledgerStatus === "error" && !rows.length) {
+    return strip + `<div class="heartbeat"><span class="dot neg"></span>${escapeHtml(C.heartbeat.error)}</div><p class="edge">${escapeHtml(C.errorRow)}</p>`;
+  }
+  if (!rows.length) {
+    return strip + `<div class="heartbeat"><span class="dot ${hb.dot}"></span>${escapeHtml(hb.text)}</div><p class="teach">${escapeHtml(C.emptyTeach)}</p><p class="footer-line">${escapeHtml(C.ledgerFooter)}</p>`;
+  }
+
+  return (
+    strip +
+    `<div class="heartbeat"><span class="dot ${hb.dot}"></span>${escapeHtml(hb.text)}</div>` +
+    zoneBlock("needs", C.zones.needsYou, "lab-accent", needs.length, needs) +
+    zoneBlock("motion", C.zones.inMotion, "lab-accent", motion.length, motion) +
+    zoneBlock(
+      "watch",
+      C.zones.watching,
+      "lab-faint",
+      fillCopy(C.zones.watchingCount, { w: watchingN, p: paused }),
+      watch,
+    ) +
+    zoneBlock("done", C.zones.doneToday, "lab-pos", done.length, done) +
+    (earlier.length
+      ? `<div class="zone-h" id="earlierToggle"><span class="lab lab-faint">${escapeHtml(C.zones.earlier)} ${state.earlierOpen ? "▴" : "▾"}</span><span class="n">${escapeHtml(C.zones.earlierSub)}</span></div>` +
+        (state.earlierOpen ? zoneRows(earlier) : "")
+      : "") +
+    `<p class="footer-line">${escapeHtml(C.ledgerFooter)}</p>`
+  );
+}
+
+function reportLine(g, tmpl, rows, cls) {
+  const what = rows[0] ? rows[0].sentence : "—";
+  const pct = rows[0] && rows[0].progress_pct != null ? rows[0].progress_pct : "—";
+  return `<div class="report"><span class="g ${cls || ""}">${g}</span><span>${escapeHtml(
+    fillCopy(tmpl, { n: rows.length, what, pct, receipts: rows.map((r) => r.receipt || r.sentence).join(", ") }),
+  )}</span></div>`;
+}
+
+function zoneBlock(id, label, labCls, count, rows) {
+  if (!rows.length) return "";
+  return `<div class="zone-h"><span class="lab ${labCls}">${escapeHtml(label)}</span><span class="n">${escapeHtml(String(count))}</span></div>${zoneRows(rows)}`;
+}
+
+function zoneRows(rows) {
+  return rows
+    .map((row, i) => {
+      const g = glyph(row);
+      const swipable =
+        (row.status === "watching" || row.status === "paused") &&
+        !state.pending[row.instruction_id];
+      const meter =
+        row.status === "executing" && row.progress_pct != null
+          ? `<div class="meter"><span style="width:${Number(row.progress_pct)}%"></span></div>`
+          : row.status === "watching" && row.distance && state.ledgerStatus !== "stale"
+            ? `<div class="meter ${row.distance.near ? "warn" : ""}"><span style="width:${row.distance.pct}%"></span></div>`
+            : "";
+      const value =
+        row.status === "executing" && row.progress_pct != null
+          ? `<span class="pct-slot num">${escapeHtml(String(row.progress_pct))}%</span>`
+          : row.display_status
+            ? `<span class="chip ${chipClass(row.status)}">${escapeHtml(row.display_status)}</span>`
+            : "";
+      const open = state.openSwipe === row.instruction_id;
+      const chips = swipable
+        ? `<div class="swipe-under"><button type="button" class="swipe-chip primary" data-act="${row.status === "paused" ? "resume" : "pause"}" data-id="${escapeHtml(row.instruction_id)}">${row.status === "paused" ? "Resume" : "Pause"}</button><button type="button" class="swipe-chip ask" data-act="ask" data-id="${escapeHtml(row.instruction_id)}">Ask</button></div>`
+        : "";
+      return `<div class="row ${i === rows.length - 1 ? "last" : ""}" data-row="${escapeHtml(row.instruction_id)}" data-swipe="${swipable ? "1" : "0"}">
+        ${chips}
+        <div class="row-front" style="${open ? "transform:translateX(-140px)" : ""}">
+          <div class="glyph ${g.cls}">${g.spin ? '<div class="spin"></div>' : escapeHtml(g.g)}</div>
+          <div class="row-body">
+            <div class="title-row"><div class="title">${escapeHtml(row.sentence)}</div>${value}</div>
+            <div class="sub">${escapeHtml(subLine(row))}</div>
+            ${meter}
+          </div>
+          ${swipable ? '<div class="grip"><i></i></div>' : ""}
+        </div>
+      </div>`;
+    })
+    .join("");
+}
+
+function bindLedger() {
+  const strip = document.getElementById("strip");
+  if (strip) {
+    strip.onclick = () => {
+      state.tab = "portfolio";
+      paint();
+    };
+  }
+  const earlier = document.getElementById("earlierToggle");
+  if (earlier) {
+    earlier.onclick = () => {
+      state.earlierOpen = !state.earlierOpen;
+      paint();
+    };
+  }
+  const hint = app.querySelector(".teach");
+  if (hint && state.compact) {
+    hint.onclick = () => {
+      state.compact = false;
+      paint();
+    };
+  }
+  app.querySelectorAll(".row[data-row]").forEach((el) => bindRowSwipe(el, false));
+}
+
+function bindRowSwipe(el, isPosition) {
+  const id = el.getAttribute("data-row");
+  const swipable = el.getAttribute("data-swipe") === "1";
+  const front = el.querySelector(".row-front");
+  const reveal = isPosition && el.getAttribute("data-ask-only") === "1" ? 70 : 140;
+  let x0 = 0;
+  let y0 = 0;
+  let dx = 0;
+  let t0 = 0;
+  let tracking = false;
+  let aborted = false;
+  const limit = isPosition ? 230 : reveal + 20;
+
+  function rubber(v) {
+    const cap = isPosition ? 260 : reveal;
+    if (v > 0) return 0;
+    const mag = -v;
+    if (mag <= cap) return v;
+    return -(cap + (mag - cap) * 0.22);
+  }
+
+  el.querySelectorAll("[data-act]").forEach((btn) => {
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      onRowAct(id, btn.getAttribute("data-act"), isPosition);
+    };
+  });
+
+  front.addEventListener("click", () => {
+    if (Date.now() < suppressClickUntil) return;
+    if (state.openSwipe && state.openSwipe !== id) {
+      state.openSwipe = "";
+      paint();
+      return;
+    }
+    if (state.openSwipe === id) {
+      state.openSwipe = "";
+      paint();
+      return;
+    }
+    if (isPosition) {
+      state.sheet = "position";
+      state.posIdx = Number(id);
+      state.detent = "half";
+      paint();
+      return;
+    }
+    openInstruction(id);
+  });
+
+  if (!swipable) return;
+
+  front.addEventListener("pointerdown", (ev) => {
+    x0 = ev.clientX;
+    y0 = ev.clientY;
+    dx = 0;
+    t0 = performance.now();
+    tracking = true;
+    aborted = false;
+    front.setPointerCapture(ev.pointerId);
+    front.style.transition = "none";
+  });
+  front.addEventListener("pointermove", (ev) => {
+    if (!tracking) return;
+    const mx = ev.clientX - x0;
+    const my = ev.clientY - y0;
+    if (!aborted && Math.abs(my) > 12 && Math.abs(my) > Math.abs(mx)) {
+      aborted = true;
+      front.style.transform = "";
+      return;
+    }
+    if (Math.abs(mx) > 6 && Math.abs(mx) > Math.abs(my) * 1.2) {
+      dx = rubber(mx);
+      if (dx < -8) haptic("impact", "light");
+      front.style.transform = `translateX(${dx}px)`;
+    }
+  });
+  function end() {
+    if (!tracking) return;
+    tracking = false;
+    const dt = Math.max(1, performance.now() - t0);
+    const vel = dx / dt;
+    front.style.transition = "transform 220ms cubic-bezier(.2,.8,.3,1)";
+    suppressClickUntil = Date.now() + 120;
+    if (isPosition && (dx < -230 || vel < -0.9)) {
+      haptic("impact", "medium");
+      onRowAct(id, "primary", true);
+      return;
+    }
+    if (dx < -(reveal * 0.5) || vel < -0.9) {
+      state.openSwipe = id;
+      if (!isPosition && dx < -(reveal + 20)) {
+        /* instruction rows rubber-band; still only open */
+      }
+    } else {
+      state.openSwipe = "";
+    }
+    paint();
+  }
+  front.addEventListener("pointerup", end);
+  front.addEventListener("pointercancel", end);
+}
+
+function onRowAct(id, act, isPosition) {
+  if (isPosition) {
+    const p = (state.portfolio.positions || [])[Number(id)];
+    if (!p) return;
+    const acts = positionActs(p);
+    if (act === "ask") return openCompose({ kind: "question", message: acts.ask, slide: false });
+    if (act === "primary" && acts.primary) {
+      return openCompose({
+        kind: "imperative",
+        message: acts.primary.msg,
+        note: fillCopy(C.compose.noteImperative, { delta: acts.primary.delta || "moves portfolio risk" }),
+        slide: true,
+        button: acts.primary.label,
+      });
+    }
+    return;
+  }
+  const row = instructions().find((r) => r.instruction_id === id);
+  if (!row) return;
+  if (act === "ask") {
+    return openCompose({
+      kind: "question",
+      message: fillCopy(C.drafts.askPrefix, { sentence: row.sentence }),
+      slide: false,
+      instruction_id: id,
+    });
+  }
+  if (act === "pause" || act === "resume") {
+    return openCompose({
+      kind: act,
+      message: fillCopy(act === "pause" ? C.drafts.pause : C.drafts.resume, { sentence: row.sentence }),
+      note: act === "pause" ? C.compose.notePause : C.compose.noteResume,
+      slide: true,
+      instruction_id: id,
+      button: act === "pause" ? C.compose.sendPause : C.compose.sendResume,
+    });
+  }
+}
+
+function portfolioHtml(hb) {
+  const p = state.portfolio;
+  if (!p) {
+    return `<div class="heartbeat"><span class="dot well"></span>${escapeHtml(C.heartbeat.loading)}</div><div class="skel"></div>`;
+  }
+  const all = p.positions || [];
+  if (!all.length && !state.search.trim()) {
+    const hbEmpty = heartbeatText();
+    return (
+      `<div class="hero"><div class="hero-val num">${usd(p.total_usd_value)}</div></div>` +
+      `<div class="heartbeat tap" id="hbTap"><span class="dot ${hbEmpty.dot}"></span>${escapeHtml(hbEmpty.text)}</div>` +
+      `<div class="center"><p>${escapeHtml(C.portfolioEmpty)}</p><p class="sub">${escapeHtml(C.portfolioEmptySub)}</p></div>` +
+      `<p class="footer-line">${escapeHtml(C.portfolio.footer)}</p>`
+    );
+  }
+  const q = state.search.trim().toLowerCase();
+  const filtered = q
+    ? all.filter((row) => (row.keywords || row.symbol || "").toLowerCase().includes(q))
+    : all;
+  const chg = p.total_change_24h_pct != null ? Number(p.total_change_24h_pct) : null;
+  const groups = [
+    ["holdings", C.portfolio.holdings],
+    ["positions", C.portfolio.openPositions],
+    ["lending", C.portfolio.lending],
+  ];
+  const count = q
+    ? fillCopy(C.portfolio.matches, { n: filtered.length })
+    : fillCopy(C.portfolio.positions, { n: all.length });
+  const risk = p.risk || {};
+  const floor = p.floor || "—";
+  return (
+    `<div class="search"><span>⌕</span><input id="search" placeholder="${escapeHtml(C.portfolio.search)}" value="${escapeHtml(state.search)}" /><span class="n">${escapeHtml(count)}</span></div>` +
+    `<div class="hero"><div class="hero-val num">${usd(p.total_usd_value)}</div><div class="hero-sub num ${chg != null && chg < 0 ? "down" : "up"}">${chg == null ? "—" : (chg < 0 ? "" : "+") + chg + "%"}</div></div>` +
+    `<div class="margin"><div class="lab">Available margin</div><div class="val num">${usd(p.dollarpower && p.dollarpower.committed_usd)}</div><div class="stack"><span style="width:${escapeHtml((p.dollarpower && p.dollarpower.fill_pct) || "0")}%"></span></div></div>` +
+    `<div class="risk-line" id="riskLine">${escapeHtml(
+      fillCopy(C.portfolio.riskLine, {
+        n: risk.liquidation_score,
+        band: risk.band || "",
+        d: risk.distance_from_floor_pct != null ? risk.distance_from_floor_pct + "%" : "—",
+        floor,
+      }),
+    )}</div>` +
+    (state.riskOpen
+      ? `<div class="facts"><div>${escapeHtml(fillCopy(C.portfolio.riskFloor, { floor }))}</div><div class="ask" id="riskAsk">${escapeHtml(C.portfolio.riskAsk)}</div></div>`
+      : "") +
+    `<div class="heartbeat tap" id="hbTap"><span class="dot ${hb.dot}"></span>${escapeHtml(hb.text)}</div>` +
+    (q && !filtered.length
+      ? `<p class="edge">${escapeHtml(fillCopy(C.portfolio.noMatch, { q: state.search }))}</p>`
+      : groups
+          .map(([key, label]) => {
+            const rows = filtered
+              .map((row, idx) => ({ row, idx: all.indexOf(row) }))
+              .filter(({ row }) => (row.group || groupFallback(row)) === key);
+            if (!rows.length) return "";
+            return `<div class="sec-h">${escapeHtml(label)}</div>${rows
+              .map(({ row, idx }) => positionRowHtml(row, idx, idx === rows[rows.length - 1].idx))
+              .join("")}`;
+          })
+          .join("")) +
+    `<p class="footer-line">${escapeHtml(C.portfolio.footer)}</p>`
+  );
+}
+
+function groupFallback(row) {
+  if (row.asset_type === "perp") return "positions";
+  if (row.asset_type === "lend" || row.asset_type === "borrow") return "lending";
+  return "holdings";
+}
+
+function jobline(row) {
+  const extra = row.extra || "";
+  if (row.watch_count > 0) return fillCopy(C.portfolio.jobline, { n: row.watch_count, extra });
+  if (state.flags.jobline_negative && extra) return fillCopy(C.portfolio.joblineNeg, { extra });
+  return extra;
+}
+
+function positionRowHtml(row, idx) {
+  const askOnly = row.can_exit === false ? "1" : "0";
+  const swipable = "1";
+  const open = state.openSwipe === String(idx);
+  const primary = positionActs(row).primary;
+  const under = `<div class="swipe-under">${
+    row.can_exit !== false && primary
+      ? `<button type="button" class="swipe-chip primary" data-act="primary" data-id="${idx}">${escapeHtml(primary.label)}</button>`
+      : ""
+  }<button type="button" class="swipe-chip ask" data-act="ask" data-id="${idx}">Ask</button></div>`;
+  return `<div class="row pos" data-row="${idx}" data-swipe="${swipable}" data-ask-only="${askOnly}">
+    ${under}
+    <div class="row-front" style="${open ? `transform:translateX(-${row.can_exit === false ? 70 : 140}px)` : ""}">
+      <div class="glyph">${escapeHtml((row.symbol || "?").slice(0, 2))}</div>
+      <div class="row-body">
+        <div class="title-row"><div class="title">${escapeHtml(row.symbol)}</div><span class="pct-slot num">${usd(row.usd_value)}</span></div>
+        <div class="sub">${escapeHtml(row.quantity + " · " + (jobline(row) || row.asset_type))}</div>
+      </div>
+      <div class="grip"><i></i></div>
+    </div>
+  </div>`;
+}
+
+function bindPortfolio() {
+  const search = document.getElementById("search");
+  if (search) {
+    search.oninput = () => {
+      state.search = search.value;
+      paint();
+      const el = document.getElementById("search");
+      if (el) {
+        el.focus();
+        el.setSelectionRange(state.search.length, state.search.length);
+      }
+    };
+  }
+  const risk = document.getElementById("riskLine");
+  if (risk) {
+    risk.onclick = () => {
+      state.riskOpen = !state.riskOpen;
+      paint();
+    };
+  }
+  const ask = document.getElementById("riskAsk");
+  if (ask) {
+    ask.onclick = () =>
+      openCompose({ kind: "question", message: "Walk me through my risk.", slide: false });
+  }
+  const hb = document.getElementById("hbTap");
+  if (hb) {
+    hb.onclick = () => {
+      state.tab = "ledger";
+      paint();
+    };
+  }
+  app.querySelectorAll(".row.pos").forEach((el) => bindRowSwipe(el, true));
+}
+
+function positionActs(p) {
+  const qty = p.quantity;
+  const sym = p.symbol;
+  const type = p.asset_type;
+  if (type === "lend") {
+    return {
+      primary: null,
+      ask: `What happens when my ${sym} lend matures?`,
+      watch: true,
+    };
+  }
+  if (type === "perp") {
+    return {
+      primary: {
+        label: "Close at market",
+        msg: `Close my ${sym} ${p.side || "long"} (${qty}) at market.`,
+        delta: "moves portfolio risk",
+      },
+      extra: [
+        {
+          label: "Reduce by half",
+          msg: `Reduce my ${sym} ${p.side || "long"} by half.`,
+          delta: "moves portfolio risk",
+        },
+        { label: "Increase to 5×", gated: true },
+      ],
+      ask: `Walk me through my ${sym} position.`,
+      watch: true,
+    };
+  }
+  return {
+    primary: {
+      label: "Sell at market",
+      msg: `Sell my ${qty} ${sym} at market.`,
+      delta: "moves portfolio risk",
+    },
+    extra: [
+      {
+        label: "Sell half",
+        msg: `Sell ${qty} ${sym} at market — half.`,
+        delta: "moves portfolio risk",
+      },
+    ],
+    ask: `Walk me through my ${sym} spot position.`,
+    watch: true,
+  };
+}
+
+function watchDrafts(p) {
+  const sym = p.symbol;
+  const floor = state.portfolio && state.portfolio.floor;
+  const out = [];
+  if (p.asset_type === "perp" && floor) {
+    const level = (Number(floor) * 1.1).toFixed(0);
+    out.push({ tag: "TELL", text: `If ${sym} drops to $${level} (floor +10%), tell me`, fire: "tell" });
+    out.push({ tag: "ACT", text: `If ${sym} drops to $${level}, close half`, fire: "act" });
+    out.push({ tag: "TELL", text: "If funding turns positive, tell me", fire: "tell" });
+  } else if (p.asset_type === "lend") {
+    out.push({
+      tag: "TELL",
+      text: `The day before maturity, remind me to choose a roll`,
+      fire: "tell",
+    });
+  } else {
+    out.push({ tag: "ACT", text: `If ${sym} touches a third below, sell a third of the spot`, fire: "act" });
+    out.push({ tag: "TELL", text: `If ${sym} drops 5% in a day, tell me`, fire: "tell" });
+  }
+  return out;
+}
+
+function sheetHtml() {
+  const half = state.sheet === "position" ? 280 : state.sheet === "instruction" ? 260 : 0;
+  const y = state.sheet === "pick" || state.sheet === "picker" ? 0 : state.detent === "full" ? 0 : half;
+  if (state.sheet === "position" || state.sheet === "picker") return positionSheet(y);
+  if (state.sheet === "instruction") return instructionSheet(y);
+  return "";
+}
+
+function positionSheet(y) {
+  const p = (state.portfolio.positions || [])[state.posIdx];
+  if (!p) return "";
+  const acts = positionActs(p);
+  const picker = state.sheet === "picker";
+  if (picker) {
+    const drafts = watchDrafts(p);
+    return `<div class="scrim" id="scrim"></div>
+      <div class="sheet pick" id="sheet" style="transform:translateY(${y}px)">
+        <div class="handle" id="handle"></div>
+        <div class="sheet-h"><h2>${escapeHtml(fillCopy(C.picker.title, { position: p.symbol }))}</h2><button type="button" class="x" id="sheetX">✕</button></div>
+        <div class="sheet-body">
+          <p class="note">${escapeHtml(C.picker.sub)}</p>
+          ${drafts
+            .map(
+              (d, i) =>
+                `<div class="draft" data-draft="${i}"><span class="tag-pill">${escapeHtml(d.tag)}</span><span>${escapeHtml(d.text)}</span></div>`,
+            )
+            .join("")}
+          <p class="hint">${escapeHtml(C.picker.footer)}</p>
+        </div>
+      </div>`;
+  }
+  const extras = (acts.extra || [])
+    .map((a) => {
+      if (a.gated) {
+        return `<button type="button" class="act" data-gated="1"><span>${escapeHtml(a.label)}</span><span class="tag">${escapeHtml(C.position.gated)}</span></button>`;
+      }
+      return `<button type="button" class="act extra-act" data-msg="${escapeHtml(a.msg)}" data-label="${escapeHtml(a.label)}"><span>${escapeHtml(a.label)}</span><span class="tag">${escapeHtml(C.instruction.tagSlides)}</span></button>`;
+    })
+    .join("");
+  return `<div class="scrim" id="scrim"></div>
+    <div class="sheet pos" id="sheet" style="transform:translateY(${y}px)">
+      <div class="handle" id="handle"></div>
+      <div class="sheet-h"><div><h2>${escapeHtml(p.symbol)}</h2><div class="sub">${usd(p.usd_value)} · ${escapeHtml(p.quantity)}</div></div><button type="button" class="x" id="sheetX">✕</button></div>
+      <div class="sheet-body">
+        <div class="fact-card">${escapeHtml(jobline(p) || p.asset_type)}${p.watch_count ? `<div class="k">${escapeHtml(fillCopy(C.position.watched, { n: p.watch_count }))}</div>` : ""}</div>
+        <div class="act-lab">${escapeHtml(C.position.actsLabel)}</div>
+        ${
+          acts.primary
+            ? `<button type="button" class="act" id="primaryAct"><span>${escapeHtml(acts.primary.label)}</span><span class="tag">${escapeHtml(C.instruction.tagSlides)}</span></button>`
+            : ""
+        }
+        ${extras}
+        <button type="button" class="act" id="watchAct"><span>${escapeHtml(C.position.watchThis)}</span><span class="tag">›</span></button>
+        <button type="button" class="act" id="askAct"><span>${escapeHtml(C.instruction.ask)}</span><span class="tag">${escapeHtml(C.instruction.tagTap)}</span></button>
+        <p class="hint">${escapeHtml(C.position.footer)}</p>
+        <p class="hint">${escapeHtml(state.detent === "full" ? C.instruction.detentFull : C.instruction.detentHalf)}</p>
+      </div>
+    </div>`;
+}
+
+function instructionSheet(y) {
+  const row = instructions().find((r) => r.instruction_id === state.insId);
+  if (!row) return "";
+  const needs = row.status === "awaiting_confirm" || row.status === "triggered";
+  const executing = row.status === "executing";
+  const g = glyph(row);
+  const facts = [
+    row.params && row.params.resolved ? ["condition", row.params.resolved] : null,
+    row.check_stats && row.check_stats.checks_7d
+      ? ["checks", String(row.check_stats.checks_7d)]
+      : null,
+    ["expires", fmtDate(row.expires_at)],
+  ].filter(Boolean);
+  const trail = row.trail || [];
+  const acts = needs
+    ? `<div class="act-lab">${escapeHtml(C.instruction.awaitingLabel)}</div><p class="note">${escapeHtml(C.instruction.awaitingNote)}</p><button type="button" class="act accent" id="openThread"><span>${escapeHtml(C.instruction.openThread)}</span></button>`
+    : `<div class="act-lab">${escapeHtml(C.instruction.actsLabel)}</div>` +
+      (row.status === "watching"
+        ? `<button type="button" class="act" id="pauseAct"><span>${escapeHtml(C.instruction.pause)}</span><span class="tag">${escapeHtml(C.instruction.tagSlides)}</span></button>`
+        : "") +
+      (row.status === "paused"
+        ? `<button type="button" class="act" id="resumeAct"><span>${escapeHtml(C.instruction.resume)}</span><span class="tag">${escapeHtml(C.instruction.tagSlides)}</span></button>`
+        : "") +
+      (!executing
+        ? `<button type="button" class="act" id="askIns"><span>${escapeHtml(C.instruction.ask)}</span><span class="tag">${escapeHtml(C.instruction.tagTap)}</span></button>`
+        : `<button type="button" class="act" id="askIns"><span>${escapeHtml(C.instruction.askRun)}</span><span class="tag">${escapeHtml(C.instruction.tagTap)}</span></button>`) +
+      `<button type="button" class="act accent" id="openThread"><span>${escapeHtml(C.instruction.openThread)}</span><span class="tag">${executing ? escapeHtml(C.instruction.tagHalt) : ""}</span></button>`;
+  return `<div class="scrim" id="scrim"></div>
+    <div class="sheet ins" id="sheet" style="transform:translateY(${y}px)">
+      <div class="handle" id="handle"></div>
+      <div class="sheet-h"><div><h2>${escapeHtml(row.sentence)}</h2><div class="chip ${chipClass(row.status)}">${escapeHtml(row.display_status || (row.progress_pct != null ? row.progress_pct + "%" : ""))}</div></div><button type="button" class="x" id="sheetX">✕</button></div>
+      <div class="sheet-body">
+        <div class="fact-card">${facts.map(([k, v]) => `<div class="k">${escapeHtml(k)}</div><div>${escapeHtml(v)}</div>`).join("")}</div>
+        ${acts}
+        ${
+          state.detent === "full"
+            ? `<div class="act-lab">${escapeHtml(C.instruction.trailLabel)}</div>${trail
+                .map(
+                  (t) =>
+                    `<div class="trail-row"><div class="trail-meta">${escapeHtml(fmtDate(t.at))} · ${escapeHtml(t.actor)}</div><div class="trail-line">${escapeHtml(t.line)}${t.signed ? `<span class="signed">signed</span>` : ""}</div></div>`,
+                )
+                .join("")}<p class="hint">${escapeHtml(C.instruction.sheetFooter)}</p>`
+            : `<p class="hint">${escapeHtml(C.instruction.detentHalf)}</p>`
+        }
+      </div>
+    </div>`;
+}
+
+function bindSheet() {
+  const scrim = document.getElementById("scrim");
+  const sheet = document.getElementById("sheet");
+  const handle = document.getElementById("handle");
+  const x = document.getElementById("sheetX");
+  if (scrim) scrim.onclick = () => { state.sheet = null; paint(); };
+  if (x) x.onclick = () => {
+    if (state.sheet === "picker") state.sheet = "position";
+    else state.sheet = null;
+    paint();
+  };
+  const primary = document.getElementById("primaryAct");
+  if (primary) {
+    primary.onclick = () => {
+      const p = (state.portfolio.positions || [])[state.posIdx];
+      const acts = positionActs(p);
+      openCompose({
+        kind: "imperative",
+        message: acts.primary.msg,
+        note: fillCopy(C.compose.noteImperative, { delta: acts.primary.delta }),
+        slide: true,
+        button: acts.primary.label,
+      });
+    };
+  }
+  app.querySelectorAll(".extra-act").forEach((btn) => {
+    btn.onclick = () =>
+      openCompose({
+        kind: "imperative",
+        message: btn.getAttribute("data-msg"),
+        note: fillCopy(C.compose.noteImperative, { delta: "moves portfolio risk" }),
+        slide: true,
+        button: btn.getAttribute("data-label"),
+      });
+  });
+  app.querySelectorAll("[data-gated]").forEach((btn) => {
+    btn.onclick = () => {
+      state.blocked = { act: "Increase to 5×", n: "—", floor: (state.portfolio && state.portfolio.floor) || "—" };
+      state.view = "blocked";
+      state.sheet = null;
+      paint();
+    };
+  });
+  const watchAct = document.getElementById("watchAct");
+  if (watchAct) {
+    watchAct.onclick = () => {
+      haptic("select");
+      state.sheet = "picker";
+      paint();
+    };
+  }
+  const askAct = document.getElementById("askAct");
+  if (askAct) {
+    askAct.onclick = () => {
+      const p = (state.portfolio.positions || [])[state.posIdx];
+      openCompose({ kind: "question", message: positionActs(p).ask, slide: false });
+    };
+  }
+  app.querySelectorAll("[data-draft]").forEach((el) => {
+    el.onclick = () => {
+      haptic("select");
+      const p = (state.portfolio.positions || [])[state.posIdx];
+      const d = watchDrafts(p)[Number(el.getAttribute("data-draft"))];
+      openCompose({
+        kind: "conditional",
+        message: d.text,
+        fire_kind: d.fire,
+        note: d.fire === "act" ? C.compose.noteWatchAct : C.compose.noteWatchTell,
+        slide: true,
+        button: C.compose.sendWatch,
+        instrument: p.symbol,
+      });
+    };
+  });
+  const pauseAct = document.getElementById("pauseAct");
+  if (pauseAct) pauseAct.onclick = () => onRowAct(state.insId, "pause", false);
+  const resumeAct = document.getElementById("resumeAct");
+  if (resumeAct) resumeAct.onclick = () => onRowAct(state.insId, "resume", false);
+  const askIns = document.getElementById("askIns");
+  if (askIns) askIns.onclick = () => onRowAct(state.insId, "ask", false);
+  const openThread = document.getElementById("openThread");
+  if (openThread) openThread.onclick = () => openThreadLink();
+  if (sheet) bindSheetDrag(sheet, handle);
+}
+
+function bindSheetDrag(sheet, handle) {
+  const kind = state.sheet;
+  const half = kind === "position" ? 280 : kind === "instruction" ? 260 : 0;
+  const container = kind === "position" ? 620 : kind === "instruction" ? 640 : 400;
+  if (kind === "picker") {
+    if (handle) handle.onclick = () => {};
+    return;
+  }
+  let y0 = 0;
+  let start = state.detent === "full" ? 0 : half;
+  let y = start;
+  let t0 = 0;
+  let tracking = false;
+  function setY(v) {
+    y = v < 0 ? v * 0.18 : v;
+    sheet.style.transition = "none";
+    sheet.style.transform = `translateY(${y}px)`;
+  }
+  function onDown(ev) {
+    y0 = ev.clientY;
+    start = state.detent === "full" ? 0 : half;
+    t0 = performance.now();
+    tracking = true;
+    sheet.setPointerCapture(ev.pointerId);
+  }
+  function onMove(ev) {
+    if (!tracking) return;
+    const dy = ev.clientY - y0;
+    if (Math.abs(dy) > 8) setY(start + dy);
+  }
+  function onUp() {
+    if (!tracking) return;
+    tracking = false;
+    const dt = Math.max(1, performance.now() - t0);
+    const vel = (y - start) / dt;
+    sheet.style.transition = "transform 240ms cubic-bezier(.2,.8,.3,1)";
+    if (vel > 0.8 || y > half + 130) {
+      state.sheet = null;
+      paint();
+      return;
+    }
+    if (y < half * 0.55 || vel < -0.6) {
+      haptic("select");
+      state.detent = "full";
+    } else {
+      haptic("select");
+      state.detent = "half";
+    }
+    paint();
+  }
+  sheet.addEventListener("pointerdown", onDown);
+  sheet.addEventListener("pointermove", onMove);
+  sheet.addEventListener("pointerup", onUp);
+  sheet.addEventListener("pointercancel", onUp);
+  if (handle) {
+    handle.onclick = () => {
+      state.detent = state.detent === "full" ? "half" : "full";
+      haptic("select");
+      paint();
+    };
+  }
+}
+
+async function openInstruction(id) {
+  state.insId = id;
+  state.sheet = "instruction";
+  state.detent = "half";
+  paint();
+  try {
+    const one = await api("/api/v1/mini-app/ledger/" + encodeURIComponent(id));
+    const ins = one.instruction || one;
+    if (ins && ins.instruction_id) {
+      const idx = state.ledger.findIndex((r) => r.instruction_id === ins.instruction_id);
+      if (idx >= 0) state.ledger[idx] = { ...state.ledger[idx], ...ins };
+      else state.ledger.push(ins);
+      if (state.sheet === "instruction" && state.insId === id) paint();
+    }
+  } catch (_) {
+    /* keep the list card */
+  }
+}
+
+function openCompose(payload) {
+  state.compose = payload;
+  state.view = "compose";
+  state.sheet = null;
+  paint();
+}
+
+function renderCompose() {
+  const c = state.compose;
+  document.body.className = "";
+  const slide = c.slide && !reduceMotion;
+  app.innerHTML =
+    headerHtml("inner") +
+    `<div class="screen">
+      <div class="kicker">${escapeHtml(C.compose.label)}</div>
+      <p class="msg">${escapeHtml(c.message)}</p>
+      <p class="note">${escapeHtml(C.compose.disclaimer)}</p>
+      ${c.note ? `<p class="note">${escapeHtml(c.note)}</p>` : ""}
+      ${
+        slide
+          ? `<div class="rail" id="rail"><div class="rail-fill" id="railFill"></div><div class="rail-lab" id="railLab">${escapeHtml(fillCopy(C.compose.slideLabel, { button: c.button || C.compose.sendWatch }))}</div><div class="thumb" id="thumb">⟶</div></div><p class="hint">${escapeHtml(C.compose.slideHint)}</p>`
+          : `<button type="button" class="primary-btn" id="sendTap">${escapeHtml(c.button || C.compose.ask)}</button><p class="hint">${escapeHtml(C.compose.tapHint)}</p>`
+      }
+    </div>` +
+    bottomHtml();
+  bindChrome();
+  const tap = document.getElementById("sendTap");
+  if (tap) tap.onclick = () => doSend();
+  const thumb = document.getElementById("thumb");
+  if (thumb) bindSlide(thumb);
+}
+
+function bindSlide(thumb) {
+  const rail = document.getElementById("rail");
+  const fillEl = document.getElementById("railFill");
+  const lab = document.getElementById("railLab");
+  const max = () => rail.clientWidth - 64 - 8;
+  let x0 = 0;
+  let x = 0;
+  let tracking = false;
+  thumb.addEventListener("pointerdown", (ev) => {
+    x0 = ev.clientX;
+    tracking = true;
+    thumb.setPointerCapture(ev.pointerId);
+    thumb.style.transition = "none";
+  });
+  thumb.addEventListener("pointermove", (ev) => {
+    if (!tracking) return;
+    x = Math.max(0, Math.min(max(), ev.clientX - x0));
+    const pct = x / max();
+    thumb.style.transform = `translateX(${x}px)`;
+    fillEl.style.transform = `translateX(${-100 + pct * 100}%)`;
+    lab.style.opacity = String(1 - Math.min(1, pct / 0.6));
+  });
+  function end() {
+    if (!tracking) return;
+    tracking = false;
+    if (x / max() >= 0.9) {
+      haptic("notify", "success");
+      doSend();
+      return;
+    }
+    thumb.style.transition = "transform 250ms cubic-bezier(.2,.8,.3,1)";
+    fillEl.style.transition = "transform 250ms cubic-bezier(.2,.8,.3,1)";
+    thumb.style.transform = "translateX(0)";
+    fillEl.style.transform = "translateX(-100%)";
+    lab.style.opacity = "1";
+  }
+  thumb.addEventListener("pointerup", end);
+  thumb.addEventListener("pointercancel", end);
+}
+
+async function doSend() {
+  const c = state.compose;
+  const correlation_id = newId();
+  const payload = {
+    correlation_id,
+    kind: c.kind,
+    message: c.message,
+    instruction_id: c.instruction_id || undefined,
+    fire_kind: c.fire_kind,
+    instrument: c.instrument,
+  };
+  const inTelegram = tg && tg.initData && typeof tg.sendData === "function";
+  if (inTelegram) {
+    try {
+      tg.sendData(JSON.stringify(payload));
+    } catch (_) {
+      /* host may still ingest via webhook */
+    }
+  }
+  let recorded = null;
+  if (!inTelegram || previewState()) {
+    try {
+      recorded = await api("/api/v1/mini-app/compose", {
+        method: "POST",
+        body: payload,
+      });
+    } catch (_) {
+      recorded = null;
+    }
+  }
+  if (c.kind === "pause" || c.kind === "resume") {
+    if (c.instruction_id) state.pending[c.instruction_id] = c.kind;
+  }
+  if (c.kind !== "question") {
+    const id =
+      (recorded && recorded.instruction && recorded.instruction.instruction_id) ||
+      c.instruction_id ||
+      correlation_id;
+    const row = {
+      instruction_id: id,
+      sentence: c.message,
+      status: "with_aomi",
+      display_status: "with aomi",
+      kind: c.kind,
+      correlation_id,
+      created_at: nowSecs(),
+      updated_at: nowSecs(),
+    };
+    state.optimistic = state.optimistic.filter((r) => r.instruction_id !== id).concat([row]);
+    state.sent = { id, kind: c.kind, message: c.message, question: false };
+  } else {
+    state.sent = { id: null, kind: c.kind, message: c.message, question: true };
+  }
+  state.view = "sent";
+  paint();
+  refreshLedger();
+}
+
+function renderSent() {
+  const s = state.sent;
+  const row = s.id ? instructions().find((r) => r.instruction_id === s.id) : null;
+  app.innerHTML =
+    headerHtml("inner") +
+    `<div class="screen">
+      <div class="kicker">${escapeHtml(C.sent.label)}</div>
+      <h2>${escapeHtml(C.sent.headline)}</h2>
+      <p class="msg">${escapeHtml(s.message)}</p>
+      ${
+        s.question
+          ? `<p class="note">${escapeHtml(C.sent.askNote)}</p>`
+          : `<div class="mini-card" id="sentCard"><div class="title">${escapeHtml((row && row.sentence) || s.message)}</div><div class="chip">${escapeHtml((row && row.display_status) || "with aomi")}</div><p class="sub">${escapeHtml(C.sub.withAomi)}</p></div><p class="note">${escapeHtml(C.sent.cardNote)}</p>`
+      }
+      <button type="button" class="ghost-btn" id="openThread">${escapeHtml(C.sent.openThread)}</button>
+    </div>` +
+    bottomHtml();
+  bindChrome();
+  const card = document.getElementById("sentCard");
+  if (card) {
+    card.onclick = () => {
+      state.view = "main";
+      state.tab = "ledger";
+      state.sheet = "instruction";
+      state.insId = s.id;
+      state.detent = "half";
+      paint();
+    };
+  }
+  const t = document.getElementById("openThread");
+  if (t) t.onclick = () => openThreadLink();
+}
+
+function renderBlocked() {
+  const b = state.blocked || {};
+  app.innerHTML =
+    headerHtml("inner") +
+    `<div class="screen">
+      <div class="kicker">${escapeHtml(C.gate.label)}</div>
+      <h2>${escapeHtml(C.gate.headline)}</h2>
+      <p class="msg">${escapeHtml(fillCopy(C.gate.line, { act: b.act || "This", n: b.n || "—", floor: b.floor || "—" }))}</p>
+      <p class="note">${escapeHtml(C.gate.note)}</p>
+      <button type="button" class="ghost-btn" id="gateAsk">${escapeHtml(C.gate.act)}</button>
+      <p class="hint">${escapeHtml(C.gate.footer)}</p>
+    </div>` +
+    bottomHtml();
+  bindChrome();
+  const ask = document.getElementById("gateAsk");
+  if (ask) {
+    ask.onclick = () =>
+      openCompose({ kind: "question", message: "Walk me through this policy gate.", slide: false });
+  }
+}
+
+function openThreadLink() {
+  if (tg && typeof tg.close === "function") tg.close();
+}
+
+async function api(path, opts) {
+  const headers = { Authorization: "Bearer " + sessionToken };
+  const init = { headers };
+  if (opts && opts.method) {
+    init.method = opts.method;
+    headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(opts.body || {});
+  }
+  const res = await fetch(path, init);
+  if (res.status === 401) throw new Error("unauthorized");
+  if (res.status === 404) throw new Error("not_found");
+  if (!res.ok) throw new Error("http");
+  return res.json();
+}
+
+async function ensureSession(initData) {
+  if (sessionToken) return sessionToken;
+  const authRes = await fetch("/api/v1/mini-app/auth", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ init_data: initData }),
+  });
+  if (authRes.status === 401) throw new Error("unauthorized");
+  if (!authRes.ok) throw new Error("auth");
+  const auth = await authRes.json();
+  sessionToken = auth.token;
+  return sessionToken;
+}
+
+async function refreshLedger() {
+  try {
+    const [sum, led] = await Promise.all([
+      api("/api/v1/mini-app/ledger/summary"),
+      api("/api/v1/mini-app/ledger"),
+    ]);
+    const prev = Object.fromEntries(instructions().map((r) => [r.instruction_id, r.status]));
+    state.summary = {
+      holding: sum.holding,
+      needs_you: sum.needs_you,
+      last_check_at: sum.last_check_at,
+    };
+    state.ledger = led.instructions || [];
+    state.ledgerStatus = "ok";
+    const ids = new Set(state.ledger.map((r) => r.instruction_id));
+    state.optimistic = state.optimistic.filter((r) => !ids.has(r.instruction_id));
+    for (const row of state.ledger) {
+      if (state.pending[row.instruction_id] && row.status !== prev[row.instruction_id]) {
+        delete state.pending[row.instruction_id];
+        if (row.status === "paused") showToast(C.toasts.paused);
+        if (row.status === "watching") showToast(fillCopy(C.toasts.watching, { date: fmtDate(row.expires_at) }));
+      } else if (prev[row.instruction_id] && prev[row.instruction_id] !== row.status) {
+        if (row.status === "awaiting_confirm") showToast(fillCopy(C.toasts.trigger, { detail: row.sentence }));
+        if (row.status === "done") showToast(C.toasts.executed);
+      }
+    }
+    if (state.view === "main" || state.view === "sent") paint();
+  } catch (err) {
+    if (err.message === "unauthorized") return renderUnauthorized();
+    if (!state.ledger.length) state.ledgerStatus = "error";
+    else state.ledgerStatus = "stale";
+    if (state.view === "main") paint();
+  }
+}
+
+function startPoll() {
+  clearInterval(pollTimer);
+  clearInterval(ageTimer);
+  pollTimer = setInterval(refreshLedger, 2000);
+  ageTimer = setInterval(() => {
+    if (state.view === "main") paint();
+  }, 1000);
+}
+
+function renderUnauthorized() {
+  app.innerHTML =
+    headerHtml("root") +
+    `<div class="center"><p>${escapeHtml(C.unauthorized)}</p></div>` +
+    bottomHtml();
+  bindChrome();
+}
+
+function renderError(retry) {
+  haptic("notify", "error");
+  app.innerHTML =
+    headerHtml("root") +
+    `<div class="center"><p>${escapeHtml(C.loadError)}</p></div>
+     <div class="pad"><button type="button" class="primary-btn" id="retry">${escapeHtml(C.retry)}</button></div>` +
+    bottomHtml();
+  bindChrome();
+  const r = document.getElementById("retry");
+  if (r) r.onclick = retry;
+}
+
+const PREVIEW_PORTFOLIO = {
+  positions: [
+    { symbol: "ETH", quantity: "2.35", usd_value: "8432.50", asset_type: "spot", group: "holdings", extra: "free collateral", can_exit: true, watch_count: 1, keywords: "ETH spot" },
+    { symbol: "ETH-PERP", quantity: "1.20", usd_value: "4310.00", asset_type: "perp", group: "positions", extra: "floor $2410.00", can_exit: true, watch_count: 2, keywords: "ETH perp", side: "long" },
+    { symbol: "USDC", quantity: "2000", usd_value: "2000.00", asset_type: "lend", group: "lending", extra: "fixed term", can_exit: false, watch_count: 1, keywords: "USDC lend" },
+  ],
+  dollarpower: { ratio: "6.8", equivalent_usd: "43100.00", committed_usd: "6338.00", fill_pct: "15", is_estimate: false },
+  risk: { liquidation_score: 7.8, band: "safe", distance_from_floor_pct: "47", is_estimate: false },
+  total_usd_value: "24761.18",
+  total_change_24h_pct: "1.30",
+  floor: "2410.00",
+  flags: { primary_view: "ledger", jobline_negative: false, family: "blue" },
+};
+
+function previewBoot() {
+  const pv = previewState();
+  state.portfolio = PREVIEW_PORTFOLIO;
+  state.flags = PREVIEW_PORTFOLIO.flags;
+  if (pv === "empty") {
+    state.ledger = [];
+    state.summary = { holding: 0, needs_you: 0, last_check_at: null };
+    state.ledgerStatus = "ok";
+    state.compact = false;
+    return paint();
+  }
+  if (pv === "error") {
+    state.ledgerStatus = "error";
+    state.compact = false;
+    return paint();
+  }
+  if (pv === "unauthorized") return renderUnauthorized();
+  state.ledger = [
+    {
+      instruction_id: "roll",
+      status: "awaiting_confirm",
+      display_status: "needs you",
+      sentence: "At maturity, roll the lend into the 30-day if the rate holds at 9% or better",
+      kind: "conditional",
+      fire_kind: "act",
+      expires_at: nowSecs() + 86400 * 5,
+    },
+    {
+      instruction_id: "perp",
+      status: "watching",
+      display_status: "watching",
+      sentence: "If ETH touches $3,400, close half the perp",
+      kind: "conditional",
+      fire_kind: "act",
+      check_stats: { last_check_at: nowSecs() - 4, checks_7d: 12 },
+      expires_at: nowSecs() + 86400 * 18,
+      distance: { mark: "3588", pct: 72, near: true },
+    },
+    {
+      instruction_id: "floor",
+      status: "watching",
+      display_status: "watching",
+      sentence: "If ETH drops to $2,650 (floor +10%), tell me",
+      kind: "watch",
+      fire_kind: "tell",
+      check_stats: { last_check_at: nowSecs() - 4, checks_7d: 8 },
+      expires_at: nowSecs() + 86400 * 26,
+      distance: { mark: "3588", pct: 26, near: false },
+    },
+  ];
+  state.summary = { holding: 3, needs_you: 1, last_check_at: nowSecs() - 4 };
+  state.ledgerStatus = "ok";
+  state.compact = pv !== "loaded";
+  paint();
 }
 
 function chartParams() {
   const q = new URLSearchParams(location.search);
   let symbol = q.get("symbol");
   let period = (q.get("period") || "").toLowerCase();
-  const start =
-    (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) ||
-    q.get("startapp") ||
-    "";
+  const start = startParam();
   if (!symbol) {
-    const parsed = parseStartapp(start);
+    const parsed = parseChartStart(start);
     if (parsed) {
       symbol = parsed.symbol;
       period = period || parsed.period;
     }
   }
   const onChart =
-    location.pathname === "/chart" ||
-    location.pathname.endsWith("/chart") ||
-    !!symbol;
+    location.pathname === "/chart" || location.pathname.endsWith("/chart") || !!symbol;
   if (!onChart) return null;
   if (!symbol) symbol = "AAPL";
   if (period !== "d" && period !== "w" && period !== "m") period = "d";
@@ -320,10 +1500,7 @@ function destroyChart() {
 function fmtChartPrice(v) {
   if (!Number.isFinite(v)) return "—";
   const d = Math.abs(v) >= 1000 ? 1 : Math.abs(v) >= 10 ? 2 : 4;
-  return (
-    "$" +
-    v.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d })
-  );
+  return "$" + v.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
 }
 
 function mountCandles(el, bars) {
@@ -332,48 +1509,36 @@ function mountCandles(el, bars) {
   if (!LC || !el) return false;
   chartHandle = LC.createChart(el, {
     layout: {
-      background: { color: "#070605" },
-      textColor: "rgba(255,252,245,0.55)",
+      background: { color: "#0e1116" },
+      textColor: "rgba(232,237,243,0.55)",
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
     },
     grid: {
-      vertLines: { color: "rgba(255,252,245,0.06)" },
-      horzLines: { color: "rgba(255,252,245,0.06)" },
+      vertLines: { color: "rgba(151,168,190,0.08)" },
+      horzLines: { color: "rgba(151,168,190,0.08)" },
     },
-    rightPriceScale: { borderColor: "rgba(255,252,245,0.12)" },
-    timeScale: {
-      borderColor: "rgba(255,252,245,0.12)",
-      timeVisible: true,
-      secondsVisible: false,
-    },
+    rightPriceScale: { borderColor: "rgba(151,168,190,0.13)" },
+    timeScale: { borderColor: "rgba(151,168,190,0.13)", timeVisible: true, secondsVisible: false },
     crosshair: { mode: LC.CrosshairMode.Normal },
     handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true },
     handleScale: { axisPressedMouseMove: true, pinch: true, mouseWheel: true },
   });
   candleSeries = chartHandle.addCandlestickSeries({
-    upColor: "#22E08A",
-    downColor: "#FF4D4D",
-    wickUpColor: "#22E08A",
-    wickDownColor: "#FF4D4D",
+    upColor: "#46c08a",
+    downColor: "#f07878",
+    wickUpColor: "#46c08a",
+    wickDownColor: "#f07878",
     borderVisible: false,
   });
-  const data = bars
-    .filter((b) => Number.isFinite(b.t) && Number.isFinite(b.o))
-    .map((b) => ({
-      time: b.t,
-      open: b.o,
-      high: b.h,
-      low: b.l,
-      close: b.c,
-    }));
-  candleSeries.setData(data);
+  candleSeries.setData(
+    bars
+      .filter((b) => Number.isFinite(b.t) && Number.isFinite(b.o))
+      .map((b) => ({ time: b.t, open: b.o, high: b.h, low: b.l, close: b.c })),
+  );
   chartHandle.timeScale().fitContent();
   const ro = new ResizeObserver(() => {
     if (!chartHandle) return;
-    chartHandle.applyOptions({
-      width: el.clientWidth,
-      height: el.clientHeight,
-    });
+    chartHandle.applyOptions({ width: el.clientWidth, height: el.clientHeight });
   });
   ro.observe(el);
   chartHandle.applyOptions({ width: el.clientWidth, height: el.clientHeight });
@@ -383,9 +1548,7 @@ function mountCandles(el, bars) {
 function renderChartShell(params, status, data) {
   document.body.className = "page-chart";
   document.title = params.symbol + " · World Markets";
-  const last = data && data.candles && data.candles.length
-    ? data.candles[data.candles.length - 1]
-    : null;
+  const last = data && data.candles && data.candles.length ? data.candles[data.candles.length - 1] : null;
   const first = data && data.candles && data.candles[0];
   const up = last && first ? last.c >= first.o : true;
   const px = last ? fmtChartPrice(last.c) : "—";
@@ -400,17 +1563,11 @@ function renderChartShell(params, status, data) {
     })
     .join("");
   let body = "";
-  if (status === "loading") {
-    body = `<p class="chart-sub">Loading…</p><div class="skel"></div>`;
-  } else if (status === "error") {
-    body = `<div class="center"><p>Could not load chart</p><p class="sub">Try another period or open from the bot again.</p></div>${retryBlock()}`;
-  } else if (status === "empty") {
-    body = `<div class="center"><p>No bars for ${escapeHtml(params.symbol)}.</p></div>`;
-  } else {
-    body = `<div id="plot"></div>`;
-  }
-  app.innerHTML = `
-    ${topbar(`<h1>${escapeHtml(params.symbol)}</h1>`)}
+  if (status === "loading") body = `<p class="chart-sub">Loading…</p><div class="skel"></div>`;
+  else if (status === "error") body = `<div class="center"><p>Could not load chart</p></div>`;
+  else if (status === "empty") body = `<div class="center"><p>No bars for ${escapeHtml(params.symbol)}.</p></div>`;
+  else body = `<div id="plot"></div>`;
+  app.innerHTML = `${headerHtml("inner")}
     <div class="chart-page">
       <div class="chart-meta">
         <span class="chart-sym">${escapeHtml(params.symbol)}</span>
@@ -419,9 +1576,8 @@ function renderChartShell(params, status, data) {
       <div class="chart-sub">${sub}</div>
       <div class="periods">${periods}</div>
       ${body}
-    </div>
-  `;
-  bindExit();
+    </div>`;
+  bindChrome();
   app.querySelectorAll("[data-period]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const next = btn.getAttribute("data-period");
@@ -435,9 +1591,6 @@ function renderChartShell(params, status, data) {
       loadChartView({ symbol: params.symbol, period: next });
     });
   });
-  if (status === "error") {
-    bindRetry(() => loadChartView(params));
-  }
   if (status === "ready") {
     const plot = document.getElementById("plot");
     if (!mountCandles(plot, data.candles)) {
@@ -446,51 +1599,24 @@ function renderChartShell(params, status, data) {
   }
 }
 
-async function ensureSession(initData) {
-  if (sessionToken) return sessionToken;
-  const authRes = await fetch("/api/v1/mini-app/auth", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ init_data: initData }),
-  });
-  if (authRes.status === 401) throw new Error("unauthorized");
-  if (!authRes.ok) throw new Error("auth");
-  const auth = await authRes.json();
-  sessionToken = auth.token;
-  return sessionToken;
-}
-
 async function loadChartView(params) {
-  const preview = previewState();
-  if (preview === "chart") {
-    renderChartShell(params, "ready", previewCandles());
-    return;
-  }
   renderChartShell(params, "loading", null);
-  const initData = (tg && tg.initData) || (preview === "dev" ? "dev" : "");
+  const initData = (tg && tg.initData) || (previewState() === "dev" ? "dev" : "");
   try {
     const token = await ensureSession(initData);
+    sessionToken = token;
     const res = await fetch(
       "/api/v1/mini-app/chart?symbol=" +
         encodeURIComponent(params.symbol) +
         "&period=" +
         encodeURIComponent(params.period),
-      { headers: { Authorization: "Bearer " + token } }
+      { headers: { Authorization: "Bearer " + token } },
     );
     if (res.status === 401) return renderUnauthorized();
-    if (res.status === 404) {
-      renderChartShell(params, "empty", null);
-      return;
-    }
-    if (!res.ok) {
-      renderChartShell(params, "error", null);
-      return;
-    }
+    if (res.status === 404) return renderChartShell(params, "empty", null);
+    if (!res.ok) return renderChartShell(params, "error", null);
     const data = await res.json();
-    if (!data.candles || data.candles.length === 0) {
-      renderChartShell(params, "empty", data);
-      return;
-    }
+    if (!data.candles || data.candles.length === 0) return renderChartShell(params, "empty", data);
     params.symbol = data.symbol || params.symbol;
     renderChartShell(params, "ready", data);
   } catch (err) {
@@ -502,30 +1628,43 @@ async function loadChartView(params) {
 async function boot() {
   const preview = previewState();
   const chart = chartParams();
-  if (preview === "chart" || chart) {
-    return loadChartView(chart || { symbol: "AAPL", period: "d" });
-  }
-  if (preview === "unauthorized") return renderUnauthorized();
-  if (preview === "error") return renderError();
-  if (preview === "empty") return renderEmpty();
-  if (preview === "loading") return renderLoading();
-  if (preview === "loaded") return renderLoaded(PREVIEW_LOADED);
+  if (chart) return loadChartView(chart);
+  if (preview && preview !== "dev") return previewBoot();
 
-  renderLoading();
+  state.ledgerStatus = "loading";
+  paint();
   const initData = (tg && tg.initData) || (preview === "dev" ? "dev" : "");
   try {
-    const token = await ensureSession(initData);
-    const portRes = await fetch("/api/v1/mini-app/portfolio", {
-      headers: { Authorization: "Bearer " + token },
-    });
-    if (portRes.status === 401) return renderUnauthorized();
-    if (!portRes.ok) return renderError();
-    const data = await portRes.json();
-    if (!data.positions || data.positions.length === 0) return renderEmpty();
-    renderLoaded(data);
+    await ensureSession(initData);
+    const port = await api("/api/v1/mini-app/portfolio");
+    state.portfolio = port;
+    if (port.flags) state.flags = port.flags;
+    if (state.flags.primary_view === "portfolio") state.tab = "portfolio";
+    await refreshLedger();
+    state.compact = Boolean(tg && !tg.isExpanded);
+    const deep = instructionStart(startParam());
+    if (deep) {
+      try {
+        const one = await api("/api/v1/mini-app/ledger/" + encodeURIComponent(deep));
+        const ins = one.instruction || one;
+        if (ins && ins.instruction_id) {
+          const idx = state.ledger.findIndex((r) => r.instruction_id === ins.instruction_id);
+          if (idx >= 0) state.ledger[idx] = { ...state.ledger[idx], ...ins };
+          else state.ledger.push(ins);
+          state.compact = false;
+          state.sheet = "instruction";
+          state.insId = ins.instruction_id;
+          state.detent = "half";
+        }
+      } catch (_) {
+        /* stale/foreign id — default view */
+      }
+    }
+    paint();
+    startPoll();
   } catch (err) {
     if (err && err.message === "unauthorized") return renderUnauthorized();
-    renderError();
+    renderError(() => boot());
   }
 }
 
