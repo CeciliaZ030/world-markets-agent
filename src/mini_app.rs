@@ -636,6 +636,11 @@ pub fn submit_compose(body: &Value) -> Result<Value, String> {
     BrainClient::from_env().compose(body)
 }
 
+/// Unfulfillable / near-match / unclear. None means fall through to the agent.
+pub fn submit_heard(account_id: u64, text: &str, extra: Option<&Value>) -> Option<Value> {
+    crate::cant::try_heard(account_id, text, extra)
+}
+
 pub fn flush_staged_trade(account_id: u64, instruction_id: &str) -> Result<Value, String> {
     crate::staged::flush_staged_trade(account_id, instruction_id)
 }

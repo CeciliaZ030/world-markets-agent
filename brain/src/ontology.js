@@ -1,0 +1,117 @@
+/**
+ * World Markets speech ontology. Same JSON the plugin compiles in.
+ * Used to seed STT keyterms globally (not persisted per account).
+ */
+
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const ONTOLOGY_PATH = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "../../assets/speech_ontology.json",
+);
+
+const file = JSON.parse(readFileSync(ONTOLOGY_PATH, "utf8"));
+
+export const ONTOLOGY_VERSION = file.version;
+
+export function ontologyEntries() {
+  return file.entries || [];
+}
+
+function normalizeKey(surface) {
+  return String(surface || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+const byKind = new Map();
+const kindBySurface = new Map();
+const instrumentBySurface = new Map();
+const confusableBySurface = new Map();
+for (const row of ontologyEntries()) {
+  const key = normalizeKey(row.surface_form);
+  if (!key) continue;
+  kindBySurface.set(key, row.kind);
+  if (!byKind.has(row.kind)) byKind.set(row.kind, []);
+  byKind.get(row.kind).push(row);
+  if (row.kind === "instrument") {
+    instrumentBySurface.set(key, row.normalized_target);
+  }
+  if (row.kind === "confusable") {
+    confusableBySurface.set(key, row.normalized_target);
+  }
+}
+
+export function kindOf(surface) {
+  return kindBySurface.get(normalizeKey(surface)) || null;
+}
+
+export function instrumentAlias(surface) {
+  return instrumentBySurface.get(normalizeKey(surface)) || null;
+}
+
+export function confusableTarget(surface) {
+  return confusableBySurface.get(normalizeKey(surface)) || null;
+}
+
+export function surfacesOfKind(kind) {
+  return (byKind.get(kind) || []).map((row) => row.surface_form);
+}
+
+export function actSet() {
+  return new Set((byKind.get("act") || []).map((row) => normalizeKey(row.surface_form)));
+}
+
+export function fillerSet() {
+  const out = new Set(["a", "an", "the", "me", "my", "of", "and", "then", "to", "for", "open"]);
+  for (const kind of ["size", "unit", "size_frame"]) {
+    for (const row of byKind.get(kind) || []) {
+      out.add(normalizeKey(row.surface_form));
+    }
+  }
+  return out;
+}
+
+export function kindRank(kind) {
+  const rank = {
+    instrument: 0,
+    act: 1,
+    size_frame: 2,
+    size: 3,
+    unit: 3,
+    product: 4,
+    level: 5,
+    phrase: 6,
+  };
+  return rank[kind] ?? 9;
+}
+
+function isBoostToken(term) {
+  const trimmed = String(term || "").trim();
+  return trimmed.length >= 2 && !/\s/.test(trimmed) && trimmed.toLowerCase() !== "if";
+}
+
+/** Single-token, non-confusable surfaces for Deepgram keywords. */
+export function ontologyKeyterms() {
+  const ranked = [...ontologyEntries()]
+    .filter((row) => row.kind !== "confusable")
+    .sort((a, b) => {
+      const d = kindRank(a.kind) - kindRank(b.kind);
+      if (d !== 0) return d;
+      return (b.confidence || 0) - (a.confidence || 0);
+    });
+  const seen = new Set();
+  const out = [];
+  for (const row of ranked) {
+    const term = String(row.surface_form || "").trim();
+    if (!isBoostToken(term)) continue;
+    const key = term.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(term);
+  }
+  return out;
+}

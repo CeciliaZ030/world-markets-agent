@@ -258,10 +258,12 @@ body.locked { overflow: hidden; }
 .chip.pos { color: var(--pos); }
 .chip.mute { color: var(--mute); }
 .chip.faint { color: var(--faint); }
+.chip.cant { color: #454d58; }
 .chip.neg { color: var(--neg); }
 .chip.warn { color: var(--warn); }
 .glyph.warn { color: var(--warn); }
 .row.is-done .title { color: var(--mute); }
+.row.is-cant .title { color: var(--faint); }
 .row.voice-draft .row-front {
   background: rgba(185, 143, 62, 0.05);
 }
@@ -800,6 +802,14 @@ body.locked { overflow: hidden; }
   flex: 0 0 88px;
 }
 .trail-line { font-size: 11px; line-height: 1.45; }
+.trail-voice {
+  display: inline-block;
+  margin-left: 6px;
+  font-family: var(--mono);
+  font-size: 9px;
+  text-transform: lowercase;
+  color: var(--faint);
+}
 .signed {
   display: inline-block;
   font-family: var(--mono);

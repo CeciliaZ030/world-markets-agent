@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   SHARE,
+  CANT,
   attachSetCopy,
   bundleMessage,
   expiredMessage,
@@ -53,6 +54,15 @@ test("share copy register has no bangs and 160-char blocks", () => {
   assert.deepEqual(templateSlots(SHARE.m10_with_name), ["first_name", "ref_link"]);
   assert.deepEqual(templateSlots(SHARE.m10_anon), ["ref_link"]);
   for (const value of Object.values(SHARE)) {
+    assert.equal(String(value).includes("!"), false, value);
+    for (const block of proseBlocks(value)) {
+      assert.ok(block.length <= 160, block);
+    }
+  }
+});
+
+test("cant copy register has no bangs and 160-char blocks", () => {
+  for (const value of Object.values(CANT)) {
     assert.equal(String(value).includes("!"), false, value);
     for (const block of proseBlocks(value)) {
       assert.ok(block.length <= 160, block);

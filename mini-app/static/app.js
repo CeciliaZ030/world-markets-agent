@@ -80,6 +80,7 @@ const state = {
     micDenied: false,
     typePulse: false,
   },
+  nearMatch: null,
 };
 
 function applyFlags(flags) {
@@ -251,6 +252,7 @@ function zoneOf(row) {
     .toISOString()
     .slice(0, 10);
   if (row.status === "done" && changed === today) return "done";
+  if (row.status === "cant" && changed === today) return "done";
   return "earlier";
 }
 
@@ -265,6 +267,7 @@ function glyph(row) {
   }
   if (row.status === "paused") return { g: "❚❚", cls: "faint" };
   if (row.status === "done") return { g: "✓", cls: "pos" };
+  if (row.status === "cant") return { g: "·", cls: "faint" };
   if (row.status === "expired") return { g: "·", cls: "faint" };
   if (row.fire_kind === "act") return { g: "⏱", cls: "" };
   return { g: "◎", cls: "" };
@@ -274,6 +277,7 @@ function chipClass(status) {
   if (status === "watching") return "pos";
   if (status === "paused") return "mute";
   if (status === "done" || status === "expired") return "faint";
+  if (status === "cant") return "cant";
   if (status === "blocked") return "neg";
   return "";
 }
@@ -348,6 +352,11 @@ function subLine(row) {
     });
   }
   if (row.status === "done" && row.receipt) return row.receipt;
+  if (row.status === "cant") {
+    if (row.sub_line) return row.sub_line;
+    if (row.repeat_count > 1) return fillCopy(C.cant.sublineRepeat, { n: row.repeat_count === 2 ? "twice" : row.repeat_count + " times" });
+    return C.cant.subline;
+  }
   if (row.status === "expired") return fillCopy(C.sub.expired, { date: fmtDate(row.expires_at) });
   if (row.status === "watching") {
     const n = relCheck(row.check_stats && row.check_stats.last_check_at);
@@ -964,6 +973,7 @@ function zoneRows(rows) {
       const rowCls = [
         i === rows.length - 1 ? "last" : "",
         row.status === "done" ? "is-done" : "",
+        row.status === "cant" ? "is-cant" : "",
         row.voice_draft ? "voice-draft" : "",
         row.voice_draft && Date.now() - (row.voice_landed_at || 0) < 500 ? "fresh" : "",
       ]
@@ -1540,17 +1550,27 @@ function instructionSheet(y) {
   if (!row) return "";
   const needs = row.status === "awaiting_confirm" || row.status === "triggered";
   const executing = row.status === "executing";
+  const cant = row.status === "cant";
   const g = glyph(row);
-  const facts = [
-    row.params && row.params.resolved ? ["condition", row.params.resolved] : null,
-    row.check_stats && row.check_stats.checks_7d
-      ? ["checks", String(row.check_stats.checks_7d)]
-      : null,
-    ["id", taskIdOf(row)],
-    ["expires", fmtDate(row.expires_at)],
-  ].filter(Boolean);
+  const facts = cant
+    ? [
+        [C.cant.factAsked, row.asked_entity || row.params?.asked || row.sentence],
+        [C.cant.factAnswerLabel, row.params?.answer || C.cant.factAnswer],
+        [C.cant.factTradesLabel, row.params?.world_trades || C.cant.factTrades],
+      ]
+    : [
+        row.params && row.params.resolved ? ["condition", row.params.resolved] : null,
+        row.check_stats && row.check_stats.checks_7d
+          ? ["checks", String(row.check_stats.checks_7d)]
+          : null,
+        ["id", taskIdOf(row)],
+        ["expires", fmtDate(row.expires_at)],
+      ].filter(Boolean);
   const trail = row.trail || [];
-  const acts = needs
+  const acts = cant
+    ? `<div class="act-lab">${escapeHtml(C.instruction.actsLabel)}</div>` +
+      `<button type="button" class="act" id="askIns"><span>${escapeHtml(C.instruction.ask)}</span><span class="tag">${escapeHtml(C.instruction.tagTap)}</span></button>`
+    : needs
     ? `<div class="act-lab">${escapeHtml(C.instruction.awaitingLabel)}</div><p class="note">${escapeHtml(C.instruction.awaitingNote)}</p><button type="button" class="act accent" id="openThread"><span>${escapeHtml(C.instruction.openThread)}</span></button>` +
       (cancellable(row)
         ? `<button type="button" class="act" id="cancelAct"><span>${escapeHtml(C.instruction.cancel)}</span><span class="tag">×</span></button>`
@@ -1581,7 +1601,7 @@ function instructionSheet(y) {
             ? `<div class="act-lab">${escapeHtml(C.instruction.trailLabel)}</div>${trail
                 .map(
                   (t) =>
-                    `<div class="trail-row"><div class="trail-meta">${escapeHtml(fmtDate(t.at))} · ${escapeHtml(t.actor)}</div><div class="trail-line">${escapeHtml(t.line)}${t.signed ? `<span class="signed">signed</span>` : ""}</div></div>`,
+                    `<div class="trail-row"><div class="trail-meta">${escapeHtml(fmtDate(t.at))} · ${escapeHtml(t.actor)}${t.origin === "voice" ? `<span class="trail-voice">voice</span>` : ""}</div><div class="trail-line">${escapeHtml(t.line)}${t.signed ? `<span class="signed">signed</span>` : ""}</div></div>`,
                 )
                 .join("")}<p class="hint">${escapeHtml(C.instruction.sheetFooter)}</p>`
             : `<p class="hint">${escapeHtml(C.instruction.detentHalf)}</p>`

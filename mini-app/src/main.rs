@@ -380,6 +380,52 @@ async fn compose_handler(
                 .ok_or_else(|| "instruction_id required".to_string())?;
             return world_markets::mini_app::flush_staged_trade(account_id, instruction_id);
         }
+        let message = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if !matches!(
+            kind.as_str(),
+            "question" | "pause" | "resume" | "cancel" | "flush_execute"
+        ) && !message.is_empty()
+        {
+            if let Some(handled) =
+                world_markets::mini_app::submit_heard(account_id, &message, Some(&payload))
+            {
+                let skip = handled.get("skip_llm") == Some(&json!(true));
+                let remaining = handled
+                    .get("remaining_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if skip || handled.get("kind").and_then(Value::as_str) == Some("cant") {
+                    if let Some(chat_id) = chat_id {
+                        if let Some(reply) = handled.get("message").and_then(Value::as_str) {
+                            let _ = world_markets::mini_app::post_chat_lines(
+                                &bot_token,
+                                chat_id,
+                                &[reply.to_string()],
+                            );
+                        }
+                    }
+                    if !remaining.is_empty() && chat_id.is_none() {
+                        let _ = dispatch_local_agent_turn(remaining);
+                    }
+                    return Ok(handled);
+                }
+                if handled.get("kind").and_then(Value::as_str) == Some("resolved") {
+                    let text = handled
+                        .get("rewritten_text")
+                        .or_else(|| handled.get("remaining_text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(&message);
+                    if chat_id.is_none() {
+                        let _ = dispatch_local_agent_turn(text);
+                    }
+                    return Ok(handled);
+                }
+            }
+        }
         let value = world_markets::mini_app::submit_compose(&payload)?;
         if kind == "cancel" {
             let command = value
@@ -517,17 +563,87 @@ async fn voice_handler(
             .unwrap_or("")
             .to_string();
         if !heard.is_empty() {
-            if let Some(chat_id) = chat_id {
+            let utterance_id = value
+                .get("utterance_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let extra = json!({
+                "origin": "voice",
+                "source": "mini_app",
+                "utterance_ref": utterance_id,
+                "peek": chat_id.is_some(),
+                "proposed_confusables": value.get("proposed_confusables"),
+            });
+            let handled = world_markets::mini_app::submit_heard(account_id, &heard, Some(&extra));
+            if let Some(handled) = handled {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("voice_kind".into(), handled.get("kind").cloned().unwrap_or(json!("")));
+                    obj.insert("heard_handled".into(), handled.clone());
+                    if handled.get("skip_llm") == Some(&json!(true)) {
+                        obj.insert("skip_send_data".into(), json!(chat_id.is_none()));
+                    }
+                }
+                let kind = handled.get("kind").and_then(Value::as_str).unwrap_or("");
+                let remaining = handled
+                    .get("remaining_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if chat_id.is_none() {
+                    if !remaining.is_empty() {
+                        let _ = dispatch_local_agent_turn(&remaining);
+                    }
+                    if kind == "cant" || kind == "unclear" || kind == "near_match" {
+                        if let Some(msg) = handled.get("message").and_then(Value::as_str) {
+                            if let Some(obj) = value.as_object_mut() {
+                                obj.insert("thread_message".into(), json!(msg));
+                            }
+                        }
+                        Ok(value)
+                    } else {
+                        // resolved: dispatch rewritten
+                        let text = handled
+                            .get("rewritten_text")
+                            .or_else(|| handled.get("remaining_text"))
+                            .and_then(Value::as_str)
+                            .unwrap_or(&heard);
+                        if dispatch_local_agent_turn(text) {
+                            if let Some(obj) = value.as_object_mut() {
+                                obj.insert("dispatched".into(), json!(true));
+                            }
+                        }
+                        Ok(value)
+                    }
+                } else {
+                    // Telegram: host render_lookup writes; skip extra heard-echo when we will wall
+                    if kind != "cant" && kind != "near_match" && kind != "unclear" {
+                        let line = format!("heard: {heard}");
+                        if let Some(chat_id) = chat_id {
+                            if let Err(err) = world_markets::mini_app::post_chat_lines(
+                                &bot_token,
+                                chat_id,
+                                &[line],
+                            ) {
+                                tracing::warn!(error = %err, "voice heard-echo failed");
+                            }
+                        }
+                    }
+                    Ok(value)
+                }
+            } else if let Some(chat_id) = chat_id {
                 let line = format!("heard: {heard}");
                 if let Err(err) =
                     world_markets::mini_app::post_chat_lines(&bot_token, chat_id, &[line])
                 {
                     tracing::warn!(error = %err, "voice heard-echo failed");
                 }
+                Ok(value)
             } else if dispatch_local_agent_turn(&heard) {
                 if let Some(obj) = value.as_object_mut() {
                     obj.insert("dispatched".to_string(), json!(true));
                 }
+                Ok(value)
             } else {
                 let correlation_id = value
                     .get("correlation_id")
@@ -554,9 +670,11 @@ async fn voice_handler(
                     }
                     Err(err) => tracing::warn!(error = %err, "voice compose fallback failed"),
                 }
+                Ok(value)
             }
+        } else {
+            Ok(value)
         }
-        Ok(value)
     })
     .await
     {

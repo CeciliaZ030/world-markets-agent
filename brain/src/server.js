@@ -60,6 +60,7 @@ import {
   upsertLexicon,
   voiceContext,
 } from "./voice.js";
+import { handleHeard } from "./cant.js";
 import { handleShare } from "./share.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -309,6 +310,9 @@ async function handle(req, res) {
       return;
     case "/v1/voice/episode/close":
       send(res, 200, closeEpisode(accountIdOf(body), body));
+      return;
+    case "/v1/heard":
+      send(res, 200, handleHeard(accountIdOf(body), body));
       return;
     case "/v1/share":
       send(res, 200, handleShare(body));

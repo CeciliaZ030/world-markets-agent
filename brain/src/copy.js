@@ -130,6 +130,44 @@ export function attachBundleCopy(payload) {
   return { ...payload, message: bundleMessage(payload.fires) };
 }
 
+export const CANT = {
+  wall_market:
+    "World doesn't trade {entity}. It trades crypto — spot, perps, and lending — and nothing off-chain.",
+  wall_scope:
+    "That's outside what I do. I trade, watch, and report on World — nothing else.",
+  repeat: "Still can't — World doesn't trade {entity}.",
+  kept_line: "Kept for the record — it's in your ledger.",
+  nearmatch_frame: 'Nothing called "{word}" trades on World. Close matches:',
+  nearmatch_escape: "No — I meant {word}",
+  unclear:
+    "I didn't catch an instrument in that. Say buy, a size, and the name.",
+};
+
+export function fillCant(key, vars = {}) {
+  return fillTemplate(CANT[key], vars);
+}
+
+export function wallMessage({ heard, entity, kind, repeat, index, total }) {
+  if (repeat) {
+    const line = fillCant("repeat", { entity });
+    return total > 1 ? `${index}. ${line}` : line;
+  }
+  const line2 =
+    kind === "out_of_scope"
+      ? fillCant("wall_scope")
+      : fillCant("wall_market", { entity });
+  const body = [`heard: "${heard}"`, line2, fillCant("kept_line")].join("\n");
+  return total > 1 ? `${index}. ${body}` : body;
+}
+
+export function nearMatchMessage(word) {
+  return fillCant("nearmatch_frame", { word });
+}
+
+export function nearMatchEscape(word) {
+  return fillCant("nearmatch_escape", { word });
+}
+
 /**
  * Introduction copy. Templates may interpolate only `first_name` and `ref_link`.
  * No positions, PnL, balances, or other account slots exist here.

@@ -885,7 +885,7 @@ impl DynAomiTool for RenderLookup {
     type App = WorldMarketsApp;
     type Args = RenderLookupArgs;
     const NAME: &'static str = "render_lookup";
-    const DESCRIPTION: &'static str = "Whole-message terse lookup (b/p/r/a/d, word forms, ?/commands), cancel task {id}, or the non-money share/introduce intent. Host: call on every user message with text=user message; if skip_llm, send message (and hint/name_ask/messages when present) and do not call the LLM. Unmatched messages still prefetch the account. Model: paste message verbatim. Share never executes. Cancel drops a watch — never a trade.";
+    const DESCRIPTION: &'static str = "Whole-message terse lookup (b/p/r/a/d, word forms, ?/commands), cancel task {id}, the non-money share/introduce intent, or an unfulfillable/near-match/unclear heard reply. Host: call on every user message with text=user message; if skip_llm, send message (and controls when present) and do not call the LLM. Unmatched messages still prefetch the account. Model: paste message verbatim. Share never executes. Cancel drops a watch — never a trade. Unfulfillable never executes.";
 
     fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
         if let Some(id) = args
@@ -913,6 +913,18 @@ impl DynAomiTool for RenderLookup {
             });
         let Some(kind) = kind else {
             app.kick_prefetch(&ctx, args.account_id);
+            if let Some(text) = args
+                .text
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                if let Some(account_id) = WorldMarketsApp::account_id(&ctx, args.account_id) {
+                    if let Some(value) = crate::cant::try_heard(account_id, text, None) {
+                        return Ok(value);
+                    }
+                }
+            }
             return Ok(json!({
                 "source": "world-markets-lookup",
                 "executable": false,

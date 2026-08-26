@@ -6,6 +6,7 @@
 import { randomBytes } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { filePath, readJson, writeJson } from "./store.js";
+import { kindRank, ontologyKeyterms } from "./ontology.js";
 
 const EPISODE_GAP_SECS = 90;
 const MAX_UTTERANCES = 400;
@@ -57,13 +58,16 @@ export function keyterms(accountId, extra = []) {
     out.push(term);
   };
   for (const row of extra) push(row);
+  for (const term of ontologyKeyterms()) push(term);
   const ranked = [...data.lexicon].sort((a, b) => {
-    const kindRank = { instrument: 0, size: 1, level: 2, phrase: 3 };
-    const d = (kindRank[a.kind] ?? 9) - (kindRank[b.kind] ?? 9);
+    const d = kindRank(a.kind) - kindRank(b.kind);
     if (d !== 0) return d;
     return (b.confidence || 0) - (a.confidence || 0);
   });
-  for (const row of ranked) push(row.surface_form);
+  for (const row of ranked) {
+    if (row.kind === "confusable") continue;
+    push(row.surface_form);
+  }
   return out.slice(0, MAX_KEYTERMS);
 }
 
@@ -74,6 +78,7 @@ function applyLexicon(data, entries, now) {
     const target = String(raw.normalized_target || raw.target || surface).trim();
     if (!surface) continue;
     const kind = raw.kind || "phrase";
+    if (kind === "confusable") continue;
     const source = raw.source || "auto";
     const existing = data.lexicon.find(
       (row) =>
@@ -99,6 +104,10 @@ function applyLexicon(data, entries, now) {
       source,
     });
   }
+}
+
+export function lexiconOf(accountId) {
+  return loadVoice(accountId).lexicon || [];
 }
 
 export function upsertLexicon(accountId, entries, now = nowSecs()) {
@@ -161,6 +170,7 @@ export function ingestUtterance(accountId, body, now = nowSecs()) {
   const utterance = {
     id: utteranceId,
     text,
+    repaired_from: body.repaired_from || null,
     words: Array.isArray(body.words) ? body.words : [],
     lang: body.lang || "en",
     stt_version: body.stt_version || null,

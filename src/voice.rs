@@ -1,15 +1,21 @@
 //! Mini App / chat voice ingest. STT + brain records + compose into the agent.
 //! Does not submit orders. Does not call The Desk.
 
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use base64::Engine;
 use serde_json::{Value, json};
 
 use crate::brain::BrainClient;
+use crate::speech_ontology::{self, Repair};
 use crate::stt::{self, SttErrorKind, Transcript};
+
+const CATALOG_TTL: Duration = Duration::from_secs(60);
 
 pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
     let brain = BrainClient::with_timeout(90);
-    let extra = seed_symbols(account_id);
+    let extra = seed_keyterms(account_id);
     let keyterms = brain
         .voice_keyterms(account_id, &extra)
         .unwrap_or_else(|_| extra.clone());
@@ -45,6 +51,37 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
         }
     }
 
+    let catalog = cached_catalog_symbols();
+    let repair = if typed.is_some() {
+        Repair {
+            text: transcript.text.clone(),
+            hits: Vec::new(),
+            repaired_from: None,
+            proposed_confusables: Vec::new(),
+        }
+    } else {
+        speech_ontology::repair_transcript(&transcript.text, &catalog)
+    };
+    let raw_text = transcript.text.clone();
+    transcript.text = repair.text.clone();
+    let proposed_confusables: Vec<Value> = repair
+        .proposed_confusables
+        .iter()
+        .map(|row| row.to_json())
+        .collect();
+    let lexicon_hits: Vec<Value> = repair.hits.iter().map(|hit| hit.to_json()).collect();
+    let repaired_from = repair
+        .repaired_from
+        .as_deref()
+        .filter(|value| *value != transcript.text.as_str())
+        .or_else(|| {
+            if raw_text != transcript.text {
+                Some(raw_text.as_str())
+            } else {
+                None
+            }
+        });
+
     let duration_secs = body
         .get("duration_secs")
         .and_then(Value::as_f64)
@@ -67,22 +104,11 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
         })
         .collect();
 
-    let lexicon_hits: Vec<Value> = extra
-        .iter()
-        .map(|symbol| {
-            json!({
-                "surface_form": symbol,
-                "normalized_target": symbol,
-                "kind": "instrument",
-                "source": "auto",
-            })
-        })
-        .collect();
-
     let recorded = brain
         .ingest_utterance(&json!({
             "account_id": account_id,
             "transcript": transcript.text,
+            "repaired_from": repaired_from,
             "words": words,
             "lang": transcript.lang,
             "stt_version": transcript.stt_version,
@@ -92,6 +118,7 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
             "source": body.get("source").and_then(Value::as_str).unwrap_or("mini_app"),
             "foreign": false,
             "lexicon_hits": lexicon_hits,
+            "proposed_confusables": proposed_confusables,
         }))
         .unwrap_or_else(|_| json!({ "heard_echo": transcript.text }));
 
@@ -136,6 +163,7 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
         "long_note": recorded.get("long_note"),
         "long_note_line": recorded.get("long_note_line"),
         "split_parse": recorded.get("split_parse"),
+        "proposed_confusables": proposed_confusables,
         "send_payload": send_payload,
     }))
 }
@@ -196,7 +224,11 @@ fn is_placeholder_transcript(text: &str) -> bool {
     )
 }
 
-fn seed_symbols(account_id: u64) -> Vec<String> {
+fn seed_keyterms(account_id: u64) -> Vec<String> {
+    speech_ontology::seed_keyterms(&cached_catalog_symbols(), &holdings(account_id))
+}
+
+fn holdings(account_id: u64) -> Vec<String> {
     match crate::mini_app::load_portfolio(account_id) {
         Ok(snap) => snap
             .positions
@@ -204,6 +236,42 @@ fn seed_symbols(account_id: u64) -> Vec<String> {
             .map(|row| row.symbol)
             .filter(|symbol| symbol.len() >= 2)
             .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn cached_catalog_symbols() -> Vec<String> {
+    struct CatalogCache {
+        at: Instant,
+        symbols: Vec<String>,
+    }
+    static CACHE: Mutex<Option<CatalogCache>> = Mutex::new(None);
+    let Ok(mut guard) = CACHE.lock() else {
+        return catalog_symbols_uncached();
+    };
+    if let Some(cache) = guard.as_ref() {
+        if cache.at.elapsed() < CATALOG_TTL {
+            return cache.symbols.clone();
+        }
+    }
+    let symbols = catalog_symbols_uncached();
+    *guard = Some(CatalogCache {
+        at: Instant::now(),
+        symbols: symbols.clone(),
+    });
+    symbols
+}
+
+fn catalog_symbols_uncached() -> Vec<String> {
+    match crate::mini_app::load_products() {
+        Ok(snap) => {
+            let mut seen = std::collections::HashSet::new();
+            snap.products
+                .into_iter()
+                .map(|row| row.symbol)
+                .filter(|symbol| symbol.len() >= 2 && seen.insert(symbol.to_ascii_lowercase()))
+                .collect()
+        }
         Err(_) => Vec::new(),
     }
 }
@@ -243,5 +311,14 @@ mod tests {
     #[test]
     fn empty_stt_uses_live_words() {
         assert_eq!(choose_transcript("", Some("sell all sol")), "sell all sol");
+    }
+
+    #[test]
+    fn lexicon_hits_do_not_auto_map_confusable_beef() {
+        let repair = speech_ontology::repair_transcript("buy fifty dollars worth of beef", &[]);
+        assert_eq!(repair.text, "buy fifty dollars worth of beef");
+        assert!(repair.hits.is_empty());
+        assert_eq!(repair.proposed_confusables.len(), 1);
+        assert_eq!(repair.proposed_confusables[0].target, "ETH");
     }
 }

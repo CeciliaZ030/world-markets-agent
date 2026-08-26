@@ -66,6 +66,34 @@ test("lexicon keyterms prefer instruments and feed STT", () => {
   assert.ok(terms.includes("the loop"));
 });
 
+test("empty-account keyterms still include ETH buy and worth", () => {
+  const terms = keyterms("99");
+  const lower = terms.map((t) => t.toLowerCase());
+  assert.ok(lower.includes("eth"), `ETH missing from ${terms.join(",")}`);
+  assert.ok(lower.includes("buy"), `buy missing from ${terms.join(",")}`);
+  assert.ok(lower.includes("worth"), `worth missing from ${terms.join(",")}`);
+  assert.ok(!lower.includes("beef"));
+  assert.ok(!lower.includes("these"));
+});
+
+test("utterance keeps repaired_from and heard_echo is repaired text", () => {
+  const out = ingestUtterance("25", {
+    transcript: "buy fifty dollars worth of ETH",
+    repaired_from: "buy fifty dollars worth of beef",
+  });
+  assert.equal(out.heard_echo, "buy fifty dollars worth of ETH");
+  assert.equal(out.utterance.text, "buy fifty dollars worth of ETH");
+  assert.equal(out.utterance.repaired_from, "buy fifty dollars worth of beef");
+});
+
+test("confusable surfaces are not seeded as keyterms", () => {
+  upsertLexicon("26", [
+    { surface_form: "beef", normalized_target: "ETH", kind: "confusable" },
+  ]);
+  const lower = keyterms("26").map((t) => t.toLowerCase());
+  assert.ok(!lower.includes("beef"));
+});
+
 test("correction pair is captured and eval export lists it", () => {
   setConsent("22", { kind: "training_use", status: "granted" });
   const corr = recordCorrection("22", {

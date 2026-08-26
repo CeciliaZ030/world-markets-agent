@@ -232,6 +232,10 @@ impl BrainClient {
         self.post("/v1/voice/episode/close", body)
     }
 
+    pub(crate) fn heard(&self, body: &Value) -> Result<Value, String> {
+        self.post("/v1/heard", body)
+    }
+
     pub(crate) fn share(&self, body: &Value) -> Result<Value, String> {
         self.post("/v1/share", body)
     }

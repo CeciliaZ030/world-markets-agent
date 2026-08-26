@@ -17,6 +17,7 @@ const STATUSES = new Set([
   "paused",
   "expired",
   "revoked",
+  "cant",
 ]);
 
 const ALLOWED = {
@@ -39,6 +40,7 @@ const ALLOWED = {
   declined: [],
   expired: [],
   revoked: [],
+  cant: [],
 };
 
 const EVENT_TYPES = new Set([
@@ -158,6 +160,7 @@ export function appendEvent(accountId, instructionId, eventType, detail, now, ex
     actor: extra.actor || actorFor(eventType),
     detail: detail || "",
     signed: Boolean(extra.signed),
+    origin: extra.origin || null,
   };
   data.items.push(event);
   saveEvents(accountId, data);
@@ -590,6 +593,7 @@ function displayStatus(status) {
   if (status === "triggered" || status === "awaiting_confirm") return "needs you";
   if (status === "pending_execute" || status === "executing") return null;
   if (status === "declined" || status === "revoked") return status === "declined" ? "done" : null;
+  if (status === "cant") return "can't";
   return status;
 }
 
@@ -660,6 +664,10 @@ function cardOf(item, accountId, now = nowSecs()) {
     correlation_id: item.correlation_id,
     distance: item.status === "watching" ? distanceFor(item) : null,
     last_mark: item.last_mark || null,
+    asked_entity: item.asked_entity || null,
+    cant_kind: item.cant_kind || null,
+    repeat_count: item.repeat_count || 0,
+    sub_line: item.sub_line || null,
   };
 }
 
@@ -688,6 +696,7 @@ function trailOf(accountId, instructionId) {
       line: event.detail || labelFor(event),
       signed: Boolean(event.signed) && Boolean(event.ref || event.event_type === "confirmed" || event.event_type === "paused" || event.event_type === "resumed"),
       ref: event.ref,
+      origin: event.origin || null,
     });
   }
   if (checks.length && !lines.some((l) => l.event_type === "check_aggregate")) {
@@ -741,7 +750,7 @@ function sortCards(a, b) {
     if (status === "pending_execute" || status === "executing") return 1;
     if (status === "watching") return 2;
     if (status === "paused") return 3;
-    if (status === "done") return 4;
+    if (status === "done" || status === "cant") return 4;
     return 5;
   };
   const d = rank(a.status) - rank(b.status);
@@ -823,4 +832,95 @@ export function laborStats(accountId, windowSecs = 7 * 86400, now = nowSecs()) {
     near_miss: near.length,
     executed: executed.length,
   };
+}
+
+const CANT_SUBLINE = "World doesn't trade this · kept for the record";
+
+export function upsertCant(accountId, body, now = nowSecs()) {
+  const entity = String(body.asked_entity || "").trim().toLowerCase();
+  if (!entity) return { ok: false, error: "entity_required" };
+  const data = loadItems(accountId);
+  data.items = data.items || [];
+  const existing = data.items.find(
+    (row) =>
+      row.status === "cant" &&
+      String(row.asked_entity || "").toLowerCase() === entity &&
+      stillVisible(row, now),
+  );
+  const origin = body.origin || null;
+  const utteranceRef = body.utterance_ref || body.ref || null;
+  const heard = String(body.heard || body.sentence || "").trim();
+  const wall = String(body.wall || "").trim();
+  const sentence = String(body.sentence || heard || "").trim().slice(0, 160);
+
+  if (existing) {
+    existing.repeat_count = (existing.repeat_count || 1) + 1;
+    existing.sub_line =
+      body.sub_line ||
+      (existing.repeat_count === 2
+        ? "asked twice · kept for the record"
+        : existing.repeat_count === 3
+          ? "asked three times · kept for the record"
+          : `asked ${existing.repeat_count} times · kept for the record`);
+    existing.updated_at = now;
+    existing.status_changed_at = now;
+    saveItems(accountId, data);
+    appendEvent(accountId, existing.instruction_id, "heard", heard, now, {
+      ref: utteranceRef,
+      origin,
+      actor: "you",
+    });
+    if (wall) {
+      appendEvent(accountId, existing.instruction_id, "sent_to_thread", wall, now, {
+        ref: utteranceRef,
+      });
+    }
+    return { ok: true, repeat: true, instruction: cardOf(existing, accountId, now) };
+  }
+
+  const instructionId = body.instruction_id || newId();
+  const item = {
+    instruction_id: instructionId,
+    account_id: Number(accountId) || accountId,
+    kind: "cant",
+    sentence,
+    params: {
+      asked: entity,
+      answer: "not tradeable on World",
+      world_trades: "crypto — spot, perps, lending",
+    },
+    status: "cant",
+    policy_scope: null,
+    source_ref: body.correlation_id || utteranceRef || instructionId,
+    confirm_ref: null,
+    result_ref: null,
+    watch_id: null,
+    task_id: allocTaskId(data),
+    correlation_id: body.correlation_id || instructionId,
+    expires_at: null,
+    check_stats: { last_check_at: null, checks_7d: 0 },
+    pending: null,
+    fire_kind: null,
+    instrument: null,
+    asked_entity: entity,
+    cant_kind: body.cant_kind || "no_market",
+    repeat_count: 1,
+    sub_line: body.sub_line || CANT_SUBLINE,
+    created_at: now,
+    updated_at: now,
+    status_changed_at: now,
+  };
+  data.items.push(item);
+  saveItems(accountId, data);
+  appendEvent(accountId, instructionId, "heard", heard, now, {
+    ref: utteranceRef,
+    origin,
+    actor: "you",
+  });
+  if (wall) {
+    appendEvent(accountId, instructionId, "sent_to_thread", wall, now, {
+      ref: utteranceRef,
+    });
+  }
+  return { ok: true, repeat: false, instruction: cardOf(item, accountId, now) };
 }

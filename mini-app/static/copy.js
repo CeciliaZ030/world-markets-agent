@@ -10,6 +10,7 @@ const COPY = {
     "done",
     "expired",
     "blocked",
+    "can't",
   ],
   header: {
     title: "World Markets",
@@ -78,6 +79,8 @@ const COPY = {
     pendingPause: "pause sent to thread",
     pendingResume: "resume sent to thread",
     expired: "expired {date} · never met — noted in that week's digest",
+    cant: "World doesn't trade this · kept for the record",
+    cantRepeat: "asked {n} · kept for the record",
   },
   emptyTeach:
     "aomi is holding nothing. Anything you say in the thread — \"watch the floor\", \"if it touches X, do Y\" — lands here and stays until it's done or expires.",
@@ -135,6 +138,15 @@ const COPY = {
       "a straight render of the append-only event log · corrections are new events, never edits",
     detentHalf: "drag ↑ for the trail",
     detentFull: "flick ↓ to dismiss",
+  },
+  cant: {
+    subline: "World doesn't trade this · kept for the record",
+    sublineRepeat: "asked {n} · kept for the record",
+    factAsked: "asked",
+    factAnswer: "not tradeable on World",
+    factTrades: "crypto — spot, perps, lending",
+    factTradesLabel: "World trades",
+    factAnswerLabel: "answer",
   },
   position: {
     actsLabel: "ACTIONS — SENT TO CHAT AS TEXT",

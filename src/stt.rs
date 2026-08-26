@@ -103,12 +103,8 @@ fn deepgram(
         .header("Authorization", format!("Token {key}"))
         .header("Content-Type", content_type)
         .body(audio.to_vec());
-    for term in keyterms.iter().take(MAX_KEYTERMS) {
-        let trimmed = term.trim();
-        if trimmed.len() < 2 {
-            continue;
-        }
-        request = request.query(&[("keywords", format!("{trimmed}:2"))]);
+    for term in keyword_params(keyterms) {
+        request = request.query(&[("keywords", term)]);
     }
     let keyterm_applied = !keyterms.is_empty();
     let response = request
@@ -124,6 +120,27 @@ fn deepgram(
         .json()
         .map_err(|err| SttError::provider(format!("deepgram returned invalid JSON ({err})")))?;
     parse_deepgram(value, keyterm_applied)
+}
+
+/// nova-2 `keywords` intensifier is roughly 1–10. Instruments use 5 so ETH/WETH
+/// beat near-misses; acts and size frames use 3; per-account nicknames stay at 2.
+/// Whisper cannot apply this layer. Phrases with spaces are skipped — nova-2
+/// keywords are single tokens (`worth`, not `worth of`).
+fn keyword_params(keyterms: &[String]) -> Vec<String> {
+    keyterms
+        .iter()
+        .take(MAX_KEYTERMS)
+        .filter_map(|term| keyword_param(term))
+        .collect()
+}
+
+fn keyword_param(term: &str) -> Option<String> {
+    let trimmed = term.trim();
+    if trimmed.len() < 2 || trimmed.contains(char::is_whitespace) {
+        return None;
+    }
+    let intensifier = crate::speech_ontology::intensifier_for(trimmed);
+    Some(format!("{trimmed}:{intensifier}"))
 }
 
 fn parse_deepgram(value: Value, keyterm_applied: bool) -> Result<Transcript, SttError> {
@@ -268,5 +285,18 @@ mod tests {
         assert_eq!(parsed.words.len(), 2);
         assert_eq!(parsed.words[1].w, "weth");
         assert!(parsed.keyterm_applied);
+    }
+
+    #[test]
+    fn keyword_params_use_kind_intensifiers() {
+        let params = keyword_params(&[
+            "ETH".to_string(),
+            "buy".to_string(),
+            "worth".to_string(),
+            "the loop".to_string(),
+            "x".to_string(),
+            "nickname".to_string(),
+        ]);
+        assert_eq!(params, vec!["ETH:5", "buy:3", "worth:3", "nickname:2"]);
     }
 }
