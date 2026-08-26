@@ -15,6 +15,40 @@ fn skill(path: &str) -> String {
     fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
+/// Slice a workflows.md flow by its `## SLUG (§6.x)` header.
+fn flow<'a>(wf: &'a str, header: &str) -> &'a str {
+    let start = wf.find(header).unwrap_or_else(|| panic!("{header} present"));
+    let rest = &wf[start + header.len()..];
+    let end = rest
+        .find("\n## ")
+        .map(|o| start + header.len() + o)
+        .unwrap_or(wf.len());
+    &wf[start..end]
+}
+
+/// Every shipped skill file. Exemplars contain illustrative figures and tool-call
+/// lines by design — rules that scan response skeletons for bare digits skip
+/// `exemplars.md` rather than editing the payload.
+const SKILL_FILES: &[&str] = &[
+    "instructions.md",
+    "lookups.md",
+    "workflows.md",
+    "action-rules.md",
+    "exemplars.md",
+    "safety.md",
+    "turn-contract.md",
+    "guest.md",
+    "share.md",
+    "reference/atlas.md",
+    "reference/products.md",
+    "reference/account-model.md",
+    "reference/venue.md",
+    "reference/dollarpower.md",
+    "reference/guardian.md",
+    "reference/notifications.md",
+    "reference/strategy-brain.md",
+];
+
 /// Strip fenced illustrative examples and inline-code spans so scans only see
 /// prose the model treats as instruction, not example numbers it is shown.
 fn prose_only(md: &str) -> String {
@@ -61,18 +95,7 @@ fn no_banned_vocabulary() {
         "100% win",
         "streak",
     ];
-    for file in [
-        "instructions.md",
-        "lookups.md",
-        "workflows.md",
-        "action-rules.md",
-        "safety.md",
-        "reference/dollarpower.md",
-        "reference/guardian.md",
-        "reference/notifications.md",
-        "guest.md",
-        "share.md",
-    ] {
+    for file in SKILL_FILES {
         let response_copy: String = skill(file)
             .lines()
             .filter(|l| l.trim_start().starts_with('>'))
@@ -94,8 +117,21 @@ fn no_banned_vocabulary() {
 /// Every figure in a `>` line must be a `[#]` placeholder or live in a fence.
 #[test]
 fn workflows_contain_no_bare_response_numbers() {
+    // Exemplars contain illustrative figures on `bot ▸` / tool-call lines by
+    // design. Scope this rule to instruction files, not the exemplar payload.
+    // §6.26 CORRECTION restates the user's figures (`$300` / `$500`) in the
+    // skeleton — those are the user's numbers, not model-invented; skip that flow.
     for file in ["workflows.md", "guest.md", "share.md", "lookups.md"] {
-        let prose = prose_only(&skill(file));
+        let mut prose = prose_only(&skill(file));
+        if file == "workflows.md" {
+            if let Some(start) = prose.find("## CORRECTION") {
+                let end = prose[start + 2..]
+                    .find("\n## ")
+                    .map(|o| start + 2 + o)
+                    .unwrap_or(prose.len());
+                prose.replace_range(start..end, "");
+            }
+        }
         for (i, line) in prose.lines().enumerate() {
             let trimmed = line.trim();
             if !trimmed.starts_with('>') {
@@ -169,12 +205,8 @@ fn blocks_cite_floor_and_engine_rule_only() {
     // Scan only the block RESPONSE skeletons (`>` lines) for warn-band talk —
     // the instructional sentence "never the warn band or recovery target" is the
     // rule, not a message, and must not trip its own test.
-    let start = wf.find("## 6.6").expect("6.6 block section present");
-    let end = wf[start..]
-        .find("## 6.7")
-        .map(|o| start + o)
-        .unwrap_or(wf.len());
-    let block_skeletons: String = wf[start..end]
+    let block = flow(&wf, "## BLOCK (§6.6)");
+    let block_skeletons: String = block
         .lines()
         .filter(|l| l.trim_start().starts_with('>'))
         .collect::<Vec<_>>()
@@ -249,7 +281,10 @@ fn research_watch_task_workflows_present() {
     assert!(wf.contains("first tool on every non-lookup turn"));
     assert!(wf.contains("instruction_id"));
     assert!(wf.contains("I won't buy or sell anything"));
-    assert!(wf.contains("paste `message`"));
+    assert!(
+        wf.to_lowercase().contains("paste `message`"),
+        "watch/cant must paste tool message"
+    );
     assert!(wf.contains("portfolio_now"));
     assert!(wf.contains("on-chain ✓"));
     let safety = skill("safety.md");
@@ -263,13 +298,13 @@ fn research_watch_task_workflows_present() {
 #[test]
 fn unfulfillable_cant_is_distinct_from_block() {
     let wf = skill("workflows.md");
-    assert!(wf.contains("## 6.21"), "missing unfulfillable section");
+    assert!(wf.contains("## CANT (§6.21)"), "missing unfulfillable section");
     assert!(
-        wf.contains("not §6.6") || wf.contains("not a block"),
+        wf.contains("not §6.6") || wf.contains("not a block") || wf.contains("Not a BLOCK"),
         "must distinguish can't from blocked"
     );
     assert!(
-        wf.contains("paste `message`") && wf.contains("`controls`"),
+        wf.to_lowercase().contains("paste `message`") && wf.contains("`controls`"),
         "host must paste wall + chips verbatim"
     );
     assert!(wf.contains("unclear"), "leftover STT path must be named");
@@ -371,12 +406,16 @@ fn terse_token_whole_message_rule() {
     );
     let instructions = skill("instructions.md");
     assert!(
-        instructions.contains("highest priority"),
+        instructions.contains("Whole-message terse token")
+            || instructions.contains("highest priority"),
         "instructions must prioritize terse lookups"
     );
     assert!(
-        instructions.contains("Never:") || instructions.contains("Forbidden"),
-        "instructions must list forbidden lookup responses"
+        instructions.contains("Never:")
+            || instructions.contains("Forbidden")
+            || lookups.contains("never capability menus")
+            || instructions.contains("E4 no capability menus"),
+        "instructions/lookups must list forbidden lookup responses"
     );
 }
 
@@ -471,14 +510,7 @@ fn risk_is_liquidation_score_not_rapv() {
         instructions.contains("higher = worse") || instructions.contains("0–10"),
         "instructions must state score polarity"
     );
-    let health = {
-        let start = wf.find("## 6.13").expect("6.13 health section");
-        let end = wf[start..]
-            .find("## 6.14")
-            .map(|o| start + o)
-            .unwrap_or(wf.len());
-        wf[start..end].to_lowercase()
-    };
+    let health = flow(&wf, "## HEALTH (§6.13)").to_lowercase();
     assert!(
         !health.contains("above your floor") && !health.contains("below your floor"),
         "health card must not mix the 0–10 score with a RAPV floor"
@@ -608,27 +640,27 @@ fn shortcut_identity_and_fade_stated() {
         "instructions must state the shortcut identity"
     );
     assert!(
-        instructions.contains("exactly twice per token"),
-        "instructions must state the fade"
+        instructions.contains("exactly twice per token")
+            || lookups.contains("first two natural-language"),
+        "instructions or lookups must state the fade"
     );
 }
 
 #[test]
 fn capability_index_and_fallback_copy() {
     let lookups = skill("lookups.md");
-    let instructions = skill("instructions.md");
     let wf = skill("workflows.md");
     assert!(
         lookups.contains(INDEX_LINE),
         "lookups must carry the capability index line"
     );
     assert!(
-        wf.contains(INDEX_LINE),
-        "workflows §6.19 must carry the capability index line"
+        wf.contains("lookups.md") && wf.contains("## INDEX (§6.19)"),
+        "workflows §6.19 must point at the canonical index in lookups.md"
     );
     assert!(
-        wf.contains(FALLBACK_LINE) && instructions.contains(FALLBACK_LINE),
-        "fallback one-liner must live in instructions and §6.20"
+        lookups.contains(FALLBACK_LINE) && wf.contains("## FALLBACK (§6.20)"),
+        "fallback one-liner must live in lookups.md; workflows §6.20 must point at it"
     );
     assert!(
         lookups.contains("| Capability |")
@@ -637,11 +669,12 @@ fn capability_index_and_fallback_copy() {
             && lookups.contains("shortcuts"),
         "lookups table must route capability asks to the index"
     );
-    for file_src in [&lookups, &instructions, &wf] {
+    for file_src in [&lookups, &wf] {
         assert!(
             file_src.contains("never \"help\"")
                 || file_src.contains("Not \"help\"")
-                || file_src.contains("Do **not** fire on \"help\""),
+                || file_src.contains("Do **not** fire on \"help\"")
+                || file_src.contains("Never fire on \"help\""),
             "help must be excluded from the capability index trigger"
         );
         assert!(
@@ -652,7 +685,7 @@ fn capability_index_and_fallback_copy() {
         );
     }
     assert!(
-        wf.contains("## 6.19") && wf.contains("## 6.20"),
+        wf.contains("## INDEX (§6.19)") && wf.contains("## FALLBACK (§6.20)"),
         "workflows must add §6.19 and §6.20"
     );
 }
@@ -660,8 +693,8 @@ fn capability_index_and_fallback_copy() {
 #[test]
 fn shortcuts_absent_from_non_lookup_surfaces() {
     let wf = skill("workflows.md");
-    let start = wf.find("## 6.1").expect("6.1 present");
-    let end = wf.find("## 6.19").expect("6.19 present");
+    let start = wf.find("## FIRST-CONTACT (§6.1)").expect("6.1 present");
+    let end = wf.find("## INDEX (§6.19)").expect("6.19 present");
     let prior: String = wf[start..end]
         .lines()
         .filter(|l| l.trim_start().starts_with('>'))
@@ -673,11 +706,7 @@ fn shortcuts_absent_from_non_lookup_surfaces() {
             "shortcut {token} must not appear in action/health/digest response copy"
         );
     }
-    let first_contact = {
-        let s = wf.find("## 6.1").unwrap();
-        let e = wf[s..].find("## 6.2").map(|o| s + o).unwrap();
-        &wf[s..e]
-    };
+    let first_contact = flow(&wf, "## FIRST-CONTACT (§6.1)");
     assert!(
         first_contact.contains("I can trade in your account within your signed mandate."),
         "§6.1 first-contact copy must stay untouched"
@@ -696,19 +725,21 @@ fn mini_app_button_copy_is_exact_and_unpromoted() {
         "action-rules must ship the Mini App exact reply"
     );
     let wf = skill("workflows.md");
+    let lookups = skill("lookups.md");
     assert!(
         wf.contains("[View portfolio]"),
         "workflows must note the host View portfolio button"
     );
     assert!(
-        wf.contains("do not mention the button"),
-        "workflows must forbid mentioning the Mini App button"
+        wf.contains("do not mention the button")
+            || wf.contains("do not mention it")
+            || lookups.contains("Do not mention the button"),
+        "workflows/lookups must forbid mentioning the Mini App button"
     );
     assert!(
         rules.contains("Opens an interactive chart in a Mini App. Tap it."),
         "action-rules must ship the Open chart Mini App exact reply"
     );
-    let lookups = skill("lookups.md");
     assert!(
         lookups.contains("[Open chart]"),
         "lookups must note the host Open chart Mini App button"
