@@ -740,6 +740,10 @@ impl WorldMarketsApp {
             },
         )
         .ok();
+        let post_trade_rapv = projected
+            .as_ref()
+            .map(|p| p.rapv)
+            .or_else(|| crate::liquidation_risk::dev_seed_rapv(&account));
         let mandate = Mandate::bound(ctx.attribute_path(&["handover_mandate"]));
         let verdict = match mandate {
             Ok(mandate) => mandate.evaluate(&TradeFacts {
@@ -751,7 +755,7 @@ impl WorldMarketsApp {
                 mark_price,
                 current_position_quantity,
                 risk_adjusted_portfolio_value: rapv,
-                post_trade_risk_adjusted_portfolio_value: projected.as_ref().map(|p| p.rapv),
+                post_trade_risk_adjusted_portfolio_value: post_trade_rapv,
                 eligible_for_liquidation: account.eligible_for_liquidation,
             }),
             Err(verdict) => verdict,
@@ -790,9 +794,11 @@ impl WorldMarketsApp {
                 "estimated_notional": estimated_notional.to_string(),
                 "order_book": market.book,
                 "pre_execution_risk_adjusted_portfolio_value": account.risk_adjusted_portfolio_value,
-                "post_trade_risk_adjusted_portfolio_value": projected.as_ref().map(|p| p.rapv_display.clone()),
-                "post_trade_risk_is_estimate": projected.as_ref().map(|p| p.is_estimate),
-                "post_trade_risk_source": projected.as_ref().map(|p| p.source),
+                "post_trade_risk_adjusted_portfolio_value": projected.as_ref().map(|p| p.rapv_display.clone()).or_else(|| {
+                    post_trade_rapv.map(|value| value.normalize().to_string())
+                }),
+                "post_trade_risk_is_estimate": projected.as_ref().map(|p| p.is_estimate).or(post_trade_rapv.and(Some(true))),
+                "post_trade_risk_source": projected.as_ref().map(|p| p.source).or(post_trade_rapv.map(|_| crate::liquidation_risk::dev_seed_source())),
                 "pre_execution_eligible_for_liquidation": account.eligible_for_liquidation,
                 "policy_result": verdict,
                 "executable": false,
