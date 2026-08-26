@@ -352,10 +352,12 @@ function extractEntity(clause, slots) {
   if (Array.isArray(slots) && slots.length) {
     const lower = String(clause || "").toLowerCase();
     const inst = slots.find((row) => {
-      if (row?.kind !== "instrument" || !row.surface) return false;
-      return lower.includes(String(row.surface).toLowerCase());
+      if (row?.kind !== "instrument") return false;
+      const surface = String(row.surface || "").toLowerCase();
+      const target = String(row.target || "").toLowerCase();
+      return (surface && lower.includes(surface)) || (target && lower.includes(target));
     });
-    if (inst) return String(inst.surface).toLowerCase();
+    if (inst) return String(inst.target || inst.surface).toLowerCase();
     return null;
   }
   const actAt = tokens.findIndex((t) => ACTS.has(t));

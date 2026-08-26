@@ -66,19 +66,30 @@ export function entryCounts() {
   const counts_by_kind = {};
   let channels_speech = 0;
   let channels_text = 0;
+  let channels_speech_only = 0;
+  let channels_text_only = 0;
+  let channels_both = 0;
   const entries = ontologyEntries();
   for (const entry of entries) {
     const kind = entry.kind || "unknown";
     counts_by_kind[kind] = (counts_by_kind[kind] || 0) + 1;
     const channels = channelsOf(entry);
-    if (channels.includes("speech")) channels_speech += 1;
-    if (channels.includes("text")) channels_text += 1;
+    const speech = channels.includes("speech");
+    const text = channels.includes("text");
+    if (speech) channels_speech += 1;
+    if (text) channels_text += 1;
+    if (speech && text) channels_both += 1;
+    else if (speech) channels_speech_only += 1;
+    else if (text) channels_text_only += 1;
   }
   return {
     counts_by_kind,
     entry_count: entries.length,
     channels_speech,
     channels_text,
+    channels_speech_only,
+    channels_text_only,
+    channels_both,
   };
 }
 

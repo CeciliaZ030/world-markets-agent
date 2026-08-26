@@ -39,6 +39,12 @@ test("version stays 2 and confusables are speech-only", () => {
   const counts = entryCounts();
   assert.ok(counts.entry_count > 0);
   assert.ok(counts.channels_speech >= counts.channels_text);
+  assert.ok(counts.channels_speech_only > 0);
+  assert.ok(counts.channels_both > 0);
+  assert.equal(
+    counts.channels_speech_only + counts.channels_both,
+    counts.channels_speech,
+  );
   assert.equal(typeof ontologyFingerprint(), "string");
   assert.equal(ontologyFingerprint().length, 64);
   assert.ok(ontologyFrames().some((row) => row.id === "buy_sell"));
@@ -105,7 +111,13 @@ test("extractEntity uses instrument slot surface and skips cancel these", () => 
     extractEntity("buy fifty dollars worth of ether", [
       { kind: "instrument", surface: "ether", target: "ETH", source: "alias" },
     ]),
-    "ether",
+    "eth",
+  );
+  assert.equal(
+    extractEntity("buy fifty dollars worth of ETH", [
+      { kind: "instrument", surface: "ether", target: "ETH", source: "alias" },
+    ]),
+    "eth",
   );
   assert.equal(extractEntity("cancel these watches", []), null);
   const heard = handleHeard("ont-3", {

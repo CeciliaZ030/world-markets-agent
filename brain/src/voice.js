@@ -333,10 +333,22 @@ export function exportEval(accountId) {
     chosen: row.accepted_intent,
     utterance_ref: row.utterance_ref,
   }));
+  const utterances = training
+    ? data.utterances.map((u) => ({
+        ...u,
+        channel: u.channel || null,
+        raw: u.repaired_from || u.text,
+        normalized: u.text,
+        proposals: u.proposals || [],
+        grammar: u.grammar || null,
+        action_ir: u.action_ir || null,
+        ontology_version: u.ontology_version ?? null,
+      }))
+    : [];
   return {
     ok: true,
     training_use: training,
-    utterances: training ? data.utterances : [],
+    utterances,
     pairs,
   };
 }

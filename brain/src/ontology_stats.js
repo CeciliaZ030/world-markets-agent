@@ -137,8 +137,9 @@ export function ontologySummary() {
     entry_count: counts.entry_count,
     channels_speech: counts.channels_speech,
     channels_text: counts.channels_text,
-    channels_speech_only: counts.channels_speech - Math.min(counts.channels_speech, counts.channels_text),
-    channels_both: Math.min(counts.channels_speech, counts.channels_text),
+    channels_speech_only: counts.channels_speech_only,
+    channels_text_only: counts.channels_text_only,
+    channels_both: counts.channels_both,
     last_snapshot: last,
     snapshots: snapshots.items,
   };
@@ -216,10 +217,12 @@ function emptyChannelStats() {
     grammar: { matched: 0, partial: 0, none: 0 },
     none_with_act: 0,
     repaired_n: 0,
+    cant_n: 0,
+    correction_n: 0,
   };
 }
 
-function absorbUtterance(stats, utterance) {
+function absorbUtterance(stats, utterance, correctedIds) {
   stats.n += 1;
   const grammar = utterance.grammar || "none";
   if (stats.grammar[grammar] == null) stats.grammar[grammar] = 0;
@@ -234,6 +237,8 @@ function absorbUtterance(stats, utterance) {
   if (grammar === "none" && utterance.action_ir?.act) {
     stats.none_with_act += 1;
   }
+  if (utterance.cant_kind) stats.cant_n += 1;
+  if (correctedIds && correctedIds.has(utterance.id)) stats.correction_n += 1;
 }
 
 function tableToRows(table) {
@@ -409,6 +414,7 @@ export function ontologyStats({ accountId, from, to, all } = {}) {
   const weekFrom = now - FRAME_GAP_LOOKBACK_SECS;
   const ids = all ? listVoiceAccountIds() : accountId ? [String(accountId)] : [];
   const utterances = [];
+  const correctedIds = new Set();
   let trainingUse = false;
   for (const id of ids) {
     const data = loadVoiceFile(id);
@@ -417,6 +423,9 @@ export function ontologyStats({ accountId, from, to, all } = {}) {
       if (!inRange(row.ts || 0, fromTs, toTs)) continue;
       utterances.push(row);
     }
+    for (const row of data.corrections || []) {
+      if (row.utterance_ref) correctedIds.add(row.utterance_ref);
+    }
   }
 
   const split = (fromBound, toBound) => {
@@ -424,7 +433,7 @@ export function ontologyStats({ accountId, from, to, all } = {}) {
     const text = emptyChannelStats();
     for (const u of utterances) {
       if (!inRange(u.ts || 0, fromBound, toBound)) continue;
-      absorbUtterance(u.channel === "text" ? text : speech, u);
+      absorbUtterance(u.channel === "text" ? text : speech, u, correctedIds);
     }
     return { speech, text };
   };

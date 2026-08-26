@@ -81,10 +81,14 @@ test("utterance keeps repaired_from and heard_echo is repaired text", () => {
   const out = ingestUtterance("25", {
     transcript: "buy fifty dollars worth of ETH",
     repaired_from: "buy fifty dollars worth of beef",
+    channel: "speech",
+    ontology_version: 2,
   });
   assert.equal(out.heard_echo, "buy fifty dollars worth of ETH");
   assert.equal(out.utterance.text, "buy fifty dollars worth of ETH");
   assert.equal(out.utterance.repaired_from, "buy fifty dollars worth of beef");
+  assert.equal(out.utterance.channel, "speech");
+  assert.equal(out.utterance.ontology_version, 2);
 });
 
 test("confusable surfaces are not seeded as keyterms", () => {

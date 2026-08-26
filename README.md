@@ -159,6 +159,12 @@ URLs after startup:
 
 - Portfolio: `http://127.0.0.1:8080/?preview=dev`
 - Chart: `http://127.0.0.1:8080/chart?symbol=AAPL&period=d&preview=dev`
+- Utterance ontology (localhost only): `http://127.0.0.1:8080/dev/ontology?preview=dev`
+
+Speech and typed compose share one vocabulary file,
+[`assets/speech_ontology.json`](assets/speech_ontology.json). The local page
+shows when to add an alias or a speech confusable; production never writes that
+JSON. Operator runbook: [`docs/USER-GUIDE-utterance-ontology.md`](docs/USER-GUIDE-utterance-ontology.md).
 
 Options: `dev-full.sh --no-open`, `--no-cli`, `--no-sidecar`, `--help`.
 

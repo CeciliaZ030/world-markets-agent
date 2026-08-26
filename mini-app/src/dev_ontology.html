@@ -78,8 +78,8 @@
 
     const snaps = (summary.snapshots || stats.snapshots || []);
     document.getElementById("snapshots").innerHTML = snaps.length
-      ? `<table><thead><tr><th>when</th><th>ver</th><th>fingerprint</th><th>entries</th><th>speech</th><th>text</th></tr></thead><tbody>${
-          snaps.slice().reverse().map(s => `<tr><td>${when(s.ts)}</td><td>${s.version}</td><td><code>${shortFp(s.fingerprint)}</code></td><td>${s.entry_count}</td><td>${s.channels_speech}</td><td>${s.channels_text}</td></tr>`).join("")
+      ? `<table><thead><tr><th>when</th><th>ver</th><th>fingerprint</th><th>entries</th><th>confusable</th><th>speech</th><th>text</th></tr></thead><tbody>${
+          snaps.slice().reverse().map(s => `<tr><td>${when(s.ts)}</td><td>${s.version}</td><td><code>${shortFp(s.fingerprint)}</code></td><td>${s.entry_count}</td><td>${(s.counts_by_kind||{}).confusable || 0}</td><td>${s.channels_speech}</td><td>${s.channels_text}</td></tr>`).join("")
         }</tbody></table>`
       : `<p class="empty">No snapshots yet. Brain records one on boot when the JSON version or fingerprint changes.</p>`;
 
@@ -90,14 +90,16 @@
       return `<h3 style="font-size:14px;margin:16px 0 6px">${title}</h3>
         <table><thead><tr><th></th><th>speech</th><th>text</th></tr></thead><tbody>
         ${row("utterances", s.n, t.n)}
-        ${row("proposals", s.proposal_n, t.proposal_n)}
-        ${row("size-rule", s.size_rule_n, t.size_rule_n)}
-        ${row("repaired", s.repaired_n, t.repaired_n)}
+        ${row("repair rate", pct(s.repaired_n, s.n), pct(t.repaired_n, t.n))}
+        ${row("proposal rate", pct(s.proposal_n, s.n), pct(t.proposal_n, t.n))}
         ${row("grammar matched", (s.grammar||{}).matched, (t.grammar||{}).matched)}
         ${row("grammar partial", (s.grammar||{}).partial, (t.grammar||{}).partial)}
         ${row("grammar none", (s.grammar||{}).none, (t.grammar||{}).none)}
+        ${row("cant", s.cant_n, t.cant_n)}
+        ${row("cant rate", pct(s.cant_n, s.n), pct(t.cant_n, t.n))}
+        ${row("correction rate", pct(s.correction_n, s.n), pct(t.correction_n, t.n))}
+        ${row("size-rule", s.size_rule_n, t.size_rule_n)}
         ${row("none + act", s.none_with_act, t.none_with_act)}
-        ${row("proposal rate", pct(s.proposal_n, s.n), pct(t.proposal_n, t.n))}
         </tbody></table>`;
     }
     document.getElementById("behavior").innerHTML =
