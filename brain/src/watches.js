@@ -12,6 +12,7 @@ import { admit, dueForDailyFlush, emptyLimiter, flushHeld } from "./rateLimit.js
 import { enqueue } from "./outbound.js";
 import {
   attachWatch,
+  cancelInstruction,
   onWatchExpired,
   onWatchFired,
   recordCheck,
@@ -182,6 +183,30 @@ export function resumeWatch(accountId, id, instructionId) {
   }
   if (!id) return { ok: false, error: "not_found" };
   return setWatchStatus(accountId, id, "active");
+}
+
+export function cancelTask(accountId, id) {
+  const result = cancelInstruction(accountId, id);
+  if (!result.ok) return result;
+  if (result.watch_id) {
+    const dropped = cancelWatch(accountId, result.watch_id);
+    if (!dropped.ok && dropped.error !== "not_found") return dropped;
+  }
+  const command = result.command || `cancel task ${result.task_id}`;
+  const reply = result.reply || `cancelled ${result.task_id}`;
+  enqueue({
+    account_id: Number(accountId) || accountId,
+    kind: "user_command",
+    message: command,
+    instruction_id: result.instruction?.instruction_id || null,
+  });
+  enqueue({
+    account_id: Number(accountId) || accountId,
+    kind: "notice",
+    message: reply,
+    instruction_id: result.instruction?.instruction_id || null,
+  });
+  return { ...result, command, reply, thread: { command, reply } };
 }
 
 export { findWatch };

@@ -37,7 +37,9 @@ let candleSeries = null;
 let pollTimer = null;
 let ageTimer = null;
 let toastTimer = null;
+let burstTimer = null;
 let suppressClickUntil = 0;
+const flushedIds = new Set();
 
 const state = {
   view: "main",
@@ -56,14 +58,65 @@ const state = {
   toast: null,
   compact: true,
   riskOpen: false,
-  flags: { primary_view: "ledger", jobline_negative: false, family: "blue" },
+  flags: {
+    primary_view: "ledger",
+    jobline_negative: false,
+    family: "blue",
+    voice_home: true,
+    voice_mode: "hold",
+    live_words: true,
+  },
   portfolio: null,
   ledger: [],
   summary: { holding: 0, needs_you: 0, last_check_at: null },
   ledgerStatus: "loading",
   pending: {},
   optimistic: [],
+  voice: {
+    phase: "idle",
+    heldMs: 0,
+    transcript: "",
+    nudge: "",
+    micDenied: false,
+    typePulse: false,
+  },
 };
+
+function applyFlags(flags) {
+  state.flags = {
+    primary_view: "ledger",
+    jobline_negative: false,
+    family: "blue",
+    voice_home: true,
+    voice_mode: "hold",
+    live_words: true,
+    ...(flags || {}),
+  };
+}
+
+function voiceHomeOn() {
+  return state.flags.voice_home !== false;
+}
+
+function voiceMode() {
+  return state.flags.voice_mode === "tap" ? "tap" : "hold";
+}
+
+function liveWordsOn() {
+  return state.flags.live_words !== false;
+}
+
+function isVoiceHome() {
+  return voiceHomeOn() && state.view === "main" && state.tab === "ledger" && !state.compact;
+}
+
+function showBottomBar() {
+  if (state.view !== "main") return true;
+  if (state.tab === "portfolio") return true;
+  if (state.compact) return true;
+  if (!voiceHomeOn()) return true;
+  return false;
+}
 
 function haptic(kind, arg) {
   const h = tg && tg.HapticFeedback;
@@ -144,11 +197,35 @@ function instructionStart(raw) {
   return s;
 }
 
+function remainingSecs(row) {
+  if (!row || row.status !== "pending_execute") return null;
+  if (row.execute_at) return Math.max(0, Number(row.execute_at) - nowSecs());
+  if (row.remaining_secs != null) return Math.max(0, Number(row.remaining_secs));
+  return null;
+}
+
+function clientProgress(row) {
+  if (!row) return null;
+  if (row.status === "pending_execute") {
+    const delay = Number(row.delay_secs) || 3;
+    const rem = remainingSecs(row);
+    if (rem == null) return row.progress_pct != null ? Number(row.progress_pct) : null;
+    return Math.max(0, Math.min(100, Math.round(((delay - rem) / delay) * 100)));
+  }
+  return row.progress_pct != null ? Number(row.progress_pct) : null;
+}
+
 function heldCount() {
   return instructions().filter((row) =>
-    ["with_aomi", "watching", "triggered", "awaiting_confirm", "executing", "paused"].includes(
-      row.status,
-    ),
+    [
+      "with_aomi",
+      "watching",
+      "triggered",
+      "awaiting_confirm",
+      "pending_execute",
+      "executing",
+      "paused",
+    ].includes(row.status),
   ).length;
 }
 
@@ -167,7 +244,7 @@ function zoneOf(row) {
   if (row.status === "awaiting_confirm" || row.status === "triggered" || row.status === "with_aomi") {
     return "needs";
   }
-  if (row.status === "executing") return "motion";
+  if (row.status === "pending_execute" || row.status === "executing") return "motion";
   if (row.status === "watching" || row.status === "paused") return "watch";
   const today = new Date().toISOString().slice(0, 10);
   const changed = new Date((row.status_changed_at || row.updated_at || 0) * 1000)
@@ -178,9 +255,14 @@ function zoneOf(row) {
 }
 
 function glyph(row) {
+  if (row.voice_draft) return { g: "›", cls: "warn" };
   if (row.status === "awaiting_confirm" || row.status === "triggered") return { g: "!", cls: "" };
   if (row.status === "with_aomi") return { g: "›", cls: "" };
   if (row.status === "executing") return { g: "", spin: true };
+  if (row.status === "pending_execute") {
+    const n = remainingSecs(row);
+    return { g: n == null ? "·" : String(n), cls: "faint" };
+  }
   if (row.status === "paused") return { g: "❚❚", cls: "faint" };
   if (row.status === "done") return { g: "✓", cls: "pos" };
   if (row.status === "expired") return { g: "·", cls: "faint" };
@@ -203,7 +285,8 @@ function cancellable(row) {
     row.status === "paused" ||
     row.status === "with_aomi" ||
     row.status === "awaiting_confirm" ||
-    row.status === "triggered"
+    row.status === "triggered" ||
+    row.status === "pending_execute"
   );
 }
 
@@ -245,12 +328,17 @@ async function cancelInPlace(row) {
 function subLine(row) {
   if (state.pending[row.instruction_id] === "pause") return C.sub.pendingPause;
   if (state.pending[row.instruction_id] === "resume") return C.sub.pendingResume;
+  if (row.voice_draft) return C.draftRow.sub;
   if (row.status === "with_aomi") return C.sub.withAomi;
   if (row.status === "paused") return C.sub.paused;
   if (row.status === "awaiting_confirm" || row.status === "triggered") {
     return row.trigger_value
       ? fillCopy(C.sub.needsYouAt, { value: row.trigger_value })
       : C.sub.needsYou;
+  }
+  if (row.status === "pending_execute") {
+    const n = remainingSecs(row);
+    return fillCopy(C.sub.pendingExecute, { n: n == null ? "—" : n });
   }
   if (row.status === "executing") {
     return fillCopy(C.sub.executing, {
@@ -296,12 +384,16 @@ function heartbeatText() {
 
 function headerHtml(mode) {
   const back = mode === "root" ? "⌄" : "‹";
-  const search = mode === "root" ? searchBarHtml() : "";
-  return `<header class="header">
+  const showSearch =
+    mode === "root" && (state.searchOpen || state.tab === "portfolio" || !voiceHomeOn());
+  const search = showSearch ? searchBarHtml() : "";
+  const sub = voiceHomeOn() ? C.header.subtitle : C.header.subtitleLedger;
+  const hdrCls = "header" + (showSearch ? " with-search" : "");
+  return `<header class="${hdrCls}">
     <button type="button" class="header-btn" id="backBtn" aria-label="Back">${back}</button>
     <div class="header-main">
       <h1 class="header-title">${escapeHtml(C.header.title)}</h1>
-      <p class="header-sub">${escapeHtml(C.header.subtitle)}</p>
+      <p class="header-sub">${escapeHtml(sub)}</p>
     </div>
     <button type="button" class="header-btn" id="moreBtn" aria-label="More">⋯</button>
     ${search}
@@ -407,9 +499,10 @@ function findProduct(id) {
 }
 
 function bottomHtml() {
+  if (!showBottomBar()) return "";
   const label = state.sheet || state.view !== "main" ? C.bottom.inner : C.bottom.launch;
   const mic =
-    state.view === "main" && !state.sheet
+    state.view === "main" && !state.sheet && !isVoiceHome()
       ? `<button type="button" class="voice-btn" id="voiceBtn" aria-label="${escapeHtml(C.voice.hold)}">🎙</button>`
       : "";
   return `<div class="bottom-row"><button type="button" class="bottom-bar" id="bottomBtn">${escapeHtml(label)}</button>${mic}</div>`;
@@ -546,7 +639,16 @@ function bindChrome() {
   const bottom = document.getElementById("bottomBtn");
   if (bottom) bottom.onclick = goBack;
   const more = document.getElementById("moreBtn");
-  if (more) more.onclick = () => {};
+  if (more) {
+    more.onclick = () => {
+      if (voiceHomeOn() && state.tab === "ledger" && !state.searchOpen) {
+        state.searchOpen = true;
+        paint();
+        const el = document.getElementById("search");
+        if (el) el.focus();
+      }
+    };
+  }
   bindSearch();
   bindVoice();
   const header = document.querySelector(".header");
@@ -564,6 +666,7 @@ function bindChrome() {
 }
 
 function paint() {
+  if (state.voice && state.voice.phase === "listening") return;
   if (state.view === "chart") return;
   if (state.view === "compose") return renderCompose();
   if (state.view === "sent") return renderSent();
@@ -572,18 +675,36 @@ function paint() {
 }
 
 function renderMain() {
-  document.body.className = state.sheet || state.searchOpen ? "locked" : "";
+  const voiceHome = isVoiceHome();
+  document.body.className = [
+    state.sheet || state.searchOpen ? "locked" : "",
+    voiceHome ? "home-v7" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
   const hb = heartbeatText();
   const held = heldCount();
   const tab = state.tab;
   const compact = state.compact && !state.sheet && tab === "ledger";
+  const showSeg = !voiceHomeOn() || tab === "portfolio";
+  const inner =
+    tab === "ledger"
+      ? voiceHome
+        ? voiceHomeHtml(hb)
+        : ledgerHtml(hb, compact)
+      : portfolioHtml(hb);
+  app.className = voiceHome ? "home-v7-app" : "";
   app.innerHTML =
+    (voiceHome ? `<div class="app-home">` : "") +
     headerHtml("root") +
-    `<div class="seg">
+    (showSeg
+      ? `<div class="seg">
       <button type="button" class="${tab === "ledger" ? "on" : ""}" data-tab="ledger">${escapeHtml(C.header.tabLedger)}<span class="held">${held}</span></button>
       <button type="button" class="${tab === "portfolio" ? "on" : ""}" data-tab="portfolio">${escapeHtml(C.header.tabPortfolio)}</button>
-    </div>` +
-    (tab === "ledger" ? ledgerHtml(hb, compact) : portfolioHtml(hb)) +
+    </div>`
+      : "") +
+    inner +
+    (voiceHome ? `</div>` : "") +
     searchMenuHtml() +
     (state.sheet ? sheetHtml() : "") +
     toastHtml() +
@@ -600,6 +721,153 @@ function renderMain() {
   bindLedger();
   bindPortfolio();
   bindSheet();
+  bindHomeActs();
+}
+
+function homeHeartbeatText() {
+  if (state.ledgerStatus === "loading") return { text: C.heartbeat.loading, dot: "well" };
+  if (state.ledgerStatus === "error") return { text: C.heartbeat.error, dot: "neg" };
+  if (state.ledgerStatus === "stale") return { text: C.heartbeat.stale, dot: "warn" };
+  const held = heldCount();
+  if (!held) return { text: C.heartbeat.empty, dot: "accent" };
+  const n = relCheck(state.summary.last_check_at);
+  return {
+    text: fillCopy(C.heartbeat.holdingOk, { held, n: n == null ? "—" : n }),
+    dot: "accent",
+  };
+}
+
+function homeStripHtml(hb) {
+  const p = state.portfolio;
+  const chg = p && p.total_change_24h_pct != null ? Number(p.total_change_24h_pct) : null;
+  const chgCls = chg == null ? "" : chg < 0 ? "down" : "up";
+  const chgTxt =
+    chg == null ? "" : fillCopy(C.strip.chg24h, { chg: (chg < 0 ? "" : "+") + chg + "%" });
+  const risk = p && p.risk ? p.risk.liquidation_score : "—";
+  const band = p && p.risk ? p.risk.band || "safe" : "";
+  const line = p
+    ? `<div class="home-strip-line"><span class="lab">${escapeHtml(C.strip.label)}</span><span class="val num">${usd(p.total_usd_value)}</span><span class="chg num ${chgCls}">${escapeHtml(chgTxt)}</span><span class="meta">${escapeHtml(fillCopy(C.strip.riskBand, { score: risk, band }))}</span></div>`
+    : "";
+  return `<div class="home-strip" id="strip">${line}<div class="heartbeat"><span class="dot ${hb.dot}"></span>${escapeHtml(hb.text)}</div></div>`;
+}
+
+function micSvg() {
+  return `<svg class="mic-svg" width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"></rect><path d="M5 11a7 7 0 0 0 14 0"></path><path d="M12 18v3"></path></svg>`;
+}
+
+function voiceStatusText() {
+  const phase = state.voice.phase;
+  if (phase === "listening") {
+    const s = Math.floor((state.voice.heldMs || 0) / 1000);
+    const m = Math.floor(s / 60);
+    const ss = String(s % 60).padStart(2, "0");
+    return fillCopy(C.voice.listening, { m, ss });
+  }
+  if (phase === "drafted") return C.voice.drafted;
+  return voiceMode() === "tap" ? C.voice.tapIdle : C.voice.hold;
+}
+
+function voiceDockHtml() {
+  const phase = state.voice.phase;
+  const nudge = state.voice.nudge
+    ? `<div class="voice-nudge" id="voiceNudge">${escapeHtml(state.voice.nudge)}</div>`
+    : `<div class="voice-nudge" id="voiceNudge" hidden></div>`;
+  const words =
+    liveWordsOn() && phase === "listening" && state.voice.transcript
+      ? `<div class="listen-words" id="liveWords">${escapeHtml(state.voice.transcript)}<span class="listen-caret">${escapeHtml(C.listening.caret)}</span></div>`
+      : `<div class="listen-words" id="liveWords"${liveWordsOn() && phase === "listening" ? "" : " hidden"}><span class="listen-caret">${escapeHtml(C.listening.caret)}</span></div>`;
+  const typePulse = state.voice.typePulse ? " type-pulse" : "";
+  return (
+    `<div class="home-ledger-wrap">` +
+    `<div class="home-ledger${phase === "listening" ? " dim" : ""}" id="homeLedger">` +
+    ledgerZonesHtml() +
+    `</div>` +
+    `<div class="listen-scrim${phase === "listening" ? " on" : ""}" id="listenScrim"><div class="listen-lab">${escapeHtml(C.listening.label)}</div>${words}</div>` +
+    `</div>` +
+    `<div class="voice-dock ${phase}" id="voiceDock">` +
+    nudge +
+    `<button type="button" class="voice-hero" id="voiceBtn" aria-label="${escapeHtml(voiceStatusText())}">` +
+    `<div class="voice-halo"></div>` +
+    `<div class="rip"></div><div class="rip d2"></div>` +
+    micSvg() +
+    `<div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i></div>` +
+    `<div class="check">✓</div>` +
+    `</button>` +
+    `<div class="voice-status" id="voiceStatus">${escapeHtml(voiceStatusText())}</div>` +
+    `</div>` +
+    `<div class="home-acts">` +
+    `<button type="button" class="home-act${typePulse}" id="typeInstead">${escapeHtml(C.homeActs.type)}</button>` +
+    `<button type="button" class="home-act port" id="goPortfolio">${escapeHtml(C.homeActs.portfolio)}</button>` +
+    `</div>`
+  );
+}
+
+function voiceHomeHtml() {
+  const hb = homeHeartbeatText();
+  return homeStripHtml(hb) + voiceDockHtml();
+}
+
+function bindHomeActs() {
+  const typeBtn = document.getElementById("typeInstead");
+  if (typeBtn) {
+    typeBtn.onclick = () => {
+      haptic("select");
+      openCompose({
+        kind: "text",
+        message: "",
+        slide: true,
+        typed: true,
+        button: C.compose.sendWatch,
+      });
+    };
+  }
+  const port = document.getElementById("goPortfolio");
+  if (port) {
+    port.onclick = () => {
+      haptic("select");
+      state.tab = "portfolio";
+      paint();
+    };
+  }
+}
+
+function ledgerZonesHtml() {
+  const rows = instructions();
+  const needs = rows.filter((r) => zoneOf(r) === "needs");
+  const motion = rows.filter((r) => zoneOf(r) === "motion");
+  const watch = rows.filter((r) => zoneOf(r) === "watch");
+  const done = rows.filter((r) => zoneOf(r) === "done");
+  const earlier = rows.filter((r) => zoneOf(r) === "earlier");
+  const paused = watch.filter((r) => r.status === "paused").length;
+  const watchingN = watch.length - paused;
+
+  if (state.ledgerStatus === "loading") {
+    return `<div class="skel"></div><div class="skel" style="width:70%"></div>`;
+  }
+  if (state.ledgerStatus === "error" && !rows.length) {
+    return `<p class="edge">${escapeHtml(C.errorRow)}</p>`;
+  }
+  if (!rows.length) {
+    return `<p class="teach">${escapeHtml(C.emptyTeach)}</p>` + ledgerFooterHtml();
+  }
+  return (
+    zoneBlock("needs", C.zones.needsYou, "lab-accent", needs.length, needs) +
+    zoneBlock("motion", C.zones.inMotion, "lab-accent", motion.length, motion) +
+    zoneBlock(
+      "watch",
+      C.zones.watching,
+      "lab-faint",
+      fillCopy(C.zones.watchingCount, { w: watchingN, p: paused }),
+      watch,
+    ) +
+    zoneBlock("done", C.zones.doneToday, "lab-pos", done.length, done) +
+    (earlier.length
+      ? `<div class="zone-h" id="earlierToggle"><span class="lab lab-faint">${escapeHtml(C.zones.earlier)} ${state.earlierOpen ? "▴" : "▾"}</span><span class="n">${escapeHtml(C.zones.earlierSub)}</span></div>` +
+        (state.earlierOpen ? zoneRows(earlier) : "")
+      : "") +
+    `<p class="footer-line">${escapeHtml(voiceHomeOn() ? C.ledgerFooter : C.ledgerFooterLegacy)}</p>` +
+    `<button type="button" class="nav-row" id="introduceRow">${escapeHtml(C.share.introduce)}</button>`
+  );
 }
 
 function ledgerHtml(hb, compact) {
@@ -617,7 +885,6 @@ function ledgerHtml(hb, compact) {
   const motion = rows.filter((r) => zoneOf(r) === "motion");
   const watch = rows.filter((r) => zoneOf(r) === "watch");
   const done = rows.filter((r) => zoneOf(r) === "done");
-  const earlier = rows.filter((r) => zoneOf(r) === "earlier");
   const paused = watch.filter((r) => r.status === "paused").length;
   const watchingN = watch.length - paused;
 
@@ -640,34 +907,18 @@ function ledgerHtml(hb, compact) {
     );
   }
 
-  if (state.ledgerStatus === "loading") {
-    return strip + `<div class="heartbeat"><span class="dot well"></span>${escapeHtml(C.heartbeat.loading)}</div><div class="skel"></div><div class="skel" style="width:70%"></div>`;
-  }
-  if (state.ledgerStatus === "error" && !rows.length) {
-    return strip + `<div class="heartbeat"><span class="dot neg"></span>${escapeHtml(C.heartbeat.error)}</div><p class="edge">${escapeHtml(C.errorRow)}</p>`;
-  }
-  if (!rows.length) {
-    return strip + `<div class="heartbeat"><span class="dot ${hb.dot}"></span>${escapeHtml(hb.text)}</div><p class="teach">${escapeHtml(C.emptyTeach)}</p><p class="footer-line">${escapeHtml(C.ledgerFooter)}</p>`;
-  }
-
   return (
     strip +
     `<div class="heartbeat"><span class="dot ${hb.dot}"></span>${escapeHtml(hb.text)}</div>` +
-    zoneBlock("needs", C.zones.needsYou, "lab-accent", needs.length, needs) +
-    zoneBlock("motion", C.zones.inMotion, "lab-accent", motion.length, motion) +
-    zoneBlock(
-      "watch",
-      C.zones.watching,
-      "lab-faint",
-      fillCopy(C.zones.watchingCount, { w: watchingN, p: paused }),
-      watch,
-    ) +
-    zoneBlock("done", C.zones.doneToday, "lab-pos", done.length, done) +
-    (earlier.length
-      ? `<div class="zone-h" id="earlierToggle"><span class="lab lab-faint">${escapeHtml(C.zones.earlier)} ${state.earlierOpen ? "▴" : "▾"}</span><span class="n">${escapeHtml(C.zones.earlierSub)}</span></div>` +
-        (state.earlierOpen ? zoneRows(earlier) : "")
-      : "") +
-    `<p class="footer-line">${escapeHtml(C.ledgerFooter)}</p>`
+    ledgerZonesHtml()
+  );
+}
+
+function ledgerFooterHtml() {
+  const line = voiceHomeOn() ? C.ledgerFooter : C.ledgerFooterLegacy;
+  return (
+    `<p class="footer-line">${escapeHtml(line)}</p>` +
+    `<button type="button" class="nav-row" id="introduceRow">${escapeHtml(C.share.introduce)}</button>`
   );
 }
 
@@ -691,24 +942,33 @@ function zoneRows(rows) {
       const swipable =
         (row.status === "watching" || row.status === "paused") &&
         !state.pending[row.instruction_id];
+      const pct = clientProgress(row);
+      const inMotion = row.status === "pending_execute" || row.status === "executing";
       const meter =
-        row.status === "executing" && row.progress_pct != null
-          ? `<div class="meter"><span style="width:${Number(row.progress_pct)}%"></span></div>`
+        inMotion && pct != null
+          ? `<div class="meter"><span style="width:${Number(pct)}%"></span></div>`
           : row.status === "watching" && row.distance && state.ledgerStatus !== "stale"
             ? `<div class="meter ${row.distance.near ? "warn" : ""}"><span style="width:${row.distance.pct}%"></span></div>`
             : "";
       const value =
-        row.status === "executing" && row.progress_pct != null
-          ? `<span class="pct-slot num">${escapeHtml(String(row.progress_pct))}%</span>`
+        inMotion && pct != null
+          ? `<span class="pct-slot num">${escapeHtml(String(pct))}%</span>`
           : row.display_status
-            ? `<span class="chip ${chipClass(row.status)}">${escapeHtml(row.display_status)}</span>`
+            ? `<span class="chip ${row.voice_draft ? "warn" : chipClass(row.status)}">${escapeHtml(row.display_status)}</span>`
             : "";
       const open = state.openSwipe === row.instruction_id;
       const canCancel = cancellable(row);
       const chips = swipable
         ? `<div class="swipe-under"><button type="button" class="swipe-chip primary" data-act="${row.status === "paused" ? "resume" : "pause"}" data-id="${escapeHtml(row.instruction_id)}">${row.status === "paused" ? "Resume" : "Pause"}</button><button type="button" class="swipe-chip ask" data-act="ask" data-id="${escapeHtml(row.instruction_id)}">Ask</button></div>`
         : "";
-      return `<div class="row ${i === rows.length - 1 ? "last" : ""}" data-row="${escapeHtml(row.instruction_id)}" data-swipe="${swipable ? "1" : "0"}">
+      const rowCls = [
+        i === rows.length - 1 ? "last" : "",
+        row.status === "done" ? "is-done" : "",
+        row.voice_draft ? "voice-draft" : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+      return `<div class="row ${rowCls}" data-row="${escapeHtml(row.instruction_id)}" data-swipe="${swipable ? "1" : "0"}">
         ${chips}
         <div class="row-front" style="${open ? "transform:translateX(-140px)" : ""}">
           <div class="glyph ${g.cls}">${g.spin ? '<div class="spin"></div>' : escapeHtml(g.g)}</div>
@@ -755,6 +1015,8 @@ function bindLedger() {
       if (row) cancelInPlace(row);
     };
   });
+  const introduce = document.getElementById("introduceRow");
+  if (introduce) introduce.onclick = introduceAomi;
 }
 
 function bindRowSwipe(el, isPosition) {
@@ -1305,7 +1567,7 @@ function instructionSheet(y) {
   return `<div class="scrim" id="scrim"></div>
     <div class="sheet ins" id="sheet" style="transform:translateY(${y}px)">
       <div class="handle" id="handle"></div>
-      <div class="sheet-h"><div><h2>${escapeHtml(row.sentence)}</h2><div class="chip ${chipClass(row.status)}">${escapeHtml(row.display_status || (row.progress_pct != null ? row.progress_pct + "%" : ""))}</div></div><button type="button" class="x" id="sheetX">✕</button></div>
+      <div class="sheet-h"><div><h2>${escapeHtml(row.sentence)}</h2><div class="chip ${chipClass(row.status)}">${escapeHtml(row.display_status || (clientProgress(row) != null ? clientProgress(row) + "%" : ""))}</div></div><button type="button" class="x" id="sheetX">✕</button></div>
       <div class="sheet-body">
         <div class="fact-card">${facts.map(([k, v]) => `<div class="k">${escapeHtml(k)}</div><div>${escapeHtml(v)}</div>`).join("")}</div>
         ${acts}
@@ -1548,11 +1810,14 @@ function renderCompose() {
   const c = state.compose;
   document.body.className = "";
   const slide = c.slide && !reduceMotion;
+  const body = c.typed
+    ? `<textarea class="compose-input" id="typeInput">${escapeHtml(c.message || "")}</textarea>`
+    : `<p class="msg">${escapeHtml(c.message)}</p>`;
   app.innerHTML =
     headerHtml("inner") +
     `<div class="screen">
       <div class="kicker">${escapeHtml(C.compose.label)}</div>
-      <p class="msg">${escapeHtml(c.message)}</p>
+      ${body}
       <p class="note">${escapeHtml(C.compose.disclaimer)}</p>
       ${c.note ? `<p class="note">${escapeHtml(c.note)}</p>` : ""}
       ${
@@ -1563,6 +1828,13 @@ function renderCompose() {
     </div>` +
     bottomHtml();
   bindChrome();
+  const input = document.getElementById("typeInput");
+  if (input) {
+    input.oninput = () => {
+      state.compose.message = input.value;
+    };
+    input.focus();
+  }
   const tap = document.getElementById("sendTap");
   if (tap) tap.onclick = () => doSend();
   const thumb = document.getElementById("thumb");
@@ -1611,6 +1883,11 @@ function bindSlide(thumb) {
 
 async function doSend() {
   const c = state.compose;
+  if (c.typed) {
+    const input = document.getElementById("typeInput");
+    if (input) c.message = input.value;
+    if (!String(c.message || "").trim()) return;
+  }
   const correlation_id = newId();
   const payload = {
     correlation_id,
@@ -1725,10 +2002,43 @@ function openThreadLink() {
   if (tg && typeof tg.close === "function") tg.close();
 }
 
+function introduceAomi() {
+  haptic("select");
+  (async () => {
+    try {
+      const data = await api("/api/v1/mini-app/share", { method: "POST", body: {} });
+      if (
+        data.prepared_inline_message_id &&
+        tg &&
+        typeof tg.shareMessage === "function"
+      ) {
+        tg.shareMessage(data.prepared_inline_message_id);
+        return;
+      }
+      const url = data.fallback_url;
+      if (url && tg && typeof tg.openTelegramLink === "function") {
+        tg.openTelegramLink(url);
+        return;
+      }
+      if (tg && typeof tg.sendData === "function") {
+        tg.sendData(C.share.intent);
+      }
+    } catch (_) {
+      /* nav only — stay silent */
+    }
+  })();
+}
+
 let voiceRecorder = null;
 let voiceChunks = [];
 let voiceStream = null;
 let voiceWanted = false;
+let voiceStartedAt = 0;
+let voiceTick = null;
+let voiceNudgeTimer = null;
+let voiceDraftTimer = null;
+let liveRec = null;
+let voiceAnalyser = null;
 
 function bindVoice() {
   const btn = document.getElementById("voiceBtn");
@@ -1738,68 +2048,288 @@ function bindVoice() {
     if (ev.button != null && ev.button !== 0) return;
     ev.preventDefault();
     ev.stopPropagation();
-    try {
+      try {
       btn.setPointerCapture(ev.pointerId);
     } catch (_) {
       /* capture optional */
     }
-    startVoice(btn);
+    onVoiceDown(btn);
   });
-  const end = (ev) => {
+  btn.addEventListener("pointermove", (ev) => {
+    if (voiceMode() !== "hold") return;
+    if (state.voice.phase !== "listening") return;
+    if (!pointInCircle(btn, ev.clientX, ev.clientY)) {
+      ev.preventDefault();
+      cancelVoice("slide");
+    }
+  });
+  btn.addEventListener("pointerup", (ev) => {
     ev.preventDefault();
     ev.stopPropagation();
-    finishVoice(btn);
-  };
-  btn.addEventListener("pointerup", end);
+    onVoiceUp(btn);
+  });
   btn.addEventListener("pointercancel", (ev) => {
     ev.preventDefault();
-    abortVoice(btn);
+    if (voiceMode() === "hold" && state.voice.phase === "listening") cancelVoice("slide");
   });
 }
 
-async function startVoice(btn) {
-  if (voiceWanted) return;
-  voiceWanted = true;
-  voiceChunks = [];
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    voiceWanted = false;
-    showToast(C.toasts.voiceDenied);
-    return;
-  }
-  try {
-    voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  } catch (_) {
-    voiceWanted = false;
-    showToast(C.toasts.voiceDenied);
-    return;
-  }
-  if (!voiceWanted) {
-    abortVoice(btn);
-    return;
-  }
-  const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-    ? "audio/webm;codecs=opus"
-    : MediaRecorder.isTypeSupported("audio/webm")
-      ? "audio/webm"
-      : "";
-  try {
-    voiceRecorder = mime ? new MediaRecorder(voiceStream, { mimeType: mime }) : new MediaRecorder(voiceStream);
-  } catch (_) {
-    abortVoice(btn);
-    showToast(C.toasts.voiceDenied);
-    return;
-  }
-  voiceRecorder.ondataavailable = (ev) => {
-    if (ev.data && ev.data.size) voiceChunks.push(ev.data);
-  };
-  voiceRecorder.start();
-  btn.classList.add("hot");
-  btn.setAttribute("aria-label", C.voice.recording);
-  haptic("impact", "medium");
+function pointInCircle(btn, x, y) {
+  const r = btn.getBoundingClientRect();
+  const cx = r.left + r.width / 2;
+  const cy = r.top + r.height / 2;
+  const rad = Math.min(r.width, r.height) / 2;
+  const dx = x - cx;
+  const dy = y - cy;
+  return dx * dx + dy * dy <= rad * rad;
 }
 
-function abortVoice(btn) {
+function onVoiceDown(btn) {
+  if (state.voice.phase === "drafted") {
+    clearTimeout(voiceDraftTimer);
+    state.voice.phase = "idle";
+    syncVoiceDom();
+    return;
+  }
+  if (voiceMode() === "tap") {
+    if (state.voice.phase === "listening") {
+      commitVoice();
+      return;
+    }
+    beginListening(btn);
+    return;
+  }
+  beginListening(btn);
+}
+
+function onVoiceUp() {
+  if (voiceMode() === "tap") return;
+  if (state.voice.phase !== "listening") return;
+  const held = Date.now() - (voiceStartedAt || 0);
+  if (held < 600) {
+    cancelVoice("short");
+    return;
+  }
+  commitVoice();
+}
+
+function showNudge(msg) {
+  state.voice.nudge = msg;
+  const el = document.getElementById("voiceNudge");
+  if (el) {
+    el.textContent = msg;
+    el.hidden = false;
+  }
+  clearTimeout(voiceNudgeTimer);
+  voiceNudgeTimer = setTimeout(() => {
+    state.voice.nudge = "";
+    const n = document.getElementById("voiceNudge");
+    if (n) n.hidden = true;
+  }, 2000);
+}
+
+function pulseTypeInstead() {
+  state.voice.typePulse = true;
+  const btn = document.getElementById("typeInstead");
+  if (btn) {
+    btn.classList.add("type-pulse");
+    setTimeout(() => {
+      state.voice.typePulse = false;
+      btn.classList.remove("type-pulse");
+    }, 1200);
+  }
+}
+
+function syncVoiceDom() {
+  const dock = document.getElementById("voiceDock");
+  const ledger = document.getElementById("homeLedger");
+  const scrim = document.getElementById("listenScrim");
+  const status = document.getElementById("voiceStatus");
+  const btn = document.getElementById("voiceBtn");
+  if (dock) dock.className = "voice-dock " + state.voice.phase;
+  if (ledger) ledger.classList.toggle("dim", state.voice.phase === "listening");
+  if (scrim) scrim.classList.toggle("on", state.voice.phase === "listening");
+  if (status) status.textContent = voiceStatusText();
+  if (btn) {
+    btn.classList.toggle("hot", state.voice.phase === "listening");
+    btn.setAttribute("aria-label", voiceStatusText());
+  }
+  const words = document.getElementById("liveWords");
+  if (words) {
+    const show = liveWordsOn() && state.voice.phase === "listening";
+    words.hidden = !show;
+    if (show) {
+      words.innerHTML =
+        escapeHtml(state.voice.transcript || "") +
+        `<span class="listen-caret">${escapeHtml(C.listening.caret)}</span>`;
+    }
+  }
+}
+
+function startVoiceTick() {
+  clearInterval(voiceTick);
+  voiceTick = setInterval(() => {
+    if (state.voice.phase !== "listening") return;
+    state.voice.heldMs = Date.now() - (voiceStartedAt || Date.now());
+    const status = document.getElementById("voiceStatus");
+    if (status) status.textContent = voiceStatusText();
+    tickWave();
+  }, 110);
+}
+
+function tickWave() {
+  const bars = document.querySelectorAll(".wave i");
+  if (!bars.length || !voiceAnalyser) return;
+  voiceAnalyser.an.getByteFrequencyData(voiceAnalyser.data);
+  bars.forEach((bar, i) => {
+    const v = voiceAnalyser.data[i + 1] || 0;
+    bar.style.height = 8 + (v / 255) * 30 + "px";
+  });
+}
+
+function startAnalyser(stream) {
+  stopAnalyser();
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    const ctx = new AC();
+    const src = ctx.createMediaStreamSource(stream);
+    const an = ctx.createAnalyser();
+    an.fftSize = 32;
+    src.connect(an);
+    voiceAnalyser = { ctx, an, data: new Uint8Array(an.frequencyBinCount) };
+  } catch (_) {
+    voiceAnalyser = null;
+  }
+}
+
+function stopAnalyser() {
+  if (voiceAnalyser && voiceAnalyser.ctx) {
+    try {
+      voiceAnalyser.ctx.close();
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  voiceAnalyser = null;
+  document.querySelectorAll(".wave i").forEach((bar) => {
+    bar.style.height = "";
+  });
+}
+
+function startLiveWords() {
+  stopLiveWords();
+  if (!liveWordsOn()) return;
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) return;
+  try {
+    const rec = new SR();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.onresult = (ev) => {
+      let t = "";
+      for (let i = 0; i < ev.results.length; i++) t += ev.results[i][0].transcript;
+      state.voice.transcript = t.trim();
+      const words = document.getElementById("liveWords");
+      if (words) {
+        words.hidden = false;
+        words.innerHTML =
+          escapeHtml(state.voice.transcript) +
+          `<span class="listen-caret">${escapeHtml(C.listening.caret)}</span>`;
+      }
+    };
+    rec.start();
+    liveRec = rec;
+  } catch (_) {
+    liveRec = null;
+  }
+}
+
+function stopLiveWords() {
+  if (liveRec) {
+    try {
+      liveRec.onresult = null;
+      liveRec.stop();
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  liveRec = null;
+}
+
+function beginListening(btn) {
+  if (state.voice.phase === "listening") return;
+  if (state.voice.micDenied) {
+    onMicDenied();
+    return;
+  }
+  voiceWanted = true;
+  voiceChunks = [];
+  voiceStartedAt = Date.now();
+  state.voice.phase = "listening";
+  state.voice.heldMs = 0;
+  state.voice.transcript = "";
+  state.voice.nudge = "";
+  haptic("impact", "light");
+  syncVoiceDom();
+  startVoiceTick();
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    onMicDenied();
+    return;
+  }
+  navigator.mediaDevices
+    .getUserMedia({ audio: true })
+    .then((stream) => {
+      if (!voiceWanted || state.voice.phase !== "listening") {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      voiceStream = stream;
+      startAnalyser(stream);
+      startLiveWords();
+      const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : MediaRecorder.isTypeSupported("audio/webm")
+          ? "audio/webm"
+          : "";
+      try {
+        voiceRecorder = mime
+          ? new MediaRecorder(stream, { mimeType: mime })
+          : new MediaRecorder(stream);
+      } catch (_) {
+        onMicDenied();
+        return;
+      }
+      voiceRecorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size) voiceChunks.push(ev.data);
+      };
+      voiceRecorder.start();
+      if (btn) btn.classList.add("hot");
+    })
+    .catch(() => {
+      onMicDenied();
+    });
+}
+
+function onMicDenied() {
+  state.voice.micDenied = true;
+  teardownVoice();
+  state.voice.phase = "idle";
+  syncVoiceDom();
+  if (isVoiceHome()) {
+    showNudge(C.voice.micDenied);
+    pulseTypeInstead();
+  } else {
+    showToast(C.toasts.voiceDenied);
+  }
+}
+
+function teardownVoice() {
   voiceWanted = false;
+  clearInterval(voiceTick);
+  voiceTick = null;
+  stopLiveWords();
+  stopAnalyser();
   try {
     if (voiceRecorder && voiceRecorder.state !== "inactive") voiceRecorder.stop();
   } catch (_) {
@@ -1811,49 +2341,121 @@ function abortVoice(btn) {
     voiceStream.getTracks().forEach((t) => t.stop());
     voiceStream = null;
   }
-  if (btn) {
-    btn.classList.remove("hot");
-    btn.setAttribute("aria-label", C.voice.hold);
-  }
+  const btn = document.getElementById("voiceBtn");
+  if (btn) btn.classList.remove("hot");
 }
 
-function finishVoice(btn) {
-  if (!voiceWanted || !voiceRecorder) {
-    abortVoice(btn);
+function cancelVoice(reason) {
+  teardownVoice();
+  state.voice.phase = "idle";
+  state.voice.transcript = "";
+  syncVoiceDom();
+  if (reason === "slide") showNudge(C.voice.slideOff);
+  else if (reason === "short") showNudge(C.voice.shortTap);
+}
+
+function commitVoice() {
+  if (!voiceWanted) {
+    cancelVoice("short");
+    return;
+  }
+  const held = Date.now() - (voiceStartedAt || 0);
+  if (voiceMode() === "hold" && held < 600) {
+    cancelVoice("short");
     return;
   }
   const recorder = voiceRecorder;
-  const mime = recorder.mimeType || "audio/webm";
+  const mime = (recorder && recorder.mimeType) || "audio/webm";
+  const started = voiceStartedAt;
+  if (!recorder) {
+    teardownVoice();
+    state.voice.phase = "idle";
+    syncVoiceDom();
+    return;
+  }
+  haptic("notify", "success");
   recorder.onstop = async () => {
-    const blob = new Blob(voiceChunks, { type: mime });
-    abortVoice(btn);
+    const blob = new Blob(voiceChunks.slice(), { type: mime });
+    teardownVoice();
     if (!blob.size) {
+      state.voice.phase = "idle";
+      syncVoiceDom();
       showToast(C.toasts.voiceEmpty);
       return;
     }
-    btn.classList.add("sending");
-    showToast(C.voice.sending);
     try {
       const audio_base64 = await blobToBase64(blob);
+      const duration_secs = started ? (Date.now() - started) / 1000 : undefined;
       const out = await api("/api/v1/mini-app/voice", {
         method: "POST",
-        body: { audio_base64, mime: blob.type || mime },
+        body: { audio_base64, mime: blob.type || mime, duration_secs },
       });
-      const heard = (out && out.transcript) || "";
-      if (heard) showToast(fillCopy(C.toasts.voiceHeard, { text: heard }));
-      else showToast((out && out.speech) || C.toasts.voiceEmpty);
+      const heard = (out && (out.transcript || out.heard_echo)) || "";
+      if (heard) {
+        const payload =
+          (out && out.send_payload) || {
+            kind: "voice",
+            message: heard,
+            utterance_id: out && out.utterance_id,
+            correlation_id: out && out.correlation_id,
+          };
+        const inTelegram = tg && tg.initData && typeof tg.sendData === "function";
+        if (inTelegram) {
+          try {
+            tg.sendData(JSON.stringify(payload));
+          } catch (_) {
+            /* host may still ingest via webhook */
+          }
+        }
+        landVoiceDraft(heard, payload.correlation_id || newId(), out && out.instruction_id);
+        burstPoll();
+      } else {
+        state.voice.phase = "idle";
+        syncVoiceDom();
+        showToast((out && out.speech) || C.toasts.voiceEmpty);
+      }
     } catch (_) {
+      state.voice.phase = "idle";
+      syncVoiceDom();
       showToast(C.toasts.voiceFailed);
-    } finally {
-      btn.classList.remove("sending");
     }
   };
   try {
     recorder.stop();
   } catch (_) {
-    abortVoice(btn);
+    teardownVoice();
+    state.voice.phase = "idle";
+    syncVoiceDom();
     showToast(C.toasts.voiceFailed);
   }
+}
+
+function landVoiceDraft(text, correlation_id, instruction_id) {
+  const id = instruction_id || correlation_id;
+  const row = {
+    instruction_id: id,
+    sentence: text,
+    status: "with_aomi",
+    display_status: C.draftRow.chip,
+    voice_draft: true,
+    kind: "voice",
+    correlation_id,
+    created_at: nowSecs(),
+    updated_at: nowSecs(),
+  };
+  state.optimistic = [row].concat(
+    state.optimistic.filter((r) => r.instruction_id !== id && r.correlation_id !== correlation_id),
+  );
+  state.voice.phase = "drafted";
+  state.voice.transcript = "";
+  paint();
+  clearTimeout(voiceDraftTimer);
+  voiceDraftTimer = setTimeout(() => {
+    if (state.voice.phase === "drafted") {
+      state.voice.phase = "idle";
+      paint();
+    }
+  }, 2400);
 }
 
 function blobToBase64(blob) {
@@ -1913,7 +2515,12 @@ async function refreshLedger() {
     state.ledger = led.instructions || [];
     state.ledgerStatus = "ok";
     const ids = new Set(state.ledger.map((r) => r.instruction_id));
-    state.optimistic = state.optimistic.filter((r) => !ids.has(r.instruction_id));
+    const cor = new Set(
+      state.ledger.map((r) => r.correlation_id).filter(Boolean),
+    );
+    state.optimistic = state.optimistic.filter(
+      (r) => !ids.has(r.instruction_id) && !(r.correlation_id && cor.has(r.correlation_id)),
+    );
     for (const row of state.ledger) {
       if (state.pending[row.instruction_id] && row.status !== prev[row.instruction_id]) {
         delete state.pending[row.instruction_id];
@@ -1924,12 +2531,14 @@ async function refreshLedger() {
         if (row.status === "done") showToast(C.toasts.executed);
       }
     }
-    if (state.view === "main" || state.view === "sent") paint();
+    if ((state.view === "main" || state.view === "sent") && state.voice.phase !== "listening") paint();
+    maybeFlushDue();
+    tunePoll();
   } catch (err) {
     if (err.message === "unauthorized") return renderUnauthorized();
     if (!state.ledger.length) state.ledgerStatus = "error";
     else state.ledgerStatus = "stale";
-    if (state.view === "main") paint();
+    if (state.view === "main" && state.voice.phase !== "listening") paint();
   }
 }
 
@@ -1938,8 +2547,46 @@ function startPoll() {
   clearInterval(ageTimer);
   pollTimer = setInterval(refreshLedger, 2000);
   ageTimer = setInterval(() => {
-    if (state.view === "main" && !state.searchOpen) paint();
+    maybeFlushDue();
+    if (state.view === "main" && !state.searchOpen && state.voice.phase !== "listening") paint();
   }, 1000);
+}
+
+function tunePoll() {
+  const hot = instructions().some(
+    (row) => row.status === "pending_execute" || row.status === "executing",
+  );
+  clearInterval(pollTimer);
+  pollTimer = setInterval(refreshLedger, hot ? 500 : 2000);
+}
+
+function burstPoll() {
+  clearInterval(burstTimer);
+  let n = 0;
+  burstTimer = setInterval(() => {
+    refreshLedger();
+    if (++n >= 12) clearInterval(burstTimer);
+  }, 500);
+}
+
+function maybeFlushDue() {
+  const preview = previewState();
+  if (preview && preview !== "dev") return;
+  for (const row of instructions()) {
+    if (row.status !== "pending_execute") continue;
+    const rem = remainingSecs(row);
+    if (rem == null || rem > 0) continue;
+    if (flushedIds.has(row.instruction_id)) continue;
+    flushedIds.add(row.instruction_id);
+    api("/api/v1/mini-app/compose", {
+      method: "POST",
+      body: { kind: "flush_execute", instruction_id: row.instruction_id, message: "" },
+    })
+      .then(() => refreshLedger())
+      .catch(() => {
+        flushedIds.delete(row.instruction_id);
+      });
+  }
 }
 
 function renderUnauthorized() {
@@ -1973,7 +2620,14 @@ const PREVIEW_PORTFOLIO = {
   total_usd_value: "24761.18",
   total_change_24h_pct: "1.30",
   floor: "2410.00",
-  flags: { primary_view: "ledger", jobline_negative: false, family: "blue" },
+  flags: {
+    primary_view: "ledger",
+    jobline_negative: false,
+    family: "blue",
+    voice_home: true,
+    voice_mode: "hold",
+    live_words: true,
+  },
 };
 
 const PREVIEW_PRODUCTS = [
@@ -1994,7 +2648,7 @@ function previewBoot() {
   const pv = previewState();
   state.portfolio = PREVIEW_PORTFOLIO;
   state.products = PREVIEW_PRODUCTS;
-  state.flags = PREVIEW_PORTFOLIO.flags;
+  applyFlags(PREVIEW_PORTFOLIO.flags);
   if (pv === "empty") {
     state.ledger = [];
     state.summary = { holding: 0, needs_you: 0, last_check_at: null };
@@ -2009,6 +2663,30 @@ function previewBoot() {
   }
   if (pv === "unauthorized") return renderUnauthorized();
   state.ledger = [
+    {
+      instruction_id: "buy",
+      task_id: "buy",
+      status: "pending_execute",
+      sentence: "Buy 0.1 ETH spot at market",
+      kind: "trade",
+      fire_kind: "act",
+      execute_at: nowSecs() + 3,
+      delay_secs: 3,
+      progress_pct: 0,
+      remaining_secs: 3,
+    },
+    {
+      instruction_id: "fill",
+      task_id: "fill",
+      status: "executing",
+      sentence: "Sell 200 USDT of SOL spot",
+      kind: "trade",
+      fire_kind: "act",
+      progress_pct: 8,
+      slice_i: 1,
+      slice_n: 1,
+      avg_price: "—",
+    },
     {
       instruction_id: "roll",
       task_id: "roll",
@@ -2044,10 +2722,14 @@ function previewBoot() {
       distance: { mark: "3588", pct: 26, near: false },
     },
   ];
-  state.summary = { holding: 3, needs_you: 1, last_check_at: nowSecs() - 4 };
+  state.summary = { holding: 5, needs_you: 1, last_check_at: nowSecs() - 4 };
   state.ledgerStatus = "ok";
   state.compact = pv !== "loaded";
   paint();
+  clearInterval(ageTimer);
+  ageTimer = setInterval(() => {
+    if (state.view === "main" && !state.searchOpen && state.voice.phase !== "listening") paint();
+  }, 1000);
 }
 
 function chartParams() {
@@ -2224,7 +2906,7 @@ async function boot() {
     ]);
     state.portfolio = port;
     state.products = catalog.products || [];
-    if (port.flags) state.flags = port.flags;
+    if (port.flags) applyFlags(port.flags);
     if (state.flags.primary_view === "portfolio") state.tab = "portfolio";
     await refreshLedger();
     state.compact = Boolean(tg && !tg.isExpanded);

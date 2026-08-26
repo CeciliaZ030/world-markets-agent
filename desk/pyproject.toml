@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "the-desk"
 version = "0.1.0"
-description = "The Desk — voice-first paper trading client for World Markets via Aomi"
+description = "The Desk — voice-first World Markets client on the Aomi rails"
 requires-python = ">=3.11"
 dependencies = [
   "pydantic>=2.7",

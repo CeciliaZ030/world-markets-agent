@@ -144,7 +144,7 @@ def validate_order(
                     code="quantity_cap",
                     message=f"notional {notional} exceeds {pct}% of equity {book.equity}",
                     spoken=(
-                        f"That's above the cap — {pct} percent of the paper book. "
+                        f"That's above the cap — {pct} percent of the book. "
                         "I won't put that ticket in readback."
                     ),
                 )
@@ -155,8 +155,8 @@ def validate_order(
             ValidationIssue(
                 slot="quantity",
                 code="buying_power",
-                message="insufficient paper cash",
-                spoken="There isn't enough paper cash for that size.",
+                message="insufficient cash",
+                spoken="There isn't enough cash for that size.",
             )
         )
 

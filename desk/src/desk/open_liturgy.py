@@ -88,7 +88,7 @@ def default_bundle(
         spoken = speak_price(Decimal(str(mark)), verbosity="expert") if mark is not None else "the mark"
         world = f"Majors are mixed. {q0.symbol} is {spoken} as of seconds ago."
     else:
-        world = "World marks are on the fixture book."
+        world = "World marks are on the live book."
     if quotes:
         bits = []
         for q in quotes[:3]:

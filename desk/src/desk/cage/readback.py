@@ -36,7 +36,7 @@ def _consequence(
     parts: list[str] = []
     if notional is not None and equity > 0:
         pct = (notional / equity) * Decimal(100)
-        parts.append(f"That's {pct.quantize(Decimal('0.1'))} percent of the paper book")
+        parts.append(f"That's {pct.quantize(Decimal('0.1'))} percent of the book")
     if spread_bps is not None and spread_bps > Decimal("20"):
         parts.append(f"the spread is {spread_bps.quantize(Decimal('1'))} basis points")
     return ". ".join(parts) + ("." if parts else "")

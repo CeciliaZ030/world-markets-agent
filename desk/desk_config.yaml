@@ -1,10 +1,7 @@
-# User-level Desk settings. No secrets. Paper mode is required for v0.
+# User-level Desk settings. No secrets. Always the World account / sidecar / brain.
 
-paper_mode: true
 verbosity: expert                 # novice | expert
 quantity_cap_pct_of_equity: 0.25
-paper_equity: "100000"
-immediate_paper_fills: true
 quiet_hours: null                 # e.g. ["22:00", "07:00"]
 anchor_time: "09:30"
 voice_id: "cartesia:sonic-3.6:desk-v0-pinned"

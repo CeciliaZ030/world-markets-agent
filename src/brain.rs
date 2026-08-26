@@ -25,13 +25,17 @@ impl Default for BrainClient {
 
 impl BrainClient {
     pub(crate) fn from_env() -> Self {
+        Self::with_timeout(20)
+    }
+
+    pub(crate) fn with_timeout(secs: u64) -> Self {
         let base_url = std::env::var("WORLD_BRAIN_URL")
             .ok()
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| DEFAULT_URL.to_string());
         Self {
             http: Client::builder()
-                .timeout(Duration::from_secs(20))
+                .timeout(Duration::from_secs(secs))
                 .build()
                 .expect("brain HTTP client"),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -121,6 +125,35 @@ impl BrainClient {
         self.post("/v1/compose", body)
     }
 
+    pub(crate) fn stage_trade(&self, body: &Value) -> Result<Value, String> {
+        self.post("/v1/trades/stage", body)
+    }
+
+    pub(crate) fn begin_execute(
+        &self,
+        account_id: u64,
+        instruction_id: &str,
+    ) -> Result<Value, String> {
+        self.post(
+            "/v1/trades/begin",
+            &json!({ "account_id": account_id, "instruction_id": instruction_id }),
+        )
+    }
+
+    pub(crate) fn complete_execute(
+        &self,
+        account_id: u64,
+        instruction_id: &str,
+        body: &Value,
+    ) -> Result<Value, String> {
+        let mut payload = body.clone();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("account_id".to_string(), json!(account_id));
+            obj.insert("instruction_id".to_string(), json!(instruction_id));
+        }
+        self.post("/v1/trades/complete", &payload)
+    }
+
     pub(crate) fn pause_watch(
         &self,
         account_id: u64,
@@ -151,6 +184,56 @@ impl BrainClient {
                 "instruction_id": instruction_id,
             }),
         )
+    }
+
+    pub(crate) fn cancel_task(&self, account_id: u64, id: &str) -> Result<Value, String> {
+        self.post(
+            "/v1/tasks/cancel",
+            &json!({ "account_id": account_id, "id": id }),
+        )
+    }
+
+    pub(crate) fn voice_keyterms(
+        &self,
+        account_id: u64,
+        extra: &[String],
+    ) -> Result<Vec<String>, String> {
+        let extra_q = extra.join(",");
+        let path = if extra_q.is_empty() {
+            format!("/v1/voice/keyterms?account_id={account_id}")
+        } else {
+            format!("/v1/voice/keyterms?account_id={account_id}&extra={extra_q}")
+        };
+        let value = self.get(&path)?;
+        Ok(value
+            .get("keyterms")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    pub(crate) fn ingest_utterance(&self, body: &Value) -> Result<Value, String> {
+        self.post("/v1/voice/utterance", body)
+    }
+
+    pub(crate) fn record_correction(&self, body: &Value) -> Result<Value, String> {
+        self.post("/v1/voice/correction", body)
+    }
+
+    pub(crate) fn set_consent(&self, body: &Value) -> Result<Value, String> {
+        self.post("/v1/voice/consent", body)
+    }
+
+    pub(crate) fn close_episode(&self, body: &Value) -> Result<Value, String> {
+        self.post("/v1/voice/episode/close", body)
+    }
+
+    pub(crate) fn share(&self, body: &Value) -> Result<Value, String> {
+        self.post("/v1/share", body)
     }
 
     fn get(&self, path: &str) -> Result<Value, String> {

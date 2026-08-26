@@ -553,6 +553,25 @@ pub(crate) fn parse_lookup_text(raw: &str) -> Option<LookupKind> {
     }
 }
 
+/// Whole-message `cancel task <id>` — host skips the LLM and drops the watch.
+pub(crate) fn parse_cancel_task(raw: &str) -> Option<String> {
+    let parts: Vec<&str> = raw.split_whitespace().collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    if !parts[0].eq_ignore_ascii_case("cancel") {
+        return None;
+    }
+    if !parts[1].eq_ignore_ascii_case("task") {
+        return None;
+    }
+    let id = parts[2].trim().trim_start_matches('/');
+    if id.is_empty() {
+        return None;
+    }
+    Some(id.to_string())
+}
+
 /// Classify an explicit `token` argument from the model or host.
 pub(crate) fn parse_lookup_token(raw: &str) -> Option<LookupKind> {
     let lower = raw.trim().to_ascii_lowercase();
@@ -857,6 +876,26 @@ mod tests {
         assert_eq!(parse_lookup_token(" /Index "), Some(LookupKind::Index));
         assert_eq!(parse_lookup_token("b"), Some(LookupKind::Balance));
         assert_eq!(parse_lookup_token("nope"), None);
+    }
+
+    #[test]
+    fn parse_cancel_task_is_whole_message_only() {
+        assert_eq!(
+            parse_cancel_task("cancel task abc12x"),
+            Some("abc12x".into())
+        );
+        assert_eq!(
+            parse_cancel_task("Cancel Task ABC12X"),
+            Some("ABC12X".into())
+        );
+        assert_eq!(
+            parse_cancel_task("cancel task i_roll"),
+            Some("i_roll".into())
+        );
+        assert_eq!(parse_cancel_task("please cancel task abc12x"), None);
+        assert_eq!(parse_cancel_task("cancel"), None);
+        assert_eq!(parse_cancel_task("cancel the task"), None);
+        assert_eq!(parse_cancel_task("cancel task"), None);
     }
 
     #[test]

@@ -7,20 +7,12 @@ from desk.policy import AomiPolicy
 from desk.cage.types import OrderDraft, Quantity, ResolvedInstrument
 from desk.cage.validate import resolve_base_quantity, validate_order
 from desk.config import DeskConfig as C
-from desk.trading import PaperBroker
+from stub_broker import StubBroker
 
 
-def test_paper_mode_required(tmp_path):
-    try:
-        DeskConfig(paper_mode=False).assert_paper()
-        raise AssertionError
-    except RuntimeError:
-        pass
-
-
-def test_load_config_missing(tmp_path, monkeypatch):
+def test_load_config_missing(tmp_path):
     cfg = load_config(tmp_path / "nope.yaml")
-    assert cfg.paper_mode is True
+    assert cfg.verbosity == "expert"
 
 
 def test_resolver_spelled_and_fuzzy():
@@ -80,7 +72,7 @@ def test_resolve_qty_errors():
 
 
 def test_validate_without_policy_ok():
-    broker = PaperBroker(equity=Decimal("100000"))
+    broker = StubBroker()
     inst = ResolvedInstrument(symbol="WETH", name="Wrapped Ether", product="spot", confidence=0.99)
     draft = OrderDraft(
         side="buy",

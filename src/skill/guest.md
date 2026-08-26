@@ -1,6 +1,8 @@
 # Guest mode
 
-No account / `start=g_` → guest. No mandate, no policy engine, no real book. Call `render_guest_surface`. Paste `message` and `controls` verbatim. Never invent a number. Never a policy verdict. Simulated figures keep the tool's paper label. Conversion is a door; `Keep looking` is complete. Nothing unprompted except one guardian-drill push. Deposit figures come from the tool — never a typed amount, never a minimum. Do not run guest or share through the mandate engine. `silent: true` → send nothing.
+No account / `start=g_` / `start=ref_{code}` → guest. No mandate, no policy engine, no real book. Call `render_guest_surface`. Paste `message` and `controls` verbatim. Never invent a number. Never a policy verdict. Simulated figures keep the tool's paper label. Conversion is a door; `Keep looking` is complete. Nothing unprompted except one guardian-drill push. Deposit figures come from the tool — never a typed amount, never a minimum. Do not run guest or share through the mandate engine. `silent: true` → send nothing.
+
+`start=ref_{code}`: host passes chat identity as `guest_id` and the payload as `start_payload`. Attribution is silent. Revoked or unknown code → `greeting` with no error. Bound account is not a guest — do not call this tool.
 
 Surfaces: `greeting` `showcase` `fire_drill` `cant_do` `paper_preview` `run_on_paper` `paper` `keep_looking` `make_mine` `paper_executable` `real_money` `deposit_less` `demo_unavailable` `exit`. Grant-key → `apply_guest_upgrade` once. Whole-message `paper` → frozen book after upgrade. Never a second live book.
 

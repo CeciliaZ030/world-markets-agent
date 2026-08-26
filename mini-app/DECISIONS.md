@@ -2,15 +2,24 @@
 
 - **Compose transport.** v3 `sendData` did not exist. Client path is `Telegram.WebApp.sendData`; local/dev and the host webhook land on `POST /api/v1/mini-app/compose`. No mutating `/ledger*` route.
 - **Watcher.** Wrapped `brain/src/watches.js`; did not build a second evaluator.
-- **Confirm gate.** Signed TTL'd buttons stay on the Aomi host. `pause_world_watch` / `resume_world_watch` / `set_world_watch` run only after that confirm. The mini app never hosts a confirm.
-- **Pause.** Spec default: draft to the thread, flip to `paused` only after the signed confirm.
-- **Cancel.** Ledger × sends whole-message `cancel task {id}` in the background (`sendData` is not used, so the mini app stays open). Host `render_lookup` skips the LLM and drops the watch — not a trade, no signed confirm. Chat echo is the bot posting the command and the result.
-- **Voice notes.** Hold-to-talk on the ledger posts `POST /api/v1/mini-app/voice` (not `sendData`). Mini App proxies audio to The Desk `/api/voice/note`; Cage assent remains the spoken word `Done`. If `getUserMedia` is blocked, copy points at a Telegram thread voice note. LiveKit duplex is not used in the WebView.
-- **Desk context.** `GET /api/v1/desk/context` is the live book The Desk reads (session or `X-Desk-Token`). It is not a ledger write.
+- **Submit gate.** Voice and text in the thread submit trades (`execute_*` → sidecar `WORLD_PRIVATE_KEY`). The Mini App never hosts a confirm and never places an order. Chat inline buttons are last-resort only when the agent decides the ticket is unclear or extremely risky.
+- **Mini App buttons.** Navigation and data only (ledger, portfolio, charts, hold-to-talk as a mic). Slides draft text into the thread; they do not sign and they do not execute.
+- **Pause.** Spec default: draft to the thread; `pause_world_watch` when the agent processes it. No Sign button.
+- **Cancel.** Ledger × sends whole-message `cancel task {id}` in the background (`sendData` is not used, so the mini app stays open). Host `render_lookup` skips the LLM and drops the watch — not a trade. Chat echo is the bot posting the command and the result. Resting **order** cancel is `cancel_world_order` via voice/text.
+- **Voice notes.** Hold-to-talk posts `POST /api/v1/mini-app/voice` (not `sendData`, not `/ledger*`). Plugin STT (Deepgram with lexicon keyterms, else Whisper) → brain utterance → client `sendData` of the transcript so the host agent runs. Heard-echo is a toast plus an optional `heard:` chat line. Lookups do not become ledger rows until the agent records an instruction. If `getUserMedia` is blocked, copy points at a Telegram thread voice note. Does **not** call The Desk. LiveKit duplex is not used in the WebView.
+- **Desk context.** `GET /api/v1/desk/context` remains a read-only book snapshot (session or `X-Desk-Token` / `DESK_BRIDGE_TOKEN`). It is not a ledger write and not a voice path.
 - **Job-line negative form.** `WORLD_MINI_JOBLINE_NEGATIVE` default off.
 - **Expiry / visibility.** 30-day watch TTL (existing); 90-day ledger visibility for done/expired.
+- **3s cancel then fill.** A clear trade instruction is staged as `pending_execute` with the user's whole sentence. The Mini App shows it in **in motion** with a countdown meter. × / `cancel task {id}` during that window drops it. After 3s the plugin thread (Mini App compose `flush_execute` as backup) `begin`s then fills; the row becomes `executing` with the same spinner/meter as other fills. No fabricated ticks. The Mini App UI never hosts confirm and never places; server flush after the delay is the backup path.
 - **Executing / TWAP.** No fabricated fill ticks. Executing rows render only when the ledger has real progress fields.
 - **Digest.** Skill copy in §6.14 (tightened to fit the 8k skill budget). Labor line from `ledger.labor` when holding>0; startapp `i_`+id. No new push channel.
-- **Event store.** Brain JSON files, same as watches. No Graphiti in this repo.
-- **Layout.** Ledger primary, portfolio secondary (owner call; `flag.primary_view`).
+- **Event store.** Brain JSON files, same as watches. Voice utterances, lexicon, consents, episodes, and correction pairs live under `WORLD_BRAIN_DIR/voice`. Audio blobs under `WORLD_BRAIN_DIR/audio`. No Graphiti in this repo.
+- **Layout.** Ledger primary, portfolio secondary (owner call; `flag.primary_view`). v7 home: no segmented switch; `portfolio ↗` and the portfolio strip open the Portfolio view (which keeps the switch). `flag.voice_home` default ON; OFF reverts to the v6 home.
+- **Voice home.** 150px hold-to-talk is the expanded home's primary act. Release ≥600ms sends through the existing voice path (`POST /api/v1/mini-app/voice` then `sendData` of the transcript) — no new execution endpoint, no `/ledger*` write. Optimistic row lands atop NEEDS YOU as `awaiting confirm` (warn, display mapping; internal status still `with_aomi`). Typed/sheet sends keep `with aomi`. Slide-off or <600ms sends nothing. Mic permission denial nudges toward `type instead` and does not loop the prompt. `flag.voice_mode` = hold | tap. `flag.live_words` streams Web Speech partials when the webview provides them.
 - **Search.** Global nav, not portfolio-only. Catalog is every live spot / perp / lend book.
+- **Introduction.** Footer row under the ledger is nav-class only. `POST /api/v1/mini-app/share` is not `/ledger*` and mutates nothing this view displays. Mini App server tries Bot API `savePreparedInlineMessage` (same token as `sendMessage`); on failure the row opens `t.me/{bot}?start=share`. No contact picker, no share analytics.
+- Compact launch has no ledger footer, so the introduce row is on the expanded ledger only.
+- M10 puts the name sentence in its own prose block so a 64-char Telegram first name cannot exceed 160 characters.
+- Extra copy keys: `share.without_name`, `share.paper`, `share.cant`, `share.rate_limited`, `share.introduce`, `share.intent`.
+- Hosts that only send tool `message` still deliver a forwardable M10; `messages[]` is the two-message sequence.
+- Share-card PNG / `g_` guest links are no longer the sending path; introductions use `ref_{code}`.

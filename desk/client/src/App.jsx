@@ -107,7 +107,7 @@ function Ticket({ card }) {
           </span>
         </footer>
       ) : null}
-      {state === "stamped" ? <div className="paper-mark" aria-hidden="true">PAPER</div> : null}
+      {state === "stamped" ? <div className="stamp-mark" aria-hidden="true">WORLD</div> : null}
     </article>
   );
 }
@@ -120,7 +120,7 @@ function Book({ card }) {
       <article className="card book">
         <header className="card-head">
           <span className="kicker">Book</span>
-          <span className="stamp">{payload.paper === false ? "LIVE" : "PAPER"}</span>
+          <span className="stamp">WORLD</span>
         </header>
         <div className="book-totals">
           <div>
@@ -402,7 +402,7 @@ export default function App() {
           <span className={`dot ${status}`} />
           {status}
           <span className="sep" />
-          paper
+          world
           <span className="sep" />
           {sessionId || "…"}
         </div>

@@ -1,19 +1,18 @@
 from __future__ import annotations
 
+import os
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DeskConfig(BaseModel):
-    paper_mode: bool = True
+    model_config = ConfigDict(extra="ignore")
     verbosity: Literal["novice", "expert"] = "expert"
     quantity_cap_pct_of_equity: Decimal = Decimal("0.25")
-    paper_equity: Decimal = Decimal("100000")
-    immediate_paper_fills: bool = True
     quiet_hours: list[str] | None = None
     anchor_time: str = "09:30"
     voice_id: str = "cartesia:sonic-3.6:desk-v0-pinned"
@@ -29,15 +28,13 @@ class DeskConfig(BaseModel):
     watchlist: list[str] = Field(default_factory=lambda: ["WETH", "WBTC"])
     aomi_mandate_path: str = "placeholder"
     world_rpc_url: str | None = None
+    world_execution_url: str | None = None
+    world_brain_url: str | None = None
+    desk_context_url: str | None = None
+    desk_bridge_token: str | None = None
+    world_account_id: int | None = None
     bind: str = "127.0.0.1:8765"
     data_dir: Path = Path("data")
-
-    def assert_paper(self) -> None:
-        if not self.paper_mode:
-            raise RuntimeError(
-                "The Desk v0 refuses to boot unless paper_mode is true. "
-                "Live-money accounts are out of scope."
-            )
 
 
 def _decimalish(value: Any) -> Any:
@@ -48,12 +45,46 @@ def _decimalish(value: Any) -> Any:
     return value
 
 
+def _parse_account_id(raw: str | None) -> int | None:
+    if not raw:
+        return None
+    trimmed = raw.strip()
+    if trimmed.lower().startswith("world-"):
+        trimmed = trimmed.split("-", 1)[1]
+    if not trimmed:
+        return None
+    try:
+        return int(trimmed)
+    except ValueError:
+        return None
+
+
 def load_config(path: Path | None = None) -> DeskConfig:
-    path = path or Path(__file__).resolve().parents[2] / "desk_config.yaml"
+    desk_root = Path(__file__).resolve().parents[2]
+    path = path or desk_root / "desk_config.yaml"
     raw: dict[str, Any] = {}
     if path.exists():
         loaded = yaml.safe_load(path.read_text()) or {}
         raw = _decimalish(loaded)
     cfg = DeskConfig.model_validate(raw)
-    cfg.assert_paper()
+    if os.getenv("WORLD_EXECUTION_URL"):
+        cfg.world_execution_url = os.getenv("WORLD_EXECUTION_URL")
+    if os.getenv("WORLD_BRAIN_URL"):
+        cfg.world_brain_url = os.getenv("WORLD_BRAIN_URL")
+    if os.getenv("DESK_CONTEXT_URL") or os.getenv("MINI_APP_URL"):
+        cfg.desk_context_url = os.getenv("DESK_CONTEXT_URL") or os.getenv("MINI_APP_URL")
+    if os.getenv("DESK_BRIDGE_TOKEN"):
+        cfg.desk_bridge_token = os.getenv("DESK_BRIDGE_TOKEN")
+    account = _parse_account_id(os.getenv("WORLD_ACCOUNT_ID"))
+    if account is not None:
+        cfg.world_account_id = account
+    bind = os.getenv("DESK_BIND")
+    if bind:
+        cfg.bind = bind
+    data_dir = os.getenv("DESK_DATA_DIR")
+    if data_dir:
+        cfg.data_dir = Path(data_dir)
+    mandate = os.getenv("WORLD_MANDATE_PATH")
+    if mandate:
+        cfg.aomi_mandate_path = mandate
     return cfg

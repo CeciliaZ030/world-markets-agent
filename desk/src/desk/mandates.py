@@ -8,14 +8,13 @@ from desk.cage.machine import Cage
 from desk.cage.types import MandateDraft, MandateStatus, OrderDraft
 from desk.cage.validate import resolve_base_quantity
 from desk.config import DeskConfig
-from desk.trading import PaperBroker
 
 
 class MandateWatcher:
     def __init__(
         self,
         config: DeskConfig,
-        broker: PaperBroker,
+        broker: Any,
         cage: Cage,
         *,
         clock: Callable[[], datetime] | None = None,
@@ -111,6 +110,9 @@ class MandateWatcher:
         receipt = self.broker.submit(action, base_qty)
         mandate.status = MandateStatus.FIRED
         self.fires.append({"mandate_id": mandate.id, "receipt": receipt, "mark": str(mark)})
+        drop = getattr(self.broker, "drop_watch", None)
+        if callable(drop):
+            drop(mandate.id)
         remain = "No residual position." if pos_qty == 0 or action.quantity and action.quantity.kind.value == "pct_of_position" and action.quantity.value in {Decimal("1"), Decimal("100")} else "What's left stays on the book."
         name = mandate.name or inst.symbol
         side = action.side or "sell"

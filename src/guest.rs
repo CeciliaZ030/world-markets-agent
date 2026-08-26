@@ -250,18 +250,12 @@ pub(crate) fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-fn opaque_token() -> String {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{n:x}").chars().rev().take(10).collect()
-}
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct Control {
     pub(crate) label: String,
     pub(crate) action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -319,41 +313,6 @@ impl<'a, R: Reporting> Funnel<'a, R> {
 
     fn demo(&self) -> Result<DemoBook, String> {
         self.reporting.demo_book()
-    }
-
-    pub(crate) fn share(&self, image_available: bool) -> RenderedSurface {
-        let link = format!(
-            "https://t.me/{}?start=g_{}",
-            self.config.telegram_bot,
-            opaque_token()
-        );
-        let deposit = self.about_deposit();
-        if image_available {
-            let mut s = RenderedSurface::spoken(
-                "share",
-                format!(
-                    "Scan or forward — they'll chat with me against a demo portfolio. Nothing real, nothing at risk. When they want the real thing: {WORLD_INC} on their phone — connect a wallet, make a first deposit ({deposit}), and grant the key.\n\n`{link}`"
-                ),
-                vec![ctrl("Copy link", "copy_link")],
-            );
-            s.simulated = false;
-            s.link = Some(link);
-            s.image_status = "ready".to_string();
-            s.image = Some("share_card".into());
-            s
-        } else {
-            let mut s = RenderedSurface::spoken(
-                "share_fallback",
-                format!(
-                    "I couldn't render the share card just now. The link works on its own:\n`{link}` — they'll chat with me against a demo portfolio, nothing real."
-                ),
-                vec![ctrl("Copy link", "copy_link")],
-            );
-            s.simulated = false;
-            s.link = Some(link);
-            s.image_status = "unavailable".to_string();
-            s
-        }
     }
 
     pub(crate) fn render(&self, guest_id: &str, surface: &str) -> Result<RenderedSurface, String> {
@@ -806,6 +765,7 @@ fn ctrl(label: &str, action: &str) -> Control {
     Control {
         label: label.to_string(),
         action: action.to_string(),
+        url: None,
     }
 }
 
@@ -865,6 +825,7 @@ pub(crate) fn anti_goal_violations(text: &str) -> Vec<&'static str> {
         ("invite count", "invite_count"),
         ("leaderboard", "leaderboard"),
         ("your friend signed up", "named_referrer"),
+        ("your friend joined", "join_notification"),
         ("ready to deposit", "standalone_conversion"),
         ("don't miss", "hype"),
         ("win rate", "win_rate"),
@@ -934,34 +895,6 @@ mod tests {
             .unwrap();
         assert_eq!(s.controls[0].label, "What can't you do?");
         assert_eq!(s.controls[1].label, "The basis trade");
-    }
-
-    #[test]
-    fn share_fallback_has_no_referral_vocab() {
-        let r = FixtureReporting;
-        let store = GuestStore::memory();
-        let s = funnel(&r, &store).share(false);
-        assert_eq!(s.surface, "share_fallback");
-        assert!(
-            s.message
-                .contains("I couldn't render the share card just now")
-        );
-        assert!(s.message.contains("?start=g_"));
-        assert_eq!(s.image_status, "unavailable");
-        assert!(anti_goal_violations(&s.message).is_empty());
-    }
-
-    #[test]
-    fn share_normal_names_deposit_with_reason() {
-        let r = FixtureReporting;
-        let store = GuestStore::memory();
-        let s = funnel(&r, &store).share(true);
-        assert!(
-            s.message
-                .contains("about `$20` clears transaction minimums")
-        );
-        assert!(!s.message.contains("minimum $20"));
-        assert!(anti_goal_violations(&s.message).is_empty());
     }
 
     #[test]

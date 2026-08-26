@@ -222,4 +222,3 @@ class PortfolioSnapshot(BaseModel):
     cash: Decimal
     positions: list[Position] = Field(default_factory=list)
     as_of: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    paper: bool = True

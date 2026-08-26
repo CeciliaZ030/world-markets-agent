@@ -83,6 +83,11 @@ export function markAtOrBefore(symbol, unix) {
   return found;
 }
 
+export function markSeries(symbol) {
+  const key = String(symbol || "").toUpperCase();
+  return loadHistory().marks[key] || [];
+}
+
 export function latestFunding(symbol) {
   const key = String(symbol || "").toUpperCase();
   const series = loadHistory().funding[key] || [];

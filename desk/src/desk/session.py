@@ -17,7 +17,7 @@ from desk.parser import parse_utterance
 from desk.persist import TapeLogger
 from desk.policy import AomiPolicy
 from desk.speech import speak_price, speak_text
-from desk.trading import PaperBroker
+from desk.trading import make_broker
 
 Push = Callable[[dict[str, Any]], None]
 
@@ -28,7 +28,7 @@ class DeskSession:
         config: DeskConfig,
         *,
         tape: TapeLogger,
-        broker: PaperBroker | None = None,
+        broker: Any | None = None,
         resolver: InstrumentResolver | None = None,
         policy: AomiPolicy | None = None,
         push: Push | None = None,
@@ -36,11 +36,11 @@ class DeskSession:
     ) -> None:
         self.config = config
         self.tape = tape
-        self.broker = broker or PaperBroker(
-            equity=config.paper_equity,
-            immediate_fills=config.immediate_paper_fills,
+        self.broker = broker or make_broker(config)
+        universe = getattr(self.broker, "universe", lambda: None)()
+        self.resolver = resolver or (
+            InstrumentResolver(rows=universe) if universe else InstrumentResolver()
         )
-        self.resolver = resolver or InstrumentResolver()
         self.policy = policy or AomiPolicy.from_path(config.aomi_mandate_path)
         self.push = push or (lambda _msg: None)
         self.clock = clock or (lambda: datetime.now(timezone.utc))
@@ -200,6 +200,9 @@ class DeskSession:
             return self._apply_result(result)
         if self.cage.mandate:
             self.watcher.register(self.cage.mandate)
+            register = getattr(self.broker, "register_watch", None)
+            if callable(register):
+                register(self.cage.mandate)
         return self._apply_result(result)
 
     def _list_mandates(self) -> dict[str, Any]:
@@ -219,6 +222,9 @@ class DeskSession:
         if not self.cage.mandate:
             return self._speak("No rule on the table.")
         self.watcher.revoke(self.cage.mandate.id)
+        drop = getattr(self.broker, "drop_watch", None)
+        if callable(drop):
+            drop(self.cage.mandate.id)
         return self._speak("Revoked.")
 
     def _quote(self, query: str) -> dict[str, Any]:
@@ -245,10 +251,10 @@ class DeskSession:
     def _positions(self) -> dict[str, Any]:
         snap = self.broker.snapshot()
         if not snap.positions:
-            speech = f"Paper book. Cash {speak_price(snap.cash, verbosity=self.config.verbosity)}. Flat."
+            speech = f"World book. Cash {speak_price(snap.cash, verbosity=self.config.verbosity)}. Flat."
         else:
             bits = [f"{p.quantity} {p.symbol} {p.product}" for p in snap.positions[:3]]
-            speech = "Paper book: " + "; ".join(bits) + "."
+            speech = "World book: " + "; ".join(bits) + "."
             if len(snap.positions) > 3:
                 speech = speech[:-1] + " — rest is on the card."
         return self._speak(
@@ -267,11 +273,18 @@ class DeskSession:
             overnight = f"{len(self.watcher.fires)} mandate fire(s) since last session."
         elif self.watcher.queued_reports:
             overnight = self.watcher.queued_reports[0]
+        notes = getattr(self.broker, "open_notes", lambda: {})()
+        if isinstance(notes, dict):
+            if not overnight and notes.get("ledger"):
+                overnight = notes["ledger"]
+            decision = notes.get("pnl")
+        else:
+            decision = None
         bundle = default_bundle(
             quotes=quotes,
             watchlist=self.watchlist,
             mandate_notes=overnight,
-            decision=None,
+            decision=decision,
         )
         text = render_open(bundle, config=self.config, rushed=rushed)
         self.tape.record("open", {"text": text, "rushed": rushed, "bundle": bundle})

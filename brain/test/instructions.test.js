@@ -14,9 +14,13 @@ import {
   listInstructions,
   pauseInstruction,
   resumeInstruction,
+  stageTrade,
+  beginExecute,
+  completeExecute,
   summary,
   transition,
 } from "../src/instructions.js";
+import { cancelTask } from "../src/watches.js";
 
 test("compose creates with_aomi and questions do not", () => {
   const account = "17";
@@ -98,4 +102,79 @@ test("pause without a watching row fails", () => {
     correlation_id: "c-5",
   });
   assert.throws(() => pauseInstruction(account, drafted.instruction.instruction_id));
+});
+
+test("each instruction has a task_id and cancel drops it without a second confirm", () => {
+  const account = "23";
+  const drafted = composeDraft(account, {
+    kind: "watch",
+    message: "If ETH drops 5% in a day, tell me",
+    correlation_id: "c-6",
+  });
+  const taskId = drafted.instruction.task_id;
+  assert.equal(typeof taskId, "string");
+  assert.equal(taskId.length, 6);
+  const id = drafted.instruction.instruction_id;
+  confirmInstruction(account, {
+    instruction_id: id,
+    watch_id: "w-cancel",
+    confirm_ref: "w-cancel",
+  });
+  const cancelled = cancelTask(account, taskId);
+  assert.equal(cancelled.ok, true);
+  assert.equal(cancelled.task_id, taskId);
+  assert.equal(cancelled.command, `cancel task ${taskId}`);
+  assert.match(cancelled.reply, /cancelled /);
+  assert.equal(listInstructions(account).length, 0);
+  const missing = cancelTask(account, "no-such-task");
+  assert.equal(missing.ok, false);
+  assert.equal(missing.error, "not_found");
+});
+
+test("stage trade shows the whole sentence and cancel works before execute", () => {
+  const account = "24";
+  const sentence = "Buy 0.1 ETH spot at market, the whole instruction";
+  const t0 = 1_700_000_000;
+  const staged = stageTrade(
+    account,
+    { sentence, instrument: "ETH", params: { side: "buy", quantity: "0.1" } },
+    t0,
+  );
+  assert.equal(staged.ok, true);
+  assert.equal(staged.instruction.status, "pending_execute");
+  assert.equal(staged.instruction.sentence, sentence);
+  assert.equal(staged.instruction.execute_at, t0 + 3);
+  assert.equal(staged.instruction.remaining_secs, 3);
+  const tooSoon = beginExecute(account, staged.instruction.instruction_id, t0 + 1);
+  assert.equal(tooSoon.ok, false);
+  assert.equal(tooSoon.error, "too_soon");
+  const cancelled = cancelTask(account, staged.instruction.task_id);
+  assert.equal(cancelled.ok, true);
+  const after = beginExecute(account, staged.instruction.instruction_id, t0 + 5);
+  assert.equal(after.ok, false);
+  assert.equal(after.error, "cancelled");
+});
+
+test("after the delay begin then complete fills the staged trade", () => {
+  const account = "25";
+  const sentence = "Sell 1 WETH perp";
+  const t0 = 1_700_000_100;
+  const staged = stageTrade(account, { sentence, instrument: "WETH" }, t0);
+  const id = staged.instruction.instruction_id;
+  const begun = beginExecute(account, id, t0 + 3);
+  assert.equal(begun.ok, true);
+  assert.equal(begun.instruction.status, "executing");
+  assert.equal(begun.instruction.progress_pct, 8);
+  assert.equal(begun.instruction.slice_i, 1);
+  const done = completeExecute(
+    account,
+    id,
+    { receipt: "filled · 0xabc", avg_price: "12" },
+    t0 + 4,
+  );
+  assert.equal(done.ok, true);
+  assert.equal(done.instruction.status, "done");
+  assert.equal(done.instruction.sentence, sentence);
+  assert.equal(done.instruction.progress_pct, 100);
+  assert.equal(done.instruction.avg_price, "12");
 });

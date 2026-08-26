@@ -97,6 +97,9 @@ pub struct MiniFlags {
     pub primary_view: String,
     pub jobline_negative: bool,
     pub family: String,
+    pub voice_home: bool,
+    pub voice_mode: String,
+    pub live_words: bool,
 }
 
 struct PositionDraft {
@@ -501,19 +504,43 @@ pub fn spec_band(score: u8) -> &'static str {
     }
 }
 
+fn env_flag_on(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on")
+        }
+        Err(_) => default,
+    }
+}
+
+fn env_flag_off(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let t = v.trim();
+            t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off")
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn mini_flags() -> MiniFlags {
     MiniFlags {
         primary_view: std::env::var("WORLD_MINI_PRIMARY_VIEW")
             .ok()
             .filter(|v| v == "portfolio" || v == "ledger")
             .unwrap_or_else(|| "ledger".to_string()),
-        jobline_negative: std::env::var("WORLD_MINI_JOBLINE_NEGATIVE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false),
+        jobline_negative: env_flag_on("WORLD_MINI_JOBLINE_NEGATIVE", false),
         family: std::env::var("WORLD_MINI_FAMILY")
             .ok()
             .filter(|v| v == "violet" || v == "blue")
             .unwrap_or_else(|| "blue".to_string()),
+        voice_home: !env_flag_off("WORLD_MINI_VOICE_HOME"),
+        voice_mode: std::env::var("WORLD_MINI_VOICE_MODE")
+            .ok()
+            .filter(|v| v == "tap" || v == "hold")
+            .unwrap_or_else(|| "hold".to_string()),
+        live_words: !env_flag_off("WORLD_MINI_LIVE_WORDS"),
     }
 }
 
@@ -597,7 +624,6 @@ pub fn load_desk_context(account_id: u64) -> Result<Value, String> {
     Ok(json!({
         "ok": true,
         "account_id": account_id,
-        "paper": false,
         "portfolio": portfolio,
         "products": products,
         "ledger": ledger,
@@ -608,6 +634,10 @@ pub fn load_desk_context(account_id: u64) -> Result<Value, String> {
 
 pub fn submit_compose(body: &Value) -> Result<Value, String> {
     BrainClient::from_env().compose(body)
+}
+
+pub fn flush_staged_trade(account_id: u64, instruction_id: &str) -> Result<Value, String> {
+    crate::staged::flush_staged_trade(account_id, instruction_id)
 }
 
 /// Best-effort Bot API send. Failures are logged by the caller; they must not
@@ -637,39 +667,109 @@ pub fn post_chat_lines(bot_token: &str, chat_id: u64, lines: &[String]) -> Resul
     Ok(())
 }
 
-/// Forward a Mini App voice note to The Desk Cage. STT and assent live there.
-pub fn post_desk_voice(body: &Value) -> Result<Value, String> {
-    let base = std::env::var("DESK_URL")
+/// Prepare M10 for Telegram.WebApp.shareMessage. Mutates nothing the Mini App
+/// displays. Falls back to a bot-chat deep link when savePreparedInlineMessage
+/// is unavailable.
+pub fn prepare_introduction(
+    account_id: u64,
+    telegram_user_id: Option<u64>,
+    first_name: Option<&str>,
+    bot_token: &str,
+) -> Result<Value, String> {
+    let telegram_bot = std::env::var("WORLD_TELEGRAM_BOT")
         .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "http://127.0.0.1:8765".to_string());
-    let url = format!("{}/api/voice/note", base.trim_end_matches('/'));
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "WorldMarketsBot".to_string());
+    let intro = BrainClient::from_env().share(&json!({
+        "action": "introduce",
+        "user_id": account_id,
+        "account_id": account_id,
+        "first_name": first_name,
+        "telegram_bot": telegram_bot,
+    }))?;
+    let message = intro
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let link = intro
+        .get("link")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let fallback_url = format!("https://t.me/{telegram_bot}?start=share");
+    let prepared = telegram_user_id
+        .and_then(|user_id| save_prepared_inline_message(bot_token, user_id, &message, &link).ok());
+    Ok(json!({
+        "ok": true,
+        "prepared_inline_message_id": prepared,
+        "fallback_url": fallback_url,
+        "intent": crate::share::INTENT,
+    }))
+}
+
+fn save_prepared_inline_message(
+    bot_token: &str,
+    user_id: u64,
+    message: &str,
+    link: &str,
+) -> Result<String, String> {
+    if bot_token.is_empty() || user_id == 0 || message.is_empty() {
+        return Err("unprepared".into());
+    }
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(90))
+        .timeout(std::time::Duration::from_secs(8))
         .build()
         .map_err(|err| err.to_string())?;
-    let mut request = client.post(&url).json(body);
-    if let Ok(token) = std::env::var("DESK_BRIDGE_TOKEN") {
-        if !token.trim().is_empty() {
-            request = request.header("X-Desk-Token", token);
-        }
+    let url = format!("https://api.telegram.org/bot{bot_token}/savePreparedInlineMessage");
+    let mut keyboard = Vec::new();
+    if !link.is_empty() {
+        keyboard.push(json!([
+            { "text": crate::share::PAPER_BTN, "url": link },
+            { "text": crate::share::CANT_BTN, "url": link }
+        ]));
     }
-    let response = request
+    let response = client
+        .post(&url)
+        .json(&json!({
+            "user_id": user_id,
+            "result": {
+                "type": "article",
+                "id": "m10",
+                "title": "aomi",
+                "input_message_content": {
+                    "message_text": message,
+                    "link_preview_options": { "is_disabled": true }
+                },
+                "reply_markup": { "inline_keyboard": keyboard }
+            },
+            "allow_user_chats": true,
+            "allow_bot_chats": false,
+            "allow_group_chats": true,
+            "allow_channel_chats": false
+        }))
         .send()
-        .map_err(|err| format!("desk is not reachable at {url} ({err})"))?;
-    let status = response.status();
-    let value: Value = response.json().map_err(|err| {
-        format!("desk returned invalid JSON from {url}: {err}")
-    })?;
-    if !status.is_success() {
-        let detail = value
-            .get("detail")
+        .map_err(|err| err.to_string())?;
+    let value: Value = response.json().map_err(|err| err.to_string())?;
+    if value.get("ok") != Some(&Value::Bool(true)) {
+        return Err(value
+            .get("description")
             .and_then(Value::as_str)
-            .or_else(|| value.get("error").and_then(Value::as_str))
-            .unwrap_or("desk rejected the voice note");
-        return Err(detail.to_string());
+            .unwrap_or("savePreparedInlineMessage failed")
+            .to_string());
     }
-    Ok(value)
+    value
+        .pointer("/result/id")
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "savePreparedInlineMessage missing id".to_string())
+}
+
+/// Mini App hold-to-talk: STT + brain utterance + compose into the agent.
+/// Does not call The Desk. Does not place an order.
+pub fn ingest_voice_note(account_id: u64, body: &Value) -> Result<Value, String> {
+    crate::voice::ingest_voice(account_id, body)
 }
 
 fn risk_score(metrics: &PortfolioMetrics, eligible: bool) -> u8 {
@@ -778,6 +878,17 @@ mod tests {
     fn money_always_two_dp() {
         assert_eq!(two_dp(Decimal::from(8432)), "8432.00");
         assert_eq!(two_dp(Decimal::new(84325, 1)), "8432.50");
+    }
+
+    #[test]
+    fn mini_flags_voice_home_defaults_on() {
+        let flags = mini_flags();
+        assert!(flags.voice_home);
+        assert_eq!(flags.voice_mode, "hold");
+        assert!(flags.live_words);
+        assert_eq!(flags.primary_view, "ledger");
+        assert!(!flags.jobline_negative);
+        assert_eq!(flags.family, "blue");
     }
 
     #[test]

@@ -204,7 +204,7 @@ pub(crate) struct RenewWorldLoans;
 pub(crate) struct PayWorldLoanInterest;
 pub(crate) struct CloseWorldLoan;
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub(crate) struct ExecuteWorldOrderArgs {
     /// Product type: spot, perp, or lend.
     pub(crate) product: String,
@@ -230,6 +230,9 @@ pub(crate) struct ExecuteWorldOrderArgs {
     pub(crate) account_id: Option<u64>,
     #[serde(default)]
     pub(crate) wallet_address: Option<String>,
+    /// The user's whole utterance. Shown on the ledger during the cancel window.
+    #[serde(default)]
+    pub(crate) sentence: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -882,9 +885,23 @@ impl DynAomiTool for RenderLookup {
     type App = WorldMarketsApp;
     type Args = RenderLookupArgs;
     const NAME: &'static str = "render_lookup";
-    const DESCRIPTION: &'static str = "Whole-message terse lookup (b/p/r/a/d, word forms, ?/commands). Host: call on every user message with text=user message; if skip_llm, send message and do not call the LLM. Unmatched messages still prefetch the account. Model: paste message verbatim. Never executes.";
+    const DESCRIPTION: &'static str = "Whole-message terse lookup (b/p/r/a/d, word forms, ?/commands), cancel task {id}, or the non-money share/introduce intent. Host: call on every user message with text=user message; if skip_llm, send message (and hint/name_ask/messages when present) and do not call the LLM. Unmatched messages still prefetch the account. Model: paste message verbatim. Share never executes. Cancel drops a watch — never a trade.";
 
     fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        if let Some(id) = args
+            .text
+            .as_deref()
+            .and_then(crate::lookups::parse_cancel_task)
+        {
+            return render_cancel_task(app, &id, args.account_id, &ctx);
+        }
+        if let Some(intent) = args
+            .text
+            .as_deref()
+            .and_then(crate::share::parse_share_intent)
+        {
+            return render_share_intent(app, intent, args.account_id, None, &ctx);
+        }
         let kind = args
             .token
             .as_deref()
@@ -920,6 +937,152 @@ impl DynAomiTool for RenderLookup {
         attach_rpc_trace(&app.client, before, &mut payload);
         Ok(payload)
     }
+}
+
+fn live_bound_account(ctx: &DynToolCallCtx) -> bool {
+    ctx.attribute_u64(&["world", "account_id"]).is_some()
+        || value_u64(ctx.attribute_path(&["handover_account_id"])).is_some()
+        || value_u64(ctx.attribute_path(&["platform_account_ref"])).is_some()
+        || value_u64(ctx.attribute_path(&["handover_account_ref"])).is_some()
+        || ctx
+            .attribute_u64(&["handover_mandate", "account", "id"])
+            .is_some()
+}
+
+fn telegram_first_name(ctx: &DynToolCallCtx, explicit: Option<&str>) -> Option<String> {
+    explicit
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| ctx.attribute_string(&["telegram", "user", "first_name"]))
+        .or_else(|| ctx.attribute_string(&["user", "first_name"]))
+        .or_else(|| ctx.attribute_string(&["telegram", "first_name"]))
+}
+
+fn telegram_user_id(ctx: &DynToolCallCtx) -> Option<u64> {
+    ctx.attribute_u64(&["telegram", "user", "id"])
+        .or_else(|| ctx.attribute_u64(&["user", "id"]))
+        .or_else(|| ctx.attribute_u64(&["telegram", "id"]))
+}
+
+fn share_user_id(ctx: &DynToolCallCtx, account_id: Option<u64>) -> String {
+    WorldMarketsApp::account_id(ctx, account_id)
+        .map(|id| id.to_string())
+        .or_else(|| telegram_user_id(ctx).map(|id| id.to_string()))
+        .unwrap_or_else(|| format!("session-{}", ctx.session_id))
+}
+
+fn wrap_share(mut value: Value) -> Value {
+    if let Some(map) = value.as_object_mut() {
+        map.insert("source".into(), json!("world-markets-share"));
+        map.insert("executable".into(), json!(false));
+        map.insert("skip_llm".into(), json!(true));
+        map.insert("reply_verbatim".into(), json!(true));
+        map.insert("matched".into(), json!(true));
+        map.insert("token".into(), json!("share"));
+        map.entry("policy_verdict".to_string())
+            .or_insert(Value::Null);
+    }
+    value
+}
+
+fn already_user_reply() -> Value {
+    wrap_share(json!({
+        "surface": "already_user",
+        "message": crate::share::ALREADY_USER,
+        "hint": null,
+        "name_ask": null,
+        "messages": [{ "kind": "already_user", "message": crate::share::ALREADY_USER }],
+        "controls": [],
+        "simulated": false,
+    }))
+}
+
+fn render_share_intent(
+    app: &WorldMarketsApp,
+    intent: crate::share::ShareIntent,
+    account_id: Option<u64>,
+    first_name: Option<&str>,
+    ctx: &DynToolCallCtx,
+) -> Result<Value, String> {
+    let user_id = share_user_id(ctx, account_id);
+    let first_name = telegram_first_name(ctx, first_name);
+    let telegram_bot = std::env::var("WORLD_TELEGRAM_BOT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "WorldMarketsBot".to_string());
+    match app.brain.share(&json!({
+        "action": intent.action(),
+        "user_id": user_id,
+        "account_id": user_id,
+        "first_name": first_name,
+        "telegram_bot": telegram_bot,
+    })) {
+        Ok(value) => Ok(wrap_share(value)),
+        Err(err) => Ok(wrap_share(json!({
+            "surface": "share_unavailable",
+            "message": crate::share::HINT,
+            "hint": crate::share::HINT,
+            "name_ask": null,
+            "error": err,
+            "controls": [],
+        }))),
+    }
+}
+
+fn render_cancel_task(
+    app: &WorldMarketsApp,
+    id: &str,
+    account_id: Option<u64>,
+    ctx: &DynToolCallCtx,
+) -> Result<Value, String> {
+    let Some(account_id) = WorldMarketsApp::account_id(ctx, account_id) else {
+        return Ok(json!({
+            "source": "world-markets-lookup",
+            "executable": false,
+            "matched": true,
+            "skip_llm": true,
+            "reply_verbatim": true,
+            "token": "cancel_task",
+            "message": "No bound account — nothing cancelled.",
+        }));
+    };
+    let result = match app.brain.cancel_task(account_id, id) {
+        Ok(value) => value,
+        Err(_) => {
+            return Ok(json!({
+                "source": "world-markets-lookup",
+                "executable": false,
+                "matched": true,
+                "skip_llm": true,
+                "reply_verbatim": true,
+                "token": "cancel_task",
+                "message": "can't reach the ledger — task not cancelled.",
+            }));
+        }
+    };
+    let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let message = result
+        .get("reply")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if ok {
+                format!("cancelled {id}")
+            } else {
+                format!("No task {id} on this account.")
+            }
+        });
+    Ok(json!({
+        "source": "world-markets-lookup",
+        "executable": false,
+        "matched": true,
+        "skip_llm": true,
+        "reply_verbatim": true,
+        "token": "cancel_task",
+        "message": message,
+        "result": result,
+    }))
 }
 
 impl DynAomiTool for WarmAccount {
@@ -1112,7 +1275,7 @@ impl DynAomiTool for ExecuteWorldOrder {
     type App = WorldMarketsApp;
     type Args = ExecuteWorldOrderArgs;
     const NAME: &'static str = "execute_world_order";
-    const DESCRIPTION: &'static str = "Place a World spot, perp, or lend/borrow order through the local execution sidecar after the mandate allows. Limit if price is set, otherwise market/IOC. Never withdraws.";
+    const DESCRIPTION: &'static str = "Stage a World spot, perp, or lend/borrow order on the ledger for a 3s cancel window, then fill through the local execution sidecar after the mandate allows. Pass the user's whole sentence. Limit if price is set, otherwise market/IOC. Call after a clear voice or text instruction — do not wait for a Telegram button. Never withdraws.";
 
     fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
         let product = normalize_execute_product(&args.product)?;
@@ -1130,7 +1293,7 @@ impl DynAomiTool for ExecuteWorldOrder {
             .clone()
             .unwrap_or_else(|| "USDT".to_string());
         let quote = asset_by_symbol(&assets, &quote_symbol)?;
-        let (market, _, verdict) = app.live_verdict(
+        let (_, _, verdict) = app.live_verdict(
             LiveVerdictInput {
                 product,
                 side: &side,
@@ -1144,33 +1307,102 @@ impl DynAomiTool for ExecuteWorldOrder {
         if !verdict.is_allow() {
             return Ok(execution_blocked(&access, &verdict));
         }
-        let order_type = resolve_order_type(args.order_type.as_deref(), args.price.as_deref());
-        let receipt = app.execution.place_order(&PlaceOrderRequest {
-            account_id: access.account_id,
-            product: product.to_string(),
-            side: side.clone(),
-            base_token_id: base.token_id,
-            quote_token_id: (product != "lend").then_some(quote.token_id),
-            quantity: args.quantity.clone(),
-            price: args.price.clone(),
-            order_type,
-            slippage: args.slippage.clone(),
-        })?;
-        app.refresh_after_trade(&ctx, args.account_id, args.wallet_address.as_deref());
-        Ok(execution_ok(
-            &access,
-            &verdict,
-            receipt,
-            json!({
-                "product": product,
-                "side": side,
-                "base_symbol": base.symbol,
-                "quote_symbol": quote.symbol,
-                "quantity": args.quantity,
-                "order_book": market.book,
-            }),
-        ))
+        let sentence = trade_sentence(&args);
+        let mandate = ctx.attribute_path(&["handover_mandate"]).cloned();
+        crate::staged::stage_and_schedule(
+            &app.brain,
+            access.account_id,
+            &args,
+            &sentence,
+            mandate.as_ref(),
+        )
     }
+}
+
+pub(crate) fn trade_sentence(args: &ExecuteWorldOrderArgs) -> String {
+    if let Some(sentence) = args
+        .sentence
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return sentence.to_string();
+    }
+    let product = args.product.trim();
+    let qty = args.quantity.trim();
+    let base = args.base_symbol.trim();
+    let side = args.side.trim();
+    match args
+        .price
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(price) => format!("{side} {qty} {base} {product} at {price}"),
+        None => format!("{side} {qty} {base} {product} at market"),
+    }
+}
+
+pub(crate) fn place_world_order(
+    app: &WorldMarketsApp,
+    args: ExecuteWorldOrderArgs,
+    ctx: DynToolCallCtx,
+) -> Result<Value, String> {
+    let product = normalize_execute_product(&args.product)?;
+    let side = normalize_execute_side(product, &args.side)?;
+    let quantity = parse_decimal(&args.quantity, "quantity")
+        .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+    if quantity <= Decimal::ZERO {
+        return Err("[world-markets] quantity must be greater than zero".to_string());
+    }
+    let access = app.access(args.account_id, args.wallet_address.as_deref(), &ctx)?;
+    let (assets, account) = app.live_account(&access)?;
+    let base = asset_by_symbol(&assets, &args.base_symbol)?;
+    let quote_symbol = args
+        .quote_symbol
+        .clone()
+        .unwrap_or_else(|| "USDT".to_string());
+    let quote = asset_by_symbol(&assets, &quote_symbol)?;
+    let (market, _, verdict) = app.live_verdict(
+        LiveVerdictInput {
+            product,
+            side: &side,
+            base: &base,
+            quote: &quote,
+            quantity,
+            account: &account,
+        },
+        &ctx,
+    )?;
+    if !verdict.is_allow() {
+        return Ok(execution_blocked(&access, &verdict));
+    }
+    let order_type = resolve_order_type(args.order_type.as_deref(), args.price.as_deref());
+    let receipt = app.execution.place_order(&PlaceOrderRequest {
+        account_id: access.account_id,
+        product: product.to_string(),
+        side: side.clone(),
+        base_token_id: base.token_id,
+        quote_token_id: (product != "lend").then_some(quote.token_id),
+        quantity: args.quantity.clone(),
+        price: args.price.clone(),
+        order_type,
+        slippage: args.slippage.clone(),
+    })?;
+    app.refresh_after_trade(&ctx, args.account_id, args.wallet_address.as_deref());
+    Ok(execution_ok(
+        &access,
+        &verdict,
+        receipt,
+        json!({
+            "product": product,
+            "side": side,
+            "base_symbol": base.symbol,
+            "quote_symbol": quote.symbol,
+            "quantity": args.quantity,
+            "order_book": market.book,
+        }),
+    ))
 }
 
 impl DynAomiTool for CancelWorldOrder {
@@ -1818,26 +2050,47 @@ impl DynAomiTool for CheckNegativeCarry {
 pub(crate) struct RenderShare;
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub(crate) struct RenderShareArgs {}
+pub(crate) struct RenderShareArgs {
+    /// Whole user message when the host did not pre-classify the intent.
+    #[serde(default)]
+    pub(crate) text: Option<String>,
+    /// `introduce` / `without_name` / `with_name` / `revoke` / `who`.
+    #[serde(default)]
+    pub(crate) action: Option<String>,
+    /// Telegram first name. Omitted from M10 unless the user left name-on as default.
+    #[serde(default)]
+    pub(crate) first_name: Option<String>,
+    /// World account ID. Optional when handover account context is available.
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+}
 
 impl DynAomiTool for RenderShare {
     type App = WorldMarketsApp;
     type Args = RenderShareArgs;
     const NAME: &'static str = "render_share";
-    const DESCRIPTION: &'static str = "Share card caption + guest deep link. Send `message` verbatim. Never invent a deposit amount. Never executes.";
+    const DESCRIPTION: &'static str = "Introduction (M10) for the user's own thread. Send hint if present, then message verbatim. Never executes. Never the mandate engine. Never account figures.";
 
-    fn run(
-        app: &WorldMarketsApp,
-        _args: Self::Args,
-        _ctx: DynToolCallCtx,
-    ) -> Result<Value, String> {
-        let funnel = Funnel::new(&app.reporting, &app.guest_store, FunnelConfig::default());
-        // PNG renderer is a host dependency (see docs/FUTURE-WORK.md).
-        let image_available = std::env::var("WORLD_SHARE_CARD_RENDERER")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let surface = funnel.share(image_available);
-        Ok(guest::to_tool_json(&surface))
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let intent = args
+            .text
+            .as_deref()
+            .and_then(crate::share::parse_share_intent)
+            .or_else(|| match args.action.as_deref().unwrap_or("introduce") {
+                "without_name" => Some(crate::share::ShareIntent::WithoutName),
+                "with_name" => Some(crate::share::ShareIntent::WithName),
+                "revoke" => Some(crate::share::ShareIntent::Revoke),
+                "who" => Some(crate::share::ShareIntent::Who),
+                _ => Some(crate::share::ShareIntent::Introduce),
+            })
+            .unwrap_or(crate::share::ShareIntent::Introduce);
+        render_share_intent(
+            app,
+            intent,
+            args.account_id,
+            args.first_name.as_deref(),
+            &ctx,
+        )
     }
 }
 
@@ -1849,21 +2102,46 @@ pub(crate) struct RenderGuestSurfaceArgs {
     pub(crate) guest_id: String,
     /// Surface name (greeting, showcase, paper, upgrade, …).
     pub(crate) surface: String,
+    /// Raw Telegram start / startapp payload when separate from guest_id.
+    #[serde(default)]
+    pub(crate) start_payload: Option<String>,
 }
 
 impl DynAomiTool for RenderGuestSurface {
     type App = WorldMarketsApp;
     type Args = RenderGuestSurfaceArgs;
     const NAME: &'static str = "render_guest_surface";
-    const DESCRIPTION: &'static str = "Guest/paper message. Send `message` verbatim. Never invent numbers. Never a policy verdict. Never executes.";
+    const DESCRIPTION: &'static str = "Guest/paper message. Send `message` verbatim. Never invent numbers. Never a policy verdict. Never executes. Host: pass chat identity as guest_id and the /start payload as start_payload.";
 
-    fn run(app: &WorldMarketsApp, args: Self::Args, _ctx: DynToolCallCtx) -> Result<Value, String> {
-        let guest_id =
-            guest::guest_id_from_start(&args.guest_id).unwrap_or_else(|| args.guest_id.clone());
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let start = args
+            .start_payload
+            .as_deref()
+            .unwrap_or(args.guest_id.as_str());
+        if crate::share::ref_code_from_start(start).is_some() && live_bound_account(&ctx) {
+            return Ok(already_user_reply());
+        }
+        let guest_id = arriving_guest_id(&args, &ctx);
+        if let Some(code) = crate::share::ref_code_from_start(start) {
+            let _ = app.brain.share(&json!({
+                "action": "attribute",
+                "code": code,
+                "guest_id": guest_id,
+            }));
+        }
         let funnel = Funnel::new(&app.reporting, &app.guest_store, FunnelConfig::default());
         let surface = funnel.render(&guest_id, &args.surface)?;
         Ok(guest::to_tool_json(&surface))
     }
+}
+
+fn arriving_guest_id(args: &RenderGuestSurfaceArgs, ctx: &DynToolCallCtx) -> String {
+    if crate::share::ref_code_from_start(&args.guest_id).is_some() && args.start_payload.is_none() {
+        if let Some(id) = telegram_user_id(ctx) {
+            return format!("g_{id}");
+        }
+    }
+    guest::guest_id_from_start(&args.guest_id).unwrap_or_else(|| args.guest_id.clone())
 }
 
 pub(crate) struct ApplyGuestUpgrade;
@@ -2031,7 +2309,7 @@ impl DynAomiTool for GetWorldTasks {
     type App = WorldMarketsApp;
     type Args = GetWorldTasksArgs;
     const NAME: &'static str = "get_world_tasks";
-    const DESCRIPTION: &'static str = "List watches, unsigned preferences, and signed on-chain policies. Policies are read-only from chat. Never executes.";
+    const DESCRIPTION: &'static str = "List watches, unsigned preferences, signed on-chain policies, plus voice lexicon/episode/consents. Policies are read-only from chat. Never executes.";
 
     fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
         app.note_activity(&ctx, args.account_id);
@@ -2292,6 +2570,127 @@ impl DynAomiTool for DrainWorldOutbound {
     }
 }
 
+pub(crate) struct RecordWorldCorrection;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct RecordWorldCorrectionArgs {
+    #[serde(default)]
+    pub(crate) utterance_ref: Option<String>,
+    #[serde(default)]
+    pub(crate) rejected_intent: Option<Value>,
+    #[serde(default)]
+    pub(crate) rejected_readback: Option<String>,
+    #[serde(default)]
+    pub(crate) correction_utterance_ref: Option<String>,
+    #[serde(default)]
+    pub(crate) accepted_intent: Option<Value>,
+    #[serde(default)]
+    pub(crate) accepted_readback: Option<String>,
+    #[serde(default)]
+    pub(crate) lexicon_rename: Option<Value>,
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+}
+
+impl DynAomiTool for RecordWorldCorrection {
+    type App = WorldMarketsApp;
+    type Args = RecordWorldCorrectionArgs;
+    const NAME: &'static str = "record_world_correction";
+    const DESCRIPTION: &'static str = "Store a spoken or typed repair (rejected vs accepted intent). Never executes. Never a confirm gate.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let account_id = WorldMarketsApp::account_id(&ctx, args.account_id).ok_or_else(|| {
+            "[world-markets] account_id is required to record a correction".to_string()
+        })?;
+        let result = app.brain.record_correction(&json!({
+            "account_id": account_id,
+            "utterance_ref": args.utterance_ref,
+            "rejected_intent": args.rejected_intent,
+            "rejected_readback": args.rejected_readback,
+            "correction_utterance_ref": args.correction_utterance_ref,
+            "accepted_intent": args.accepted_intent,
+            "accepted_readback": args.accepted_readback,
+            "lexicon_rename": args.lexicon_rename,
+        }))?;
+        Ok(json!({
+            "source": "world-markets-brain",
+            "executable": false,
+            "result": result,
+        }))
+    }
+}
+
+pub(crate) struct SetWorldConsent;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct SetWorldConsentArgs {
+    /// ai_identity_ack | training_use | prosody_dark | aomi_initiated_voice
+    pub(crate) kind: String,
+    /// granted or withdrawn
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+    #[serde(default)]
+    pub(crate) wording_version: Option<String>,
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+}
+
+impl DynAomiTool for SetWorldConsent {
+    type App = WorldMarketsApp;
+    type Args = SetWorldConsentArgs;
+    const NAME: &'static str = "set_world_consent";
+    const DESCRIPTION: &'static str = "Record a versioned voice/data consent. Required before any aomi-generated audio. Never executes.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let account_id = WorldMarketsApp::account_id(&ctx, args.account_id).ok_or_else(|| {
+            "[world-markets] account_id is required to record consent".to_string()
+        })?;
+        let result = app.brain.set_consent(&json!({
+            "account_id": account_id,
+            "kind": args.kind,
+            "status": args.status.unwrap_or_else(|| "granted".to_string()),
+            "wording_version": args.wording_version.unwrap_or_else(|| "v1".to_string()),
+        }))?;
+        Ok(json!({
+            "source": "world-markets-brain",
+            "executable": false,
+            "result": result,
+        }))
+    }
+}
+
+pub(crate) struct CloseWorldEpisode;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct CloseWorldEpisodeArgs {
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+}
+
+impl DynAomiTool for CloseWorldEpisode {
+    type App = WorldMarketsApp;
+    type Args = CloseWorldEpisodeArgs;
+    const NAME: &'static str = "close_world_episode";
+    const DESCRIPTION: &'static str = "Close the current voice episode and return its recap fields. Call when the user is done for now. Never executes.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let account_id = WorldMarketsApp::account_id(&ctx, args.account_id).ok_or_else(|| {
+            "[world-markets] account_id is required to close an episode".to_string()
+        })?;
+        let result = app.brain.close_episode(&json!({
+            "account_id": account_id,
+            "reason": args.reason.unwrap_or_else(|| "done_for_now".to_string()),
+        }))?;
+        Ok(json!({
+            "source": "world-markets-brain",
+            "executable": false,
+            "result": result,
+        }))
+    }
+}
+
 fn value_u64(value: Option<&Value>) -> Option<u64> {
     value.and_then(|value| {
         value.as_u64().or_else(|| {
@@ -2514,6 +2913,7 @@ mod tests {
                 slippage: None,
                 account_id: None,
                 wallet_address: None,
+                sentence: None,
             },
             empty_ctx("execute_world_order"),
         )
@@ -2524,6 +2924,26 @@ mod tests {
                 || err.contains("execution sidecar"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn trade_sentence_prefers_the_whole_utterance() {
+        let mut args = ExecuteWorldOrderArgs {
+            product: "spot".to_string(),
+            side: "buy".to_string(),
+            base_symbol: "WETH".to_string(),
+            quote_symbol: Some("USDT".to_string()),
+            quantity: "0.1".to_string(),
+            price: None,
+            order_type: None,
+            slippage: None,
+            account_id: None,
+            wallet_address: None,
+            sentence: Some("  Buy a tenth of ETH spot please  ".to_string()),
+        };
+        assert_eq!(trade_sentence(&args), "Buy a tenth of ETH spot please");
+        args.sentence = None;
+        assert_eq!(trade_sentence(&args), "buy 0.1 WETH spot at market");
     }
 
     fn ctx_with(attributes: Value) -> DynToolCallCtx {
@@ -2632,6 +3052,77 @@ mod tests {
             state_attributes: Default::default(),
             secrets: Default::default(),
         }
+    }
+
+    #[test]
+    fn render_lookup_share_intent_skips_llm_and_never_executes() {
+        let app = WorldMarketsApp::default();
+        let value = RenderLookup::run(
+            &app,
+            lookup_args("introduce yourself to my friend", None),
+            empty_ctx("render_lookup"),
+        )
+        .unwrap();
+        assert_eq!(value["skip_llm"], true);
+        assert_eq!(value["executable"], false);
+        assert_eq!(value["matched"], true);
+        assert_eq!(value["token"], "share");
+        assert!(value.get("message").and_then(Value::as_str).is_some());
+        assert!(
+            app.warmer.never_refreshed(),
+            "share must not touch the account warmer"
+        );
+    }
+
+    #[test]
+    fn bound_user_on_ref_start_gets_already_user() {
+        let app = WorldMarketsApp::default();
+        let ctx = ctx_with(json!({ "world": { "account_id": 17 } }));
+        let value = RenderGuestSurface::run(
+            &app,
+            RenderGuestSurfaceArgs {
+                guest_id: "ref_ab12cd34ef".into(),
+                surface: "greeting".into(),
+                start_payload: None,
+            },
+            DynToolCallCtx {
+                session_id: ctx.session_id,
+                tool_name: "render_guest_surface".into(),
+                call_id: ctx.call_id,
+                state_attributes: ctx.state_attributes,
+                secrets: ctx.secrets,
+            },
+        )
+        .unwrap();
+        assert_eq!(value["message"], crate::share::ALREADY_USER);
+        assert_eq!(value["skip_llm"], true);
+        assert_eq!(value["executable"], false);
+        assert!(
+            !value["message"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("paper portfolio")
+        );
+    }
+
+    #[test]
+    fn ref_start_without_bound_account_is_generic_a_flow() {
+        let app = WorldMarketsApp::default();
+        let value = RenderGuestSurface::run(
+            &app,
+            RenderGuestSurfaceArgs {
+                guest_id: "ref_ab12cd34ef".into(),
+                surface: "greeting".into(),
+                start_payload: Some("ref_ab12cd34ef".into()),
+            },
+            empty_ctx("render_guest_surface"),
+        )
+        .unwrap();
+        let message = value["message"].as_str().unwrap();
+        assert!(message.contains("paper portfolio"));
+        assert_ne!(message, crate::share::ALREADY_USER);
+        assert!(guest::anti_goal_violations(message).is_empty());
     }
 
     #[test]

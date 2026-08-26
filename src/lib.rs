@@ -18,8 +18,12 @@ mod rates;
 mod reporting;
 mod research;
 mod rpc;
+mod share;
+mod staged;
+mod stt;
 mod tasks;
 mod tool;
+mod voice;
 mod warm;
 
 dyn_aomi_app!(
@@ -69,6 +73,9 @@ dyn_aomi_app!(
         tool::PauseWorldWatch,
         tool::ResumeWorldWatch,
         tool::DrainWorldOutbound,
+        tool::RecordWorldCorrection,
+        tool::SetWorldConsent,
+        tool::CloseWorldEpisode,
     ],
     secrets = [tool::MARKET_DATA_API_KEY],
     namespaces = ["evm-core"],

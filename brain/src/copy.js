@@ -129,3 +129,59 @@ export function attachExpireCopy(fire) {
 export function attachBundleCopy(payload) {
   return { ...payload, message: bundleMessage(payload.fires) };
 }
+
+/**
+ * Introduction copy. Templates may interpolate only `first_name` and `ref_link`.
+ * No positions, PnL, balances, or other account slots exist here.
+ */
+export const SHARE = {
+  hint: "Forward the next message to them — and a voice note from you on top beats anything I could say.",
+  m10_with_name:
+    "I'm aomi — an AI on a recorded line. I watch, I execute inside signed limits, and I can do nothing my owner hasn't allowed.\n\n{first_name} thought you should meet me.\n\nTry me on paper — pick a number, nothing is real, you sign nothing.\n{ref_link}",
+  m10_anon:
+    "I'm aomi — an AI on a recorded line. I watch, I execute inside signed limits, and I can do nothing my owner hasn't allowed.\n\nA friend thought you should meet me.\n\nTry me on paper — pick a number, nothing is real, you sign nothing.\n{ref_link}",
+  name_ask: "With your first name on it, or without?",
+  already_user: "You two already know each other — this account is live.",
+  revoke_ack: "Old invite link is dead. Here's your new one.",
+  who_asked:
+    "I don't track who opens it — that stays between you and them.",
+  without_name: "without my name",
+  paper: "Try it on paper ↗",
+  cant: "What can't you do?",
+  rate_limited: "Three new invite links a day. The current one still works.",
+  introduce: "Introduce aomi to a friend ›",
+  intent: "introduce yourself to my friend",
+};
+
+const SLOT = /\{(\w+)\}/g;
+
+export function templateSlots(template) {
+  return [...new Set([...String(template).matchAll(SLOT)].map((m) => m[1]))].sort();
+}
+
+export function fillTemplate(template, vars) {
+  return String(template).replace(SLOT, (_, key) => {
+    if (!Object.prototype.hasOwnProperty.call(vars, key)) {
+      throw new Error(`no field for slot {${key}}`);
+    }
+    const value = vars[key];
+    return value == null ? "" : String(value);
+  });
+}
+
+export function renderM10({ includeName, firstName, refLink }) {
+  if (includeName && firstName) {
+    return fillTemplate(SHARE.m10_with_name, {
+      first_name: firstName,
+      ref_link: refLink,
+    });
+  }
+  return fillTemplate(SHARE.m10_anon, { ref_link: refLink });
+}
+
+export function proseBlocks(text) {
+  return String(text)
+    .split(/\n\n+/)
+    .map((block) => block.replace(/\n/g, " ").trim())
+    .filter(Boolean);
+}

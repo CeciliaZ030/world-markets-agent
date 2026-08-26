@@ -2,6 +2,7 @@ import { filePath, readJson, writeJson } from "./store.js";
 import { latestMark } from "./history.js";
 
 export const VISIBILITY_SECS = 90 * 24 * 60 * 60;
+export const TRADE_DELAY_SECS = 3;
 const NEAR_MISS_BAND = 0.02;
 
 const STATUSES = new Set([
@@ -9,6 +10,7 @@ const STATUSES = new Set([
   "watching",
   "triggered",
   "awaiting_confirm",
+  "pending_execute",
   "executing",
   "done",
   "declined",
@@ -28,8 +30,9 @@ const ALLOWED = {
     "done",
     "executing",
   ],
-  triggered: ["awaiting_confirm", "executing", "done", "watching"],
+  triggered: ["awaiting_confirm", "executing", "done", "watching", "revoked"],
   awaiting_confirm: ["executing", "declined", "watching", "done", "revoked"],
+  pending_execute: ["executing", "revoked", "declined"],
   executing: ["done"],
   paused: ["watching", "revoked", "expired"],
   done: [],
@@ -51,6 +54,7 @@ const EVENT_TYPES = new Set([
   "executed",
   "blocked",
   "reported",
+  "staged",
   "paused",
   "resumed",
   "expired",
@@ -92,7 +96,34 @@ function nowSecs(now) {
 }
 
 function findItem(data, instructionId) {
-  return (data.items || []).find((row) => row.instruction_id === instructionId);
+  const raw = String(instructionId || "").trim();
+  if (!raw) return undefined;
+  const key = raw.startsWith("i_") ? raw.slice(2) : raw;
+  return (data.items || []).find(
+    (row) =>
+      row.instruction_id === key ||
+      row.task_id === key ||
+      row.watch_id === key,
+  );
+}
+
+function allocTaskId(data) {
+  const used = new Set((data.items || []).map((row) => row.task_id).filter(Boolean));
+  const alphabet = "23456789abcdefghijkmnpqrstuvwxyz";
+  for (let n = 0; n < 80; n++) {
+    let id = "";
+    for (let i = 0; i < 6; i++) {
+      id += alphabet[Math.floor(Math.random() * alphabet.length)];
+    }
+    if (!used.has(id)) return id;
+  }
+  return newId().replace(/-/g, "").slice(0, 8);
+}
+
+function ensureTaskId(data, item) {
+  if (item.task_id) return item.task_id;
+  item.task_id = allocTaskId(data);
+  return item.task_id;
 }
 
 export function transition(item, next, now) {
@@ -195,6 +226,7 @@ export function composeDraft(accountId, body, now = nowSecs()) {
     confirm_ref: null,
     result_ref: null,
     watch_id: null,
+    task_id: allocTaskId(data),
     correlation_id: body.correlation_id || instructionId,
     expires_at: body.expires_at || null,
     check_stats: { last_check_at: null, checks_7d: 0 },
@@ -212,6 +244,114 @@ export function composeDraft(accountId, body, now = nowSecs()) {
     actor: "you",
   });
   return { ok: true, recorded: true, instruction: cardOf(item, accountId) };
+}
+
+export function stageTrade(accountId, body, now = nowSecs()) {
+  const sentence = String(body.sentence || body.message || "").trim().slice(0, 400);
+  if (!sentence) return { ok: false, error: "sentence_required" };
+  const delay = Math.max(1, Number(body.delay_secs) || TRADE_DELAY_SECS);
+  const data = loadItems(accountId);
+  data.items = data.items || [];
+  const instructionId = body.instruction_id || newId();
+  let item = findItem(data, instructionId);
+  if (item && item.status === "pending_execute") {
+    return { ok: true, recorded: true, instruction: cardOf(item, accountId, now), duplicate: true };
+  }
+  if (item) {
+    return { ok: false, error: "conflict", instruction: cardOf(item, accountId, now) };
+  }
+  item = {
+    instruction_id: instructionId,
+    account_id: Number(accountId) || accountId,
+    kind: "trade",
+    sentence,
+    params: body.params || {},
+    status: "pending_execute",
+    policy_scope: body.policy_scope || null,
+    source_ref: body.correlation_id || body.source_ref || instructionId,
+    confirm_ref: null,
+    result_ref: null,
+    watch_id: null,
+    task_id: allocTaskId(data),
+    correlation_id: body.correlation_id || instructionId,
+    expires_at: null,
+    check_stats: { last_check_at: null, checks_7d: 0 },
+    pending: null,
+    fire_kind: "act",
+    instrument: body.instrument || body.params?.base_symbol || null,
+    execute_at: now + delay,
+    delay_secs: delay,
+    progress_pct: 0,
+    slice_i: null,
+    slice_n: 1,
+    avg_price: null,
+    created_at: now,
+    updated_at: now,
+    status_changed_at: now,
+  };
+  data.items.push(item);
+  saveItems(accountId, data);
+  appendEvent(accountId, instructionId, "staged", sentence, now, { actor: "you" });
+  return { ok: true, recorded: true, instruction: cardOf(item, accountId, now) };
+}
+
+export function beginExecute(accountId, id, now = nowSecs()) {
+  const data = loadItems(accountId);
+  const item = findItem(data, id);
+  if (!item) return { ok: false, error: "not_found" };
+  if (item.status === "revoked" || item.status === "declined") {
+    return { ok: false, error: "cancelled", instruction: cardOf(item, accountId, now) };
+  }
+  if (item.status === "executing" || item.status === "done") {
+    return { ok: true, already: true, instruction: cardOf(item, accountId, now) };
+  }
+  if (item.status !== "pending_execute") {
+    return { ok: false, error: "not_pending", instruction: cardOf(item, accountId, now) };
+  }
+  if (item.execute_at && now < item.execute_at) {
+    return { ok: false, error: "too_soon", instruction: cardOf(item, accountId, now) };
+  }
+  transition(item, "executing", now);
+  item.progress_pct = 8;
+  item.slice_i = 1;
+  item.slice_n = item.slice_n || 1;
+  item.updated_at = now;
+  saveItems(accountId, data);
+  appendEvent(accountId, item.instruction_id, "executed", "sending", now, { actor: "aomi" });
+  return { ok: true, instruction: cardOf(item, accountId, now), params: item.params || {} };
+}
+
+export function completeExecute(accountId, id, body = {}, now = nowSecs()) {
+  const data = loadItems(accountId);
+  const item = findItem(data, id);
+  if (!item) return { ok: false, error: "not_found" };
+  if (item.status === "revoked" || item.status === "declined") {
+    return { ok: false, error: "cancelled", instruction: cardOf(item, accountId, now) };
+  }
+  if (item.status === "pending_execute") {
+    transition(item, "executing", now);
+  }
+  if (item.status !== "executing" && item.status !== "done") {
+    return { ok: false, error: "not_executing", instruction: cardOf(item, accountId, now) };
+  }
+  const failed = Boolean(body.failed || body.error);
+  item.progress_pct = failed ? item.progress_pct : 100;
+  item.slice_i = item.slice_n || 1;
+  item.avg_price = body.avg_price || item.avg_price;
+  item.receipt = body.receipt || item.receipt;
+  item.result_ref = body.result_ref || item.result_ref;
+  if (item.status === "executing") transition(item, "done", now);
+  item.updated_at = now;
+  saveItems(accountId, data);
+  appendEvent(
+    accountId,
+    item.instruction_id,
+    failed ? "blocked" : "executed",
+    item.receipt || (failed ? String(body.error || "failed") : "filled"),
+    now,
+    { actor: "aomi" },
+  );
+  return { ok: true, instruction: cardOf(item, accountId, now) };
 }
 
 export function confirmInstruction(accountId, body, now = nowSecs()) {
@@ -316,11 +456,54 @@ export function revokeInstruction(accountId, instructionId, now = nowSecs()) {
   const data = loadItems(accountId);
   const item = findItem(data, instructionId);
   if (!item) return { ok: false, error: "not_found" };
+  ensureTaskId(data, item);
   if (item.status !== "revoked") transition(item, "revoked", now);
   item.pending = null;
   saveItems(accountId, data);
-  appendEvent(accountId, instructionId, "revoked", "Revoked.", now, { actor: "you" });
-  return { ok: true, instruction: cardOf(item, accountId), watch_id: item.watch_id };
+  appendEvent(accountId, item.instruction_id, "revoked", "Cancelled.", now, { actor: "you" });
+  return {
+    ok: true,
+    instruction: cardOf(item, accountId),
+    watch_id: item.watch_id,
+    task_id: item.task_id,
+  };
+}
+
+const CANCELLABLE = new Set([
+  "with_aomi",
+  "watching",
+  "triggered",
+  "awaiting_confirm",
+  "paused",
+  "pending_execute",
+]);
+
+export function cancelInstruction(accountId, id, now = nowSecs()) {
+  const data = loadItems(accountId);
+  const item = findItem(data, id);
+  if (!item) return { ok: false, error: "not_found" };
+  ensureTaskId(data, item);
+  if (item.status === "revoked") {
+    return {
+      ok: true,
+      already: true,
+      instruction: cardOf(item, accountId),
+      watch_id: item.watch_id,
+      task_id: item.task_id,
+      reply: `already cancelled ${item.task_id}`,
+    };
+  }
+  if (!CANCELLABLE.has(item.status)) {
+    return { ok: false, error: "not_cancellable", task_id: item.task_id };
+  }
+  const result = revokeInstruction(accountId, item.instruction_id, now);
+  const sentence = item.sentence || "";
+  const clipped = sentence.length > 80 ? `${sentence.slice(0, 77)}…` : sentence;
+  result.reply = clipped
+    ? `cancelled ${result.task_id} — "${clipped}"`
+    : `cancelled ${result.task_id}`;
+  result.command = `cancel task ${result.task_id}`;
+  return result;
 }
 
 export function recordCheck(accountId, watch, result, now = nowSecs()) {
@@ -405,7 +588,7 @@ export function onWatchExpired(accountId, watch, now = nowSecs()) {
 function displayStatus(status) {
   if (status === "with_aomi") return "with aomi";
   if (status === "triggered" || status === "awaiting_confirm") return "needs you";
-  if (status === "executing") return null;
+  if (status === "pending_execute" || status === "executing") return null;
   if (status === "declined" || status === "revoked") return status === "declined" ? "done" : null;
   return status;
 }
@@ -430,17 +613,31 @@ function distanceFor(item) {
   return { mark: item.last_mark, pct, near: Math.abs(live - level) / Math.abs(level) <= 0.08 };
 }
 
-function cardOf(item, accountId) {
+function cardOf(item, accountId, now = nowSecs()) {
   const events = loadEvents(accountId).items || [];
   const mine = events.filter((row) => row.instruction_id === item.instruction_id);
   const last = mine[mine.length - 1];
+  const delay = Number(item.delay_secs) || TRADE_DELAY_SECS;
+  const remaining =
+    item.status === "pending_execute" && item.execute_at
+      ? Math.max(0, item.execute_at - now)
+      : null;
+  const countdownPct =
+    remaining == null
+      ? null
+      : Math.max(0, Math.min(100, Math.round(((delay - remaining) / delay) * 100)));
   return {
     instruction_id: item.instruction_id,
+    task_id: item.task_id || null,
     kind: item.kind,
     sentence: item.sentence,
     status: item.status,
     display_status: displayStatus(item.status),
-    progress_pct: item.progress_pct ?? null,
+    progress_pct:
+      item.status === "pending_execute" ? countdownPct : item.progress_pct ?? null,
+    remaining_secs: remaining,
+    execute_at: item.execute_at || null,
+    delay_secs: item.status === "pending_execute" ? delay : item.delay_secs || null,
     slice_i: item.slice_i ?? null,
     slice_n: item.slice_n ?? null,
     avg_price: item.avg_price ?? null,
@@ -525,6 +722,7 @@ function isActiveStatus(status) {
     status === "watching" ||
     status === "triggered" ||
     status === "awaiting_confirm" ||
+    status === "pending_execute" ||
     status === "executing" ||
     status === "paused"
   );
@@ -540,7 +738,7 @@ function stillVisible(item, now) {
 function sortCards(a, b) {
   const rank = (status) => {
     if (status === "awaiting_confirm" || status === "triggered" || status === "with_aomi") return 0;
-    if (status === "executing") return 1;
+    if (status === "pending_execute" || status === "executing") return 1;
     if (status === "watching") return 2;
     if (status === "paused") return 3;
     if (status === "done") return 4;
@@ -553,9 +751,17 @@ function sortCards(a, b) {
 
 export function listInstructions(accountId, now = nowSecs()) {
   const data = loadItems(accountId);
+  let dirty = false;
+  for (const item of data.items || []) {
+    if (!item.task_id) {
+      ensureTaskId(data, item);
+      dirty = true;
+    }
+  }
+  if (dirty) saveItems(accountId, data);
   const cards = (data.items || [])
     .filter((item) => stillVisible(item, now))
-    .map((item) => cardOf(item, accountId))
+    .map((item) => cardOf(item, accountId, now))
     .sort(sortCards);
   return cards;
 }
@@ -565,15 +771,15 @@ export function getInstruction(accountId, instructionId, now = nowSecs()) {
   const item = findItem(data, instructionId);
   if (!item || !stillVisible(item, now)) return null;
   return {
-    ...cardOf(item, accountId),
-    trail: trailOf(accountId, instructionId),
+    ...cardOf(item, accountId, now),
+    trail: trailOf(accountId, item.instruction_id),
   };
 }
 
 export function summary(accountId, now = nowSecs()) {
   const cards = listInstructions(accountId, now);
   const holding = cards.filter((row) =>
-    ["with_aomi", "watching", "triggered", "awaiting_confirm", "executing", "paused"].includes(
+    ["with_aomi", "watching", "triggered", "awaiting_confirm", "pending_execute", "executing", "paused"].includes(
       row.status,
     ),
   ).length;

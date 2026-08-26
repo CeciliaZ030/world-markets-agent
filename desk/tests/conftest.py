@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -8,16 +7,13 @@ import pytest
 from desk.config import DeskConfig
 from desk.persist import Store, TapeLogger
 from desk.session import DeskSession
-from desk.trading import PaperBroker
+from stub_broker import StubBroker
 
 
 @pytest.fixture
 def config() -> DeskConfig:
     return DeskConfig(
-        paper_mode=True,
         verbosity="expert",
-        paper_equity="100000",
-        immediate_paper_fills=True,
         mandate_confirmation_window_sec=0,
         aomi_mandate_path="placeholder",
     )
@@ -33,7 +29,7 @@ def store(tmp_path: Path) -> Store:
 @pytest.fixture
 def session(config: DeskConfig, store: Store) -> DeskSession:
     tape = TapeLogger(store, "test-session")
-    broker = PaperBroker(equity=config.paper_equity, immediate_fills=True)
+    broker = StubBroker(immediate_fills=True)
     return DeskSession(config, tape=tape, broker=broker)
 
 

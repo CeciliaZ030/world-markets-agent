@@ -29,11 +29,21 @@ impl std::fmt::Display for AuthError {
     }
 }
 
-pub fn verify_init_data(init_data: &str, bot_token: &str) -> Result<u64, AuthError> {
+#[derive(Debug, PartialEq, Eq)]
+pub struct TelegramUser {
+    pub id: u64,
+    pub first_name: Option<String>,
+}
+
+pub fn verify_init_data(init_data: &str, bot_token: &str) -> Result<TelegramUser, AuthError> {
     verify_init_data_at(init_data, bot_token, now_unix())
 }
 
-fn verify_init_data_at(init_data: &str, bot_token: &str, now: i64) -> Result<u64, AuthError> {
+fn verify_init_data_at(
+    init_data: &str,
+    bot_token: &str,
+    now: i64,
+) -> Result<TelegramUser, AuthError> {
     let mut fields = BTreeMap::new();
     for pair in init_data.split('&') {
         if pair.is_empty() {
@@ -78,9 +88,17 @@ fn verify_init_data_at(init_data: &str, bot_token: &str, now: i64) -> Result<u64
 
     let user_raw = fields.get("user").ok_or(AuthError::BadUser)?;
     let user: serde_json::Value = serde_json::from_str(user_raw).map_err(|_| AuthError::BadUser)?;
-    user.get("id")
+    let id = user
+        .get("id")
         .and_then(|v| v.as_u64())
-        .ok_or(AuthError::BadUser)
+        .ok_or(AuthError::BadUser)?;
+    let first_name = user
+        .get("first_name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Ok(TelegramUser { id, first_name })
 }
 
 fn eq_hex(a: &str, b: &str) -> bool {
@@ -133,7 +151,13 @@ mod tests {
     fn valid_init_data_roundtrip() {
         let now = 1_700_000_000;
         let signed = sign_init_data_for_tests(TOKEN, now, r#"{"id":42,"first_name":"A"}"#);
-        assert_eq!(verify_init_data_at(&signed, TOKEN, now), Ok(42));
+        assert_eq!(
+            verify_init_data_at(&signed, TOKEN, now),
+            Ok(TelegramUser {
+                id: 42,
+                first_name: Some("A".into()),
+            })
+        );
     }
 
     #[test]

@@ -1,5 +1,19 @@
 //! Telegram Mini App server: portfolio snapshot, instruction ledger, charts,
-//! the tradeable-product catalog, Desk context, and hold-to-talk voice notes.
+//! the tradeable-product catalog, Desk context (read-only), and hold-to-talk
+//! voice notes into the Aomi agent (not The Desk).
+//!
+//! Init-data HMAC follows Telegram's WebApp algorithm (HMAC-SHA256 keyed by
+//! `WebAppData`, then HMAC of the sorted data-check string). The Mini App spec's
+//! shorter "HMAC with the bot token as key" does not match Telegram and would
+//! reject every real session.
+//!
+//! `/api/v1/mini-app/ledger*` is GET-only. Compose writes go through
+//! `POST /api/v1/mini-app/compose` (Telegram sendData ingress), never `/ledger*`.
+//! Voice notes go through `POST /api/v1/mini-app/voice` (not sendData, not
+//! `/ledger*`), then the client sendData's the transcript so the host agent runs.
+//! Introduction prepare is `POST /api/v1/mini-app/share` (not `/ledger*`; it
+//! mutates nothing the Mini App displays).
+//! Compose `kind: flush_execute` is a server-side backup after the 3s trade delay.
 //!
 //! Init-data HMAC follows Telegram's WebApp algorithm (HMAC-SHA256 keyed by
 //! `WebAppData`, then HMAC of the sorted data-check string). The Mini App spec's
@@ -42,6 +56,7 @@ struct AppState {
 
 struct Session {
     telegram_user_id: u64,
+    first_name: Option<String>,
     expires_at: Instant,
 }
 
@@ -92,6 +107,7 @@ async fn main() {
         .route("/api/v1/mini-app/ledger", get(ledger_handler))
         .route("/api/v1/mini-app/compose", post(compose_handler))
         .route("/api/v1/mini-app/voice", post(voice_handler))
+        .route("/api/v1/mini-app/share", post(share_handler))
         .route("/api/v1/desk/context", get(desk_context_handler))
         .route("/api/v1/mini-app/health", get(health_handler))
         .fallback(static_handler)
@@ -120,13 +136,13 @@ async fn health_handler() -> Json<Value> {
 
 async fn auth_handler(State(state): State<AppState>, Json(body): Json<AuthRequest>) -> Response {
     if state.dev_bypass && (body.init_data.is_empty() || body.init_data == "dev") {
-        return issue_session(&state, 0);
+        return issue_session(&state, 0, None);
     }
     if state.bot_token.is_empty() {
         return json_error(StatusCode::UNAUTHORIZED, "invalid_init_data");
     }
     match auth::verify_init_data(&body.init_data, &state.bot_token) {
-        Ok(user_id) => issue_session(&state, user_id),
+        Ok(user) => issue_session(&state, user.id, user.first_name),
         Err(err) => {
             tracing::info!(error = %err, "initData rejected");
             json_error(StatusCode::UNAUTHORIZED, "invalid_init_data")
@@ -134,7 +150,7 @@ async fn auth_handler(State(state): State<AppState>, Json(body): Json<AuthReques
     }
 }
 
-fn issue_session(state: &AppState, telegram_user_id: u64) -> Response {
+fn issue_session(state: &AppState, telegram_user_id: u64, first_name: Option<String>) -> Response {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     let token = hex::encode(bytes);
@@ -145,6 +161,7 @@ fn issue_session(state: &AppState, telegram_user_id: u64) -> Response {
             token.clone(),
             Session {
                 telegram_user_id,
+                first_name,
                 expires_at: Instant::now() + SESSION_TTL,
             },
         );
@@ -318,6 +335,7 @@ struct ComposeRequest {
     correlation_id: Option<String>,
     #[serde(default)]
     kind: Option<String>,
+    #[serde(default)]
     message: String,
     #[serde(default)]
     instruction_id: Option<String>,
@@ -351,6 +369,14 @@ async fn compose_handler(
         "instrument": body.instrument,
     });
     match spawn_blocking(move || -> Result<Value, String> {
+        if kind == "flush_execute" {
+            let instruction_id = payload
+                .get("instruction_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| "instruction_id required".to_string())?;
+            return world_markets::mini_app::flush_staged_trade(account_id, instruction_id);
+        }
         let value = world_markets::mini_app::submit_compose(&payload)?;
         if kind == "cancel" {
             let command = value
@@ -400,6 +426,40 @@ struct VoiceRequest {
     mime: Option<String>,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    duration_secs: Option<f64>,
+}
+
+async fn share_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !session_ok(&state, &headers) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let Some(account_id) = state.account_id else {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed");
+    };
+    let chat_id = session_telegram_user(&state, &headers);
+    let first_name = session_first_name(&state, &headers);
+    let bot_token = state.bot_token.clone();
+    match spawn_blocking(move || {
+        world_markets::mini_app::prepare_introduction(
+            account_id,
+            chat_id,
+            first_name.as_deref(),
+            &bot_token,
+        )
+    })
+    .await
+    {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, "share prepare failed");
+            json_error(StatusCode::BAD_GATEWAY, "share_unavailable")
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "share join failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
+        }
+    }
 }
 
 async fn desk_context_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -430,34 +490,33 @@ async fn voice_handler(
     if !session_ok(&state, &headers) {
         return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
     }
+    let Some(account_id) = state.account_id else {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed");
+    };
     let chat_id = session_telegram_user(&state, &headers);
     let bot_token = state.bot_token.clone();
-    let session_id = chat_id
-        .map(|id| format!("tg-{id}"))
-        .unwrap_or_else(|| "mini".to_string());
     let payload = json!({
-        "session_id": session_id,
         "audio_base64": body.audio_base64,
         "mime": body.mime,
         "text": body.text,
-        "complete_tts": true,
+        "duration_secs": body.duration_secs,
+        "source": "mini_app",
     });
     match spawn_blocking(move || -> Result<Value, String> {
-        let value = world_markets::mini_app::post_desk_voice(&payload)?;
-        let mut lines = Vec::new();
-        if let Some(transcript) = value.get("transcript").and_then(|v| v.as_str()) {
-            if !transcript.is_empty() {
-                lines.push(format!("Voice note: {transcript}"));
-            }
-        }
-        if let Some(speech) = value.get("speech").and_then(|v| v.as_str()) {
-            if !speech.is_empty() {
-                lines.push(speech.to_string());
-            }
-        }
-        if let Some(chat_id) = chat_id {
-            if let Err(err) = world_markets::mini_app::post_chat_lines(&bot_token, chat_id, &lines) {
-                tracing::warn!(error = %err, "voice chat echo failed");
+        let value = world_markets::mini_app::ingest_voice_note(account_id, &payload)?;
+        let heard = value
+            .get("heard_echo")
+            .or_else(|| value.get("transcript"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !heard.is_empty() {
+            if let Some(chat_id) = chat_id {
+                let line = format!("heard: {heard}");
+                if let Err(err) =
+                    world_markets::mini_app::post_chat_lines(&bot_token, chat_id, &[line])
+                {
+                    tracing::warn!(error = %err, "voice heard-echo failed");
+                }
             }
         }
         Ok(value)
@@ -467,12 +526,16 @@ async fn voice_handler(
         Ok(Ok(value)) => Json(value).into_response(),
         Ok(Err(err)) => {
             tracing::error!(error = %err, "voice note failed");
-            let code = if err.contains("not reachable") {
-                StatusCode::BAD_GATEWAY
+            let (code, key) = if err.contains("not configured") {
+                (StatusCode::BAD_GATEWAY, "stt_unconfigured")
+            } else if err.contains("not reachable") || err.contains("brain sidecar") {
+                (StatusCode::BAD_GATEWAY, "voice_unavailable")
+            } else if err.contains("didn't catch") || err.contains("empty") {
+                (StatusCode::BAD_REQUEST, "empty_transcript")
             } else {
-                StatusCode::INTERNAL_SERVER_ERROR
+                (StatusCode::INTERNAL_SERVER_ERROR, "voice_failed")
             };
-            json_error(code, "desk_unavailable")
+            json_error(code, key)
         }
         Err(err) => {
             tracing::error!(error = %err, "voice note join failed");
@@ -523,6 +586,17 @@ fn session_telegram_user(state: &AppState, headers: &HeaderMap) -> Option<u64> {
     sessions.retain(|_, session| session.expires_at > Instant::now());
     let id = sessions.get(&token)?.telegram_user_id;
     (id != 0).then_some(id)
+}
+
+fn session_first_name(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    let token = bearer_token(headers)?;
+    let mut sessions = state.sessions.lock().expect("session lock");
+    sessions.retain(|_, session| session.expires_at > Instant::now());
+    sessions
+        .get(&token)?
+        .first_name
+        .clone()
+        .filter(|s| !s.is_empty())
 }
 
 fn unix_now() -> u64 {
@@ -617,6 +691,42 @@ mod tests {
     fn voice_is_not_a_ledger_route() {
         let src = include_str!("main.rs");
         assert!(src.contains(r#".route("/api/v1/mini-app/voice", post(voice_handler))"#));
+        assert!(src.contains("ingest_voice_note"));
+        let desk_fn = format!("post_{}_voice", "desk");
+        assert!(
+            !src.contains(&format!("world_markets::mini_app::{desk_fn}")),
+            "voice handler must not call The Desk"
+        );
         assert!(src.contains(r#".route("/api/v1/desk/context", get(desk_context_handler))"#));
+    }
+
+    #[test]
+    fn mutating_mini_app_routes_are_allowlisted() {
+        // Non-ledger writes. /api/v1/mini-app/share prepares an introduction;
+        // it is not /ledger* and mutates nothing the Mini App displays.
+        let src = include_str!("main.rs");
+        let allowed = [
+            r#"/api/v1/mini-app/auth"#,
+            r#"/api/v1/mini-app/compose"#,
+            r#"/api/v1/mini-app/voice"#,
+            r#"/api/v1/mini-app/share"#,
+        ];
+        for line in src.lines() {
+            let trimmed = line.trim();
+            let is_route = trimmed.contains(".route(");
+            let is_post = trimmed.contains("post(");
+            if !is_route || !is_post {
+                continue;
+            }
+            if trimmed.contains("/ledger") {
+                panic!("no posting to ledger: {trimmed}");
+            }
+            assert!(
+                allowed.iter().any(|path| trimmed.contains(path)),
+                "unallowlisted mutating route: {trimmed}"
+            );
+        }
+        assert!(src.contains(r#".route("/api/v1/mini-app/share", post(share_handler))"#));
+        assert!(src.contains("prepare_introduction"));
     }
 }

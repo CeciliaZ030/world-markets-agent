@@ -156,7 +156,7 @@ class Cage:
         consequence = None
         if notional and book.equity > 0:
             pct = (notional / book.equity) * Decimal(100)
-            consequence = f"{pct.quantize(Decimal('0.1'))}% of paper book"
+            consequence = f"{pct.quantize(Decimal('0.1'))}% of the book"
         return CardPayload(
             card="ticket",
             state=card_state,
@@ -348,7 +348,7 @@ class Cage:
         self._emit("cage.submit", {"receipt": receipt})
         status = str(receipt.get("status", "working"))
         if status == "filled":
-            self._transition(CageState.FILLED, "paper_fill")
+            self._transition(CageState.FILLED, "fill")
             fill_px = receipt.get("fill_price")
             speech = self._fill_speech(fill_px)
             self.last_speech = speech
@@ -376,7 +376,7 @@ class Cage:
 
         px = speak_price(Decimal(str(fill_px)), verbosity=self.config.verbosity) if fill_px is not None else "the mark"
         verb = "Bought" if d.side == "buy" else "Sold"
-        return f"{verb} {d.instrument.name} at {px}. Paper."
+        return f"{verb} {d.instrument.name} at {px}."
 
     def _off(self) -> CageResult:
         if self.state not in {CageState.ARMED_FOR_ASSENT, CageState.READBACK, CageState.ASSEMBLING}:

@@ -23,7 +23,7 @@ from desk.cage.slots import missing_order_slots
 from desk.cage.types import PortfolioSnapshot, Position
 from desk.config import DeskConfig
 from desk.policy import AomiPolicy
-from desk.trading import PaperBroker
+from stub_broker import StubBroker
 
 WETH = ResolvedInstrument(
     symbol="WETH",
@@ -36,8 +36,8 @@ WETH = ResolvedInstrument(
 )
 
 
-def _cage(config: DeskConfig, broker: PaperBroker | None = None) -> Cage:
-    broker = broker or PaperBroker(equity=config.paper_equity)
+def _cage(config: DeskConfig, broker: StubBroker | None = None) -> Cage:
+    broker = broker or StubBroker()
     events: list[tuple] = []
 
     class T:
@@ -84,7 +84,7 @@ def test_happy_path_done_fills(config):
     r = cage.handle_transcript("Done")
     assert cage.state is CageState.FILLED
     assert r.earcon == "fill"
-    assert "Paper" in r.speech
+    assert r.speech.startswith("Bought Wrapped Ether")
 
 
 def test_soft_yes_does_not_submit(config):
@@ -186,7 +186,7 @@ def test_amendment_from_armed(config):
 
 
 def test_working_order_blocks_new(config):
-    broker = PaperBroker(equity=config.paper_equity, immediate_fills=False)
+    broker = StubBroker(immediate_fills=False)
     cage = _cage(config, broker)
     cage.propose_order(_draft())
     cage.notify_tts_playout(completed=True)
@@ -200,7 +200,7 @@ def test_working_order_blocks_new(config):
 
 
 def test_brake_cancels_in_flight(config):
-    broker = PaperBroker(equity=config.paper_equity, immediate_fills=False)
+    broker = StubBroker(immediate_fills=False)
     cage = _cage(config, broker)
     cage.propose_order(_draft())
     cage.notify_tts_playout(completed=True)
@@ -226,7 +226,7 @@ def test_missing_slots_and_readback_template(config):
 
 
 def test_pct_and_dollars_and_policy(config):
-    broker = PaperBroker(equity=config.paper_equity)
+    broker = StubBroker()
     broker.positions[("WETH", "spot")] = Position(
         symbol="WETH", product="spot", quantity=Decimal("2"), avg_price=Decimal("3800")
     )
@@ -261,7 +261,7 @@ def test_mandate_paraphrase_and_rationale_gate(config):
 
 
 def test_validate_buying_power(config):
-    broker = PaperBroker(equity=Decimal("100"), immediate_fills=True)
+    broker = StubBroker(equity=Decimal("100"), immediate_fills=True)
     broker.cash = Decimal("10")
     issues = validate_order(
         _draft(),
@@ -364,7 +364,7 @@ def test_fill_without_price_and_sell_speech(config):
 
     monkey_broker.submit = submit  # type: ignore[method-assign]
     r = cage.handle_transcript("done")
-    assert "Sold" in (r.speech or "") or "Paper" in (r.speech or "")
+    assert "Sold" in (r.speech or "")
 
 
 def test_mandate_merge_gt_and_paraphrase_sizes(config):
@@ -497,7 +497,7 @@ def test_detect_empty_reserved():
 
 
 def test_done_uses_open_position_and_gt_limit(config):
-    broker = PaperBroker(equity=config.paper_equity)
+    broker = StubBroker()
     broker.positions[("WBTC", "spot")] = Position(
         symbol="WBTC", product="spot", quantity=Decimal("1"), avg_price=Decimal("95000")
     )

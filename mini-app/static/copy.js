@@ -13,7 +13,8 @@ const COPY = {
   ],
   header: {
     title: "World Markets",
-    subtitle: "instruction ledger",
+    subtitle: "say the word",
+    subtitleLedger: "instruction ledger",
     tabLedger: "Ledger",
     tabPortfolio: "Portfolio",
   },
@@ -73,8 +74,9 @@ const COPY = {
     watchingStale: "last check {n}m ago — stale",
     paused: "paused · resumes only on your word",
     executing: "filling · slice {i} of {n} · avg {price}",
-    pendingPause: "pause sent to thread · awaiting your signed confirm",
-    pendingResume: "resume sent to thread · awaiting your signed confirm",
+    pendingExecute: "executes in {n}s · × if that's wrong",
+    pendingPause: "pause sent to thread",
+    pendingResume: "resume sent to thread",
     expired: "expired {date} · never met — noted in that week's digest",
   },
   emptyTeach:
@@ -82,10 +84,31 @@ const COPY = {
   errorRow:
     "can't reach the ledger — your instructions are safe; this view is stale.",
   ledgerFooter:
-    "read-only — instructions change only by signed confirms in the thread · progress is a projection of engine records",
+    "read-only — voice composes, the thread signs · progress is a projection of engine records",
+  ledgerFooterLegacy:
+    "read-only here — voice and text in the thread move money · this view is a projection of engine records",
+  draftRow: {
+    chip: "awaiting confirm",
+    sub: "sent to thread — nothing runs until you sign",
+  },
+  listening: {
+    label: "LISTENING",
+    caret: "▌",
+  },
+  homeActs: {
+    type: "⌨ type instead",
+    portfolio: "portfolio ↗",
+  },
+  share: {
+    introduce: "Introduce aomi to a friend ›",
+    intent: "introduce yourself to my friend",
+  },
   strip: {
     trail: "portfolio ›",
     riskFree: "· risk {risk} · {free} free",
+    label: "PORTFOLIO",
+    riskBand: "· risk {score} {band}",
+    chg24h: "{chg} 24h",
   },
   instruction: {
     actsLabel: "ACTIONS — SENT TO CHAT AS TEXT",
@@ -98,9 +121,9 @@ const COPY = {
     tagSlides: "SLIDES",
     tagTap: "ONE TAP",
     tagHalt: "HALT LIVES THERE",
-    awaitingLabel: "THE CONFIRM LIVES IN THE THREAD",
+    awaitingLabel: "AOMI IS ASKING IN THE THREAD",
     awaitingNote:
-      "Signed, TTL'd buttons — the mini app displays the state; it never hosts the confirm.",
+      "The mini app displays the state. It never hosts a confirm and never submits a trade.",
     trailLabel: "TRAIL — BECAUSE YOU SAID IT",
     trailAggregate: "+{n} checks — none met the condition.",
     trailNear: "Near miss — {value} low, condition not held.",
@@ -138,12 +161,12 @@ const COPY = {
   compose: {
     label: "CONFIRM — GOES TO THE THREAD AS TEXT",
     disclaimer:
-      "aomi restates it with expiry and policy scope · you confirm with the signed buttons in the thread — never here.",
+      "aomi restates it in the thread and acts there — never here.",
     notePause:
-      "A protection stops firing while paused — it takes effect only on your signed confirm in the thread.",
-    noteResume: "It starts checking again only after your signed confirm.",
+      "A protection stops firing while paused — say so in the thread, or slide to send the pause.",
+    noteResume: "It starts checking again when aomi processes the resume in the thread.",
     noteWatchAct:
-      "Consequence: arms an order template — it fires only after a fresh policy check and the thread confirm flow.",
+      "Consequence: arms an order template — a watch messages, it never trades. A later trade is a new voice or text instruction.",
     noteWatchTell: "Consequence: arms a future obligation — aomi can only message you.",
     noteImperative: "Consequence: {delta}",
     slideLabel: "slide — {button}",
@@ -196,23 +219,29 @@ const COPY = {
     inner: "↩ Back to chat",
   },
   toasts: {
-    paused: "signed in the thread — paused",
-    resumed: "signed in the thread — watching again",
-    watching: "signed in the thread — watching · expires {date}",
+    paused: "pause sent to the thread",
+    resumed: "resume sent to the thread",
+    watching: "watch sent to the thread — expires {date}",
     executed: "executed in the thread — receipt in DONE TODAY",
     filled: "filled {amount} — receipt in the thread, row in DONE",
-    trigger: "{detail} — confirm waiting in the thread",
+    trigger: "{detail} — aomi is asking in the thread",
     cancelSent: "cancel sent to the thread",
     cancelFailed: "couldn't reach the thread — still holding it",
     voiceHeard: "heard: {text}",
     voiceDenied: "microphone is blocked — send a voice note in the thread instead",
-    voiceFailed: "couldn't reach the desk — send a voice note in the thread instead",
+    voiceFailed: "couldn't reach aomi — send a voice note in the thread instead",
     voiceEmpty: "didn't catch any speech — try again",
   },
   voice: {
     hold: "hold to talk",
+    tapIdle: "tap to talk — tap again to send",
+    listening: "release to send · slide off to cancel · {m}:{ss}",
+    drafted: "drafted — atop NEEDS YOU · the thread signs",
     recording: "recording — release to send",
     sending: "sending to aomi",
+    shortTap: "hold to talk",
+    slideOff: "slid off — cancelled, nothing sent",
+    micDenied: "mic is off for Telegram — type instead, or enable it in settings",
   },
   unauthorized: "Session expired. Open from the bot again.",
   portfolioEmpty: "No open positions.",

@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { gatherNews } from "./news/index.js";
 import {
   markAtOrBefore,
+  markSeries,
   movePct,
   recordAccount,
   recordFunding,
@@ -32,6 +33,7 @@ import {
   pauseWatch,
   resumeWatch,
   setWatch,
+  cancelTask,
   watchedAccounts,
 } from "./watches.js";
 import {
@@ -41,10 +43,24 @@ import {
   listInstructions,
   summary as ledgerSummary,
   watchCountsByInstrument,
+  stageTrade,
+  beginExecute,
+  completeExecute,
 } from "./instructions.js";
 import { drain, peek } from "./outbound.js";
 import { resolvePredicate } from "./resolve.js";
 import { dataDir } from "./store.js";
+import {
+  closeEpisode,
+  exportEval,
+  ingestUtterance,
+  keyterms,
+  recordCorrection,
+  setConsent,
+  upsertLexicon,
+  voiceContext,
+} from "./voice.js";
+import { handleShare } from "./share.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 loadDotEnv(resolve(ROOT, ".env"));
@@ -111,6 +127,15 @@ async function handle(req, res) {
     });
     return;
   }
+  if (req.method === "GET" && url.pathname === "/v1/history/marks") {
+    const symbol = url.searchParams.get("symbol") || "";
+    send(res, 200, {
+      ok: true,
+      symbol,
+      marks: markSeries(symbol),
+    });
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/v1/tasks") {
     const accountId = url.searchParams.get("account_id");
     if (!accountId) {
@@ -125,11 +150,43 @@ async function handle(req, res) {
         ...ledgerSummary(accountId),
         labor: laborStats(accountId),
       },
+      voice: voiceContext(accountId),
     });
     return;
   }
   if (req.method === "GET" && url.pathname === "/v1/outbound/peek") {
     send(res, 200, { ok: true, items: peek() });
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/v1/voice/context") {
+    const accountId = url.searchParams.get("account_id");
+    if (!accountId) {
+      send(res, 400, { ok: false, error: "account_id is required" });
+      return;
+    }
+    send(res, 200, { ok: true, ...voiceContext(accountId) });
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/v1/voice/keyterms") {
+    const accountId = url.searchParams.get("account_id");
+    if (!accountId) {
+      send(res, 400, { ok: false, error: "account_id is required" });
+      return;
+    }
+    const extra = (url.searchParams.get("extra") || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    send(res, 200, { ok: true, keyterms: keyterms(accountId, extra) });
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/v1/voice/eval") {
+    const accountId = url.searchParams.get("account_id");
+    if (!accountId) {
+      send(res, 400, { ok: false, error: "account_id is required" });
+      return;
+    }
+    send(res, 200, exportEval(accountId));
     return;
   }
   if (req.method === "GET" && url.pathname === "/v1/ledger/summary") {
@@ -192,14 +249,34 @@ async function handle(req, res) {
     case "/v1/watches/cancel":
       send(res, 200, cancelWatch(accountIdOf(body), body.id));
       return;
+    case "/v1/tasks/cancel":
+      send(res, 200, cancelTask(accountIdOf(body), cancelIdOf(body)));
+      return;
+    case "/v1/compose":
+      if (String(body.kind || "") === "cancel") {
+        send(res, 200, cancelTask(accountIdOf(body), cancelIdOf(body)));
+        return;
+      }
+      send(res, 200, composeDraft(accountIdOf(body), body));
+      return;
+    case "/v1/trades/stage":
+      send(res, 200, stageTrade(accountIdOf(body), body));
+      return;
+    case "/v1/trades/begin":
+      send(res, 200, beginExecute(accountIdOf(body), body.instruction_id || body.id));
+      return;
+    case "/v1/trades/complete":
+      send(
+        res,
+        200,
+        completeExecute(accountIdOf(body), body.instruction_id || body.id, body),
+      );
+      return;
     case "/v1/watches/pause":
       send(res, 200, pauseWatch(accountIdOf(body), body.id, body.instruction_id));
       return;
     case "/v1/watches/resume":
       send(res, 200, resumeWatch(accountIdOf(body), body.id, body.instruction_id));
-      return;
-    case "/v1/compose":
-      send(res, 200, composeDraft(accountIdOf(body), body));
       return;
     case "/v1/preferences":
       send(res, 200, upsertPreference(accountIdOf(body), body));
@@ -217,6 +294,24 @@ async function handle(req, res) {
       return;
     case "/v1/outbound/drain":
       send(res, 200, { ok: true, items: drain(Number(body.limit) || 50) });
+      return;
+    case "/v1/voice/utterance":
+      send(res, 200, ingestUtterance(accountIdOf(body), body));
+      return;
+    case "/v1/voice/lexicon":
+      send(res, 200, upsertLexicon(accountIdOf(body), body.entries || body));
+      return;
+    case "/v1/voice/correction":
+      send(res, 200, recordCorrection(accountIdOf(body), body));
+      return;
+    case "/v1/voice/consent":
+      send(res, 200, setConsent(accountIdOf(body), body));
+      return;
+    case "/v1/voice/episode/close":
+      send(res, 200, closeEpisode(accountIdOf(body), body));
+      return;
+    case "/v1/share":
+      send(res, 200, handleShare(body));
       return;
     default:
       send(res, 404, { ok: false, error: "not found" });
@@ -252,6 +347,15 @@ function accountIdOf(body) {
   const id = body.account_id;
   if (id == null || id === "") throw new Error("account_id is required");
   return String(id);
+}
+
+function cancelIdOf(body) {
+  const direct = body.instruction_id || body.id || body.task_id;
+  if (direct) return String(direct);
+  const match = String(body.message || "")
+    .trim()
+    .match(/^cancel\s+task\s+(\S+)$/i);
+  return match ? match[1] : "";
 }
 
 function send(res, status, body) {

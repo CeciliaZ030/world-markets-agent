@@ -70,6 +70,7 @@ pub(crate) fn compose(
     let mut watches = json!([]);
     let mut preferences = json!([]);
     let mut ledger = json!({});
+    let mut voice = json!({});
     let mut watches_status = "ok";
     let mut preferences_status = "ok";
     if let Some(account_id) = account_id {
@@ -78,6 +79,7 @@ pub(crate) fn compose(
                 watches = payload.get("watches").cloned().unwrap_or(json!([]));
                 preferences = payload.get("preferences").cloned().unwrap_or(json!([]));
                 ledger = payload.get("ledger").cloned().unwrap_or(json!({}));
+                voice = payload.get("voice").cloned().unwrap_or(json!({}));
             }
             Err(_) => {
                 watches_status = "unavailable";
@@ -108,6 +110,7 @@ pub(crate) fn compose(
         "preferences": preferences,
         "policies": policies,
         "ledger": ledger,
+        "voice": voice,
         "sections_partial": {
             "watches": watches_status != "ok",
             "preferences": preferences_status != "ok",

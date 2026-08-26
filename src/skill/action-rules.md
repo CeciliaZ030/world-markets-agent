@@ -2,7 +2,7 @@
 
 ## Tool → claim mapping (never state a fact without its tool)
 
-Account · balance · RAPV · liquidation eligibility · risk 0–10 · NAV → `get_world_account` (`metrics`). Lookups → `lookups.md`. PnL → `get_world_pnl`. Grant status → `get_world_agent_permission`. Asset identity → `list_world_assets`. Market · book · mark → `get_world_market`. Resting orders → `get_world_open_orders`. Trade verdict → `preview_world_trade` / `check_world_mandate`. Before/after figures → `preview_account_effect` (intent only — never figures). Blocked intent's floor + largest compliant size → `compute_resize`. Exit impact → `preview_exit`. Sliced cost → `plan_large_order`. Capital efficiency → `get_dollarpower`. Guardian order + costs → `simulate_guardian_unwind`. Rates → `get_world_rates`. Loans → `get_world_loans`. Carry → `check_negative_carry`. Chart → `render_market_chart`. Research/tasks/watches → `get_world_research` (`cause_established` authoritative) · `get_world_tasks` · `set_world_watch` / `cancel_world_task` / `set_world_preference`. Earn/deploy/lend/basis/rebalance → `reference/strategy-brain.md`.
+Account · balance · RAPV · liquidation eligibility · risk 0–10 · NAV → `get_world_account` (`metrics`). Lookups → `lookups.md`. PnL → `get_world_pnl`. Grant status → `get_world_agent_permission`. Asset identity → `list_world_assets`. Market · book · mark → `get_world_market`. Resting orders → `get_world_open_orders`. Trade verdict → `preview_world_trade` / `check_world_mandate`. Before/after figures → `preview_account_effect` (intent only — never figures). Blocked intent's floor + largest compliant size → `compute_resize`. Exit impact → `preview_exit`. Sliced cost → `plan_large_order`. Capital efficiency → `get_dollarpower`. Guardian order + costs → `simulate_guardian_unwind`. Rates → `get_world_rates`. Loans → `get_world_loans`. Carry → `check_negative_carry`. Chart → `render_market_chart`. Introduction → `render_share`. Research/tasks/watches → `get_world_research` (`cause_established` authoritative) · `get_world_tasks` · `set_world_watch` / `cancel_world_task` / `set_world_preference`. Earn/deploy/lend/basis/rebalance → `reference/strategy-brain.md`.
 
 **Discovery.** First contact, bound key → `get_world_agent_permission` → `get_world_account` (§6.21). Explain/compare → **no tool, no new figures** (§6.22); never call a rate tool to decorate prose. Simulation on the user's own balance → account → rates → `preview_account_effect` (§6.23). Ranking ask → refuse, then one idle fact from account + rates (§6.24). No account → guest surfaces.
 
@@ -21,9 +21,9 @@ Reuse handover account/wallet context. Quote numbers only from the latest tool r
 
 ## Three action classes
 
-- **Auto** — inside mandate, familiar kind, below materiality → executes instantly, receipt in seconds.
-- **Confirm-once** — first instance of each kind → one preview, then that kind graduates with the notice in §6.4.
-- **Always-confirm** — material size jumps, lockups/maturities, leverage-band changes, first entry to a newly-allowed market, any policy edit. Policy edits sign on World, never in chat. Silence = no action.
+- **Execute** — clear, inside mandate → `execute_*` with whole `sentence`. 3s ledger ×, then fill. No tap.
+- **Ask** — instrument/size/level unclear → one voice/text question, max two rounds, then Mini App to inspect. Never guess. Never Sign.
+- **Escalate** — material size jump, lockup/maturity, leverage-band change, first new market, add while liquidation-eligible → voice/text confirm. Chat button last-resort. Silence = no. Policy edits sign on World.
 
 ## The autonomy ladder
 
@@ -39,7 +39,7 @@ Outcome first; never a product menu. One recommendation unless asked to compare.
 
 ## Controls
 
-One dominant action. Buttons verb + object. `Confirm`, `OK`, `Proceed`, `Yes` prohibited. Keep-first in every pair. No `style` in a pair; no `danger`/`success`. `primary` only on a lone `View on World ↗`. Name pair options in prose. Exit controls as prominent as entry.
+Mini App buttons never submit (nav/data only). `Confirm`, `OK`, `Proceed`, `Yes` prohibited. Verb+object only for Escalate. Keep-first. No `style` on a pair; no `danger`/`success`. `primary` only on a lone `View on World ↗`. Name pair options in prose.
 
 ## Mini App
 

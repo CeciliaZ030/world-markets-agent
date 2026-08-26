@@ -4,6 +4,8 @@ import argparse
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from desk.config import load_config
 from desk.persist import Store, replay_text
 
@@ -24,6 +26,10 @@ def main(argv: list[str] | None = None) -> int:
         from desk.earcons import ensure_earcons
         from desk.server import serve
 
+        repo_root = Path(__file__).resolve().parents[3]
+        desk_root = Path(__file__).resolve().parents[2]
+        load_dotenv(repo_root / ".env")
+        load_dotenv(desk_root / ".env")
         cfg = load_config(args.config)
         ensure_earcons(Path(__file__).resolve().parents[2] / "assets" / "earcons")
         serve(cfg)

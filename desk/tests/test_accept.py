@@ -162,7 +162,7 @@ def test_quotes_and_book(session):
     out = session.on_final_transcript("what's weth doing")
     assert "as of" in (out.get("speech") or "")
     out = session.on_final_transcript("positions")
-    assert "Paper book" in (out.get("speech") or "")
+    assert "World book" in (out.get("speech") or "")
     session.on_final_transcript("add weth to the watchlist")
     session.on_final_transcript("journal hello")
     session.on_final_transcript("xyzzy")
