@@ -46,6 +46,9 @@ const state = {
   detent: "half",
   openSwipe: "",
   search: "",
+  searchOpen: false,
+  products: [],
+  productId: "",
   earlierOpen: false,
   compose: null,
   sent: null,
@@ -193,6 +196,52 @@ function chipClass(status) {
   return "";
 }
 
+function cancellable(row) {
+  if (!row || state.pending[row.instruction_id] === "cancel") return false;
+  return (
+    row.status === "watching" ||
+    row.status === "paused" ||
+    row.status === "with_aomi" ||
+    row.status === "awaiting_confirm" ||
+    row.status === "triggered"
+  );
+}
+
+function taskIdOf(row) {
+  return row.task_id || row.instruction_id;
+}
+
+async function cancelInPlace(row) {
+  const id = taskIdOf(row);
+  const message = fillCopy(C.drafts.cancel, { id });
+  haptic("impact", "light");
+  state.pending[row.instruction_id] = "cancel";
+  state.ledger = state.ledger.filter((r) => r.instruction_id !== row.instruction_id);
+  state.optimistic = state.optimistic.filter((r) => r.instruction_id !== row.instruction_id);
+  if (state.insId === row.instruction_id) {
+    state.sheet = null;
+    state.insId = null;
+  }
+  showToast(C.toasts.cancelSent);
+  const preview = previewState();
+  if (preview && preview !== "dev") return;
+  try {
+    const initData = (tg && tg.initData) || (preview === "dev" ? "dev" : "");
+    await ensureSession(initData);
+    await api("/api/v1/mini-app/compose", {
+      method: "POST",
+      body: {
+        kind: "cancel",
+        instruction_id: row.instruction_id,
+        message,
+      },
+    });
+    refreshLedger();
+  } catch (_) {
+    showToast(C.toasts.cancelFailed);
+  }
+}
+
 function subLine(row) {
   if (state.pending[row.instruction_id] === "pause") return C.sub.pendingPause;
   if (state.pending[row.instruction_id] === "resume") return C.sub.pendingResume;
@@ -247,6 +296,7 @@ function heartbeatText() {
 
 function headerHtml(mode) {
   const back = mode === "root" ? "⌄" : "‹";
+  const search = mode === "root" ? searchBarHtml() : "";
   return `<header class="header">
     <button type="button" class="header-btn" id="backBtn" aria-label="Back">${back}</button>
     <div class="header-main">
@@ -254,12 +304,115 @@ function headerHtml(mode) {
       <p class="header-sub">${escapeHtml(C.header.subtitle)}</p>
     </div>
     <button type="button" class="header-btn" id="moreBtn" aria-label="More">⋯</button>
+    ${search}
   </header>`;
+}
+
+function productKindLabel(product) {
+  if (product === "perp") return C.search.perp;
+  if (product === "lend") return C.search.lending;
+  return C.search.spot;
+}
+
+function filterProducts(q) {
+  const all = state.products || [];
+  const needle = String(q || "").trim().toLowerCase();
+  if (!needle) return all.slice();
+  return all.filter((row) => {
+    const hay = (row.keywords || row.symbol || "").toLowerCase();
+    return hay.split(/\s+/).some((tok) => tok.includes(needle));
+  });
+}
+
+function searchBarHtml() {
+  const q = state.search.trim();
+  const filtered = filterProducts(q);
+  const count = state.searchOpen
+    ? q
+      ? fillCopy(C.search.matches, { n: filtered.length })
+      : fillCopy(C.search.products, { n: (state.products || []).length })
+    : "";
+  const clear = state.searchOpen
+    ? `<button type="button" class="search-x" id="searchClear" aria-label="Close search">✕</button>`
+    : "";
+  return `<div class="search header-search">
+    <span>⌕</span>
+    <input id="search" placeholder="${escapeHtml(C.search.placeholder)}" value="${escapeHtml(state.search)}" autocomplete="off" />
+    ${count ? `<span class="n">${escapeHtml(count)}</span>` : ""}
+    ${clear}
+  </div>`;
+}
+
+function searchMenuHtml() {
+  if (!state.searchOpen) return "";
+  const q = state.search.trim();
+  const filtered = filterProducts(q);
+  if (!state.products.length && !q) {
+    return `<div class="search-menu"><p class="edge">${escapeHtml(C.search.loading)}</p></div>`;
+  }
+  if (q && !filtered.length) {
+    return `<div class="search-menu"><p class="edge">${escapeHtml(fillCopy(C.search.noMatch, { q: state.search }))}</p></div>`;
+  }
+  const groups = [
+    ["spot", C.search.spot],
+    ["perp", C.search.perp],
+    ["lend", C.search.lending],
+  ];
+  const body = groups
+    .map(([key, label]) => {
+      const rows = filtered.filter((row) => row.product === key);
+      if (!rows.length) return "";
+      return `<div class="sec-h">${escapeHtml(label)}</div>${rows.map(productRowHtml).join("")}`;
+    })
+    .join("");
+  return `<div class="search-menu">${body}</div>`;
+}
+
+function productRowHtml(row) {
+  const held = heldPosition(row);
+  const sub = row.product === "lend"
+    ? productKindLabel(row.product)
+    : fillCopy(C.search.quote, { base: row.symbol, quote: row.quote_symbol || "USDT" });
+  const mark = row.mark_price
+    ? fillCopy(C.search.mark, { price: usd(row.mark_price) })
+    : "";
+  return `<button type="button" class="prod-row" data-product="${escapeHtml(row.id)}">
+    <div class="glyph">${escapeHtml((row.symbol || "?").slice(0, 2))}</div>
+    <div class="row-body">
+      <div class="title-row"><div class="title">${escapeHtml(row.symbol)}</div><span class="pct-slot num">${escapeHtml(mark)}</span></div>
+      <div class="sub">${escapeHtml(sub)}${held ? `<span class="prod-held">${escapeHtml(C.search.held)}</span>` : ""}</div>
+    </div>
+  </button>`;
+}
+
+function heldPosition(prod) {
+  if (!prod) return null;
+  const all = (state.portfolio && state.portfolio.positions) || [];
+  const want = String(prod.symbol || "")
+    .replace(/-PERP$/i, "")
+    .toUpperCase();
+  for (let idx = 0; idx < all.length; idx++) {
+    const row = all[idx];
+    const have = String(row.symbol || "")
+      .replace(/-PERP$/i, "")
+      .toUpperCase();
+    const type = row.asset_type === "borrow" ? "lend" : row.asset_type;
+    if (have === want && type === prod.product) return { row, idx };
+  }
+  return null;
+}
+
+function findProduct(id) {
+  return (state.products || []).find((row) => row.id === id);
 }
 
 function bottomHtml() {
   const label = state.sheet || state.view !== "main" ? C.bottom.inner : C.bottom.launch;
-  return `<button type="button" class="bottom-bar" id="bottomBtn">${escapeHtml(label)}</button>`;
+  const mic =
+    state.view === "main" && !state.sheet
+      ? `<button type="button" class="voice-btn" id="voiceBtn" aria-label="${escapeHtml(C.voice.hold)}">🎙</button>`
+      : "";
+  return `<div class="bottom-row"><button type="button" class="bottom-bar" id="bottomBtn">${escapeHtml(label)}</button>${mic}</div>`;
 }
 
 function toastHtml() {
@@ -279,13 +432,29 @@ function showToast(msg) {
 
 function goBack() {
   haptic("impact", "light");
+  if (state.searchOpen) {
+    closeSearch();
+    return;
+  }
   if (state.sheet === "picker") {
-    state.sheet = "position";
+    state.sheet = state.productId ? "product" : "position";
     paint();
     return;
   }
   if (state.sheet) {
     state.sheet = null;
+    state.productId = "";
+    paint();
+    return;
+  }
+  if (state.view === "chart") {
+    destroyChart();
+    state.view = "main";
+    const url = new URL(location.href);
+    url.pathname = "/";
+    url.searchParams.delete("symbol");
+    url.searchParams.delete("period");
+    history.pushState({}, "", url);
     paint();
     return;
   }
@@ -297,6 +466,80 @@ function goBack() {
   if (tg && typeof tg.close === "function") tg.close();
 }
 
+function closeSearch() {
+  state.searchOpen = false;
+  state.search = "";
+  paint();
+}
+
+function bindSearch() {
+  const search = document.getElementById("search");
+  function open() {
+    if (state.searchOpen) return;
+    state.searchOpen = true;
+    paint();
+    const el = document.getElementById("search");
+    if (el) el.focus();
+  }
+  if (search) {
+    search.onfocus = open;
+    search.onclick = open;
+    search.oninput = () => {
+      state.search = search.value;
+      state.searchOpen = true;
+      paint();
+      const el = document.getElementById("search");
+      if (el) {
+        el.focus();
+        el.setSelectionRange(state.search.length, state.search.length);
+      }
+    };
+  }
+  const clear = document.getElementById("searchClear");
+  if (clear) {
+    clear.onclick = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      closeSearch();
+    };
+  }
+  app.querySelectorAll("[data-product]").forEach((el) => {
+    el.onclick = () => openProduct(el.getAttribute("data-product"));
+  });
+}
+
+function openProduct(id) {
+  const prod = findProduct(id);
+  if (!prod) return;
+  state.searchOpen = false;
+  state.search = "";
+  const held = heldPosition(prod);
+  if (held) {
+    state.productId = "";
+    state.sheet = "position";
+    state.posIdx = held.idx;
+  } else {
+    state.posIdx = -1;
+    state.productId = id;
+    state.sheet = "product";
+  }
+  state.detent = "half";
+  paint();
+}
+
+function openProductChart(symbol) {
+  haptic("select");
+  state.searchOpen = false;
+  state.sheet = null;
+  state.view = "chart";
+  const url = new URL(location.href);
+  url.pathname = "/chart";
+  url.searchParams.set("symbol", symbol);
+  url.searchParams.set("period", "d");
+  history.pushState({}, "", url);
+  loadChartView({ symbol, period: "d" });
+}
+
 function bindChrome() {
   const back = document.getElementById("backBtn");
   if (back) back.onclick = goBack;
@@ -304,8 +547,14 @@ function bindChrome() {
   if (bottom) bottom.onclick = goBack;
   const more = document.getElementById("moreBtn");
   if (more) more.onclick = () => {};
+  bindSearch();
+  bindVoice();
+  const header = document.querySelector(".header");
+  if (header) {
+    document.documentElement.style.setProperty("--header-h", header.offsetHeight + "px");
+  }
   if (tg && tg.BackButton) {
-    if (state.sheet || state.view !== "main") {
+    if (state.sheet || state.view !== "main" || state.searchOpen) {
       tg.BackButton.show();
       tg.BackButton.onClick(goBack);
     } else {
@@ -315,6 +564,7 @@ function bindChrome() {
 }
 
 function paint() {
+  if (state.view === "chart") return;
   if (state.view === "compose") return renderCompose();
   if (state.view === "sent") return renderSent();
   if (state.view === "blocked") return renderBlocked();
@@ -322,7 +572,7 @@ function paint() {
 }
 
 function renderMain() {
-  document.body.className = state.sheet ? "locked" : "";
+  document.body.className = state.sheet || state.searchOpen ? "locked" : "";
   const hb = heartbeatText();
   const held = heldCount();
   const tab = state.tab;
@@ -334,6 +584,7 @@ function renderMain() {
       <button type="button" class="${tab === "portfolio" ? "on" : ""}" data-tab="portfolio">${escapeHtml(C.header.tabPortfolio)}</button>
     </div>` +
     (tab === "ledger" ? ledgerHtml(hb, compact) : portfolioHtml(hb)) +
+    searchMenuHtml() +
     (state.sheet ? sheetHtml() : "") +
     toastHtml() +
     bottomHtml();
@@ -453,6 +704,7 @@ function zoneRows(rows) {
             ? `<span class="chip ${chipClass(row.status)}">${escapeHtml(row.display_status)}</span>`
             : "";
       const open = state.openSwipe === row.instruction_id;
+      const canCancel = cancellable(row);
       const chips = swipable
         ? `<div class="swipe-under"><button type="button" class="swipe-chip primary" data-act="${row.status === "paused" ? "resume" : "pause"}" data-id="${escapeHtml(row.instruction_id)}">${row.status === "paused" ? "Resume" : "Pause"}</button><button type="button" class="swipe-chip ask" data-act="ask" data-id="${escapeHtml(row.instruction_id)}">Ask</button></div>`
         : "";
@@ -461,7 +713,7 @@ function zoneRows(rows) {
         <div class="row-front" style="${open ? "transform:translateX(-140px)" : ""}">
           <div class="glyph ${g.cls}">${g.spin ? '<div class="spin"></div>' : escapeHtml(g.g)}</div>
           <div class="row-body">
-            <div class="title-row"><div class="title">${escapeHtml(row.sentence)}</div>${value}</div>
+            <div class="title-row"><div class="title">${escapeHtml(row.sentence)}</div>${value}${canCancel ? `<button type="button" class="row-x" data-cancel="${escapeHtml(row.instruction_id)}" aria-label="${escapeHtml(C.instruction.cancel)}">×</button>` : ""}</div>
             <div class="sub">${escapeHtml(subLine(row))}</div>
             ${meter}
           </div>
@@ -495,6 +747,14 @@ function bindLedger() {
     };
   }
   app.querySelectorAll(".row[data-row]").forEach((el) => bindRowSwipe(el, false));
+  app.querySelectorAll("[data-cancel]").forEach((btn) => {
+    btn.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      const row = instructions().find((r) => r.instruction_id === btn.getAttribute("data-cancel"));
+      if (row) cancelInPlace(row);
+    };
+  });
 }
 
 function bindRowSwipe(el, isPosition) {
@@ -645,7 +905,7 @@ function portfolioHtml(hb) {
     return `<div class="heartbeat"><span class="dot well"></span>${escapeHtml(C.heartbeat.loading)}</div><div class="skel"></div>`;
   }
   const all = p.positions || [];
-  if (!all.length && !state.search.trim()) {
+  if (!all.length) {
     const hbEmpty = heartbeatText();
     return (
       `<div class="hero"><div class="hero-val num">${usd(p.total_usd_value)}</div></div>` +
@@ -654,23 +914,15 @@ function portfolioHtml(hb) {
       `<p class="footer-line">${escapeHtml(C.portfolio.footer)}</p>`
     );
   }
-  const q = state.search.trim().toLowerCase();
-  const filtered = q
-    ? all.filter((row) => (row.keywords || row.symbol || "").toLowerCase().includes(q))
-    : all;
   const chg = p.total_change_24h_pct != null ? Number(p.total_change_24h_pct) : null;
   const groups = [
     ["holdings", C.portfolio.holdings],
     ["positions", C.portfolio.openPositions],
     ["lending", C.portfolio.lending],
   ];
-  const count = q
-    ? fillCopy(C.portfolio.matches, { n: filtered.length })
-    : fillCopy(C.portfolio.positions, { n: all.length });
   const risk = p.risk || {};
   const floor = p.floor || "—";
   return (
-    `<div class="search"><span>⌕</span><input id="search" placeholder="${escapeHtml(C.portfolio.search)}" value="${escapeHtml(state.search)}" /><span class="n">${escapeHtml(count)}</span></div>` +
     `<div class="hero"><div class="hero-val num">${usd(p.total_usd_value)}</div><div class="hero-sub num ${chg != null && chg < 0 ? "down" : "up"}">${chg == null ? "—" : (chg < 0 ? "" : "+") + chg + "%"}</div></div>` +
     `<div class="margin"><div class="lab">Available margin</div><div class="val num">${usd(p.dollarpower && p.dollarpower.committed_usd)}</div><div class="stack"><span style="width:${escapeHtml((p.dollarpower && p.dollarpower.fill_pct) || "0")}%"></span></div></div>` +
     `<div class="risk-line" id="riskLine">${escapeHtml(
@@ -685,19 +937,17 @@ function portfolioHtml(hb) {
       ? `<div class="facts"><div>${escapeHtml(fillCopy(C.portfolio.riskFloor, { floor }))}</div><div class="ask" id="riskAsk">${escapeHtml(C.portfolio.riskAsk)}</div></div>`
       : "") +
     `<div class="heartbeat tap" id="hbTap"><span class="dot ${hb.dot}"></span>${escapeHtml(hb.text)}</div>` +
-    (q && !filtered.length
-      ? `<p class="edge">${escapeHtml(fillCopy(C.portfolio.noMatch, { q: state.search }))}</p>`
-      : groups
-          .map(([key, label]) => {
-            const rows = filtered
-              .map((row, idx) => ({ row, idx: all.indexOf(row) }))
-              .filter(({ row }) => (row.group || groupFallback(row)) === key);
-            if (!rows.length) return "";
-            return `<div class="sec-h">${escapeHtml(label)}</div>${rows
-              .map(({ row, idx }) => positionRowHtml(row, idx, idx === rows[rows.length - 1].idx))
-              .join("")}`;
-          })
-          .join("")) +
+    groups
+      .map(([key, label]) => {
+        const rows = all
+          .map((row, idx) => ({ row, idx }))
+          .filter(({ row }) => (row.group || groupFallback(row)) === key);
+        if (!rows.length) return "";
+        return `<div class="sec-h">${escapeHtml(label)}</div>${rows
+          .map(({ row, idx }) => positionRowHtml(row, idx, idx === rows[rows.length - 1].idx))
+          .join("")}`;
+      })
+      .join("") +
     `<p class="footer-line">${escapeHtml(C.portfolio.footer)}</p>`
   );
 }
@@ -739,18 +989,6 @@ function positionRowHtml(row, idx) {
 }
 
 function bindPortfolio() {
-  const search = document.getElementById("search");
-  if (search) {
-    search.oninput = () => {
-      state.search = search.value;
-      paint();
-      const el = document.getElementById("search");
-      if (el) {
-        el.focus();
-        el.setSelectionRange(state.search.length, state.search.length);
-      }
-    };
-  }
   const risk = document.getElementById("riskLine");
   if (risk) {
     risk.onclick = () => {
@@ -844,9 +1082,10 @@ function watchDrafts(p) {
 }
 
 function sheetHtml() {
-  const half = state.sheet === "position" ? 280 : state.sheet === "instruction" ? 260 : 0;
+  const half = state.sheet === "position" || state.sheet === "product" ? 280 : state.sheet === "instruction" ? 260 : 0;
   const y = state.sheet === "pick" || state.sheet === "picker" ? 0 : state.detent === "full" ? 0 : half;
-  if (state.sheet === "position" || state.sheet === "picker") return positionSheet(y);
+  if (state.sheet === "position" || (state.sheet === "picker" && !state.productId)) return positionSheet(y);
+  if (state.sheet === "product" || (state.sheet === "picker" && state.productId)) return productSheet(y);
   if (state.sheet === "instruction") return instructionSheet(y);
   return "";
 }
@@ -903,6 +1142,132 @@ function positionSheet(y) {
     </div>`;
 }
 
+function productActs(prod) {
+  const sym = prod.symbol;
+  if (prod.product === "lend") {
+    return {
+      primary: {
+        label: C.search.lend,
+        msg: fillCopy(C.search.lendMsg, { symbol: sym }),
+        delta: "moves portfolio risk",
+      },
+      ask: fillCopy(C.search.askLend, { symbol: sym }),
+      watch: true,
+    };
+  }
+  if (prod.product === "perp") {
+    return {
+      primary: {
+        label: C.search.openLong,
+        msg: fillCopy(C.search.longMsg, { symbol: sym }),
+        delta: "moves portfolio risk",
+      },
+      extra: [
+        {
+          label: C.search.openShort,
+          msg: fillCopy(C.search.shortMsg, { symbol: sym }),
+          delta: "moves portfolio risk",
+        },
+      ],
+      ask: fillCopy(C.search.askPerp, { symbol: sym }),
+      watch: true,
+    };
+  }
+  return {
+    primary: {
+      label: C.search.buy,
+      msg: fillCopy(C.search.buyMsg, { symbol: sym }),
+      delta: "moves portfolio risk",
+    },
+    extra: [
+      {
+        label: C.search.sell,
+        msg: fillCopy(C.search.sellMsg, { symbol: sym }),
+        delta: "moves portfolio risk",
+      },
+    ],
+    ask: fillCopy(C.search.askSpot, { symbol: sym }),
+    watch: true,
+  };
+}
+
+function productWatchDrafts(prod) {
+  const held = heldPosition(prod);
+  if (held) return watchDrafts(held.row);
+  const sym = prod.symbol;
+  if (prod.product === "perp") {
+    return [
+      { tag: "TELL", text: `If ${sym} drops 5% in a day, tell me`, fire: "tell" },
+      { tag: "ACT", text: `If ${sym} drops 8%, close the perp`, fire: "act" },
+    ];
+  }
+  if (prod.product === "lend") {
+    return [
+      {
+        tag: "TELL",
+        text: `The day before ${sym} maturity, remind me to choose a roll`,
+        fire: "tell",
+      },
+    ];
+  }
+  return [
+    { tag: "ACT", text: `If ${sym} touches a third below, sell a third of the spot`, fire: "act" },
+    { tag: "TELL", text: `If ${sym} drops 5% in a day, tell me`, fire: "tell" },
+  ];
+}
+
+function productSheet(y) {
+  const p = findProduct(state.productId);
+  if (!p) return "";
+  const acts = productActs(p);
+  const picker = state.sheet === "picker";
+  if (picker) {
+    const drafts = productWatchDrafts(p);
+    return `<div class="scrim" id="scrim"></div>
+      <div class="sheet pick" id="sheet" style="transform:translateY(${y}px)">
+        <div class="handle" id="handle"></div>
+        <div class="sheet-h"><h2>${escapeHtml(fillCopy(C.picker.title, { position: p.symbol }))}</h2><button type="button" class="x" id="sheetX">✕</button></div>
+        <div class="sheet-body">
+          <p class="note">${escapeHtml(C.picker.sub)}</p>
+          ${drafts
+            .map(
+              (d, i) =>
+                `<div class="draft" data-draft="${i}"><span class="tag-pill">${escapeHtml(d.tag)}</span><span>${escapeHtml(d.text)}</span></div>`,
+            )
+            .join("")}
+          <p class="hint">${escapeHtml(C.picker.footer)}</p>
+        </div>
+      </div>`;
+  }
+  const extras = (acts.extra || [])
+    .map(
+      (a) =>
+        `<button type="button" class="act extra-act" data-msg="${escapeHtml(a.msg)}" data-label="${escapeHtml(a.label)}"><span>${escapeHtml(a.label)}</span><span class="tag">${escapeHtml(C.instruction.tagSlides)}</span></button>`,
+    )
+    .join("");
+  const kind = productKindLabel(p.product);
+  const mark = p.mark_price ? fillCopy(C.search.mark, { price: usd(p.mark_price) }) : "";
+  return `<div class="scrim" id="scrim"></div>
+    <div class="sheet prod" id="sheet" style="transform:translateY(${y}px)">
+      <div class="handle" id="handle"></div>
+      <div class="sheet-h"><div><h2>${escapeHtml(p.symbol)}</h2><div class="sub">${escapeHtml(kind)}${mark ? " · " + escapeHtml(mark) : ""}</div></div><button type="button" class="x" id="sheetX">✕</button></div>
+      <div class="sheet-body">
+        <div class="act-lab">${escapeHtml(C.position.actsLabel)}</div>
+        ${
+          acts.primary
+            ? `<button type="button" class="act" id="primaryAct"><span>${escapeHtml(acts.primary.label)}</span><span class="tag">${escapeHtml(C.instruction.tagSlides)}</span></button>`
+            : ""
+        }
+        ${extras}
+        <button type="button" class="act" id="watchAct"><span>${escapeHtml(C.position.watchThis)}</span><span class="tag">›</span></button>
+        <button type="button" class="act" id="askAct"><span>${escapeHtml(C.instruction.ask)}</span><span class="tag">${escapeHtml(C.instruction.tagTap)}</span></button>
+        <button type="button" class="act" id="chartAct"><span>${escapeHtml(C.search.chart)}</span><span class="tag">↗</span></button>
+        <p class="hint">${escapeHtml(C.position.footer)}</p>
+        <p class="hint">${escapeHtml(state.detent === "full" ? C.instruction.detentFull : C.instruction.detentHalf)}</p>
+      </div>
+    </div>`;
+}
+
 function instructionSheet(y) {
   const row = instructions().find((r) => r.instruction_id === state.insId);
   if (!row) return "";
@@ -914,17 +1279,24 @@ function instructionSheet(y) {
     row.check_stats && row.check_stats.checks_7d
       ? ["checks", String(row.check_stats.checks_7d)]
       : null,
+    ["id", taskIdOf(row)],
     ["expires", fmtDate(row.expires_at)],
   ].filter(Boolean);
   const trail = row.trail || [];
   const acts = needs
-    ? `<div class="act-lab">${escapeHtml(C.instruction.awaitingLabel)}</div><p class="note">${escapeHtml(C.instruction.awaitingNote)}</p><button type="button" class="act accent" id="openThread"><span>${escapeHtml(C.instruction.openThread)}</span></button>`
+    ? `<div class="act-lab">${escapeHtml(C.instruction.awaitingLabel)}</div><p class="note">${escapeHtml(C.instruction.awaitingNote)}</p><button type="button" class="act accent" id="openThread"><span>${escapeHtml(C.instruction.openThread)}</span></button>` +
+      (cancellable(row)
+        ? `<button type="button" class="act" id="cancelAct"><span>${escapeHtml(C.instruction.cancel)}</span><span class="tag">×</span></button>`
+        : "")
     : `<div class="act-lab">${escapeHtml(C.instruction.actsLabel)}</div>` +
       (row.status === "watching"
         ? `<button type="button" class="act" id="pauseAct"><span>${escapeHtml(C.instruction.pause)}</span><span class="tag">${escapeHtml(C.instruction.tagSlides)}</span></button>`
         : "") +
       (row.status === "paused"
         ? `<button type="button" class="act" id="resumeAct"><span>${escapeHtml(C.instruction.resume)}</span><span class="tag">${escapeHtml(C.instruction.tagSlides)}</span></button>`
+        : "") +
+      (cancellable(row)
+        ? `<button type="button" class="act" id="cancelAct"><span>${escapeHtml(C.instruction.cancel)}</span><span class="tag">×</span></button>`
         : "") +
       (!executing
         ? `<button type="button" class="act" id="askIns"><span>${escapeHtml(C.instruction.ask)}</span><span class="tag">${escapeHtml(C.instruction.tagTap)}</span></button>`
@@ -956,15 +1328,29 @@ function bindSheet() {
   const sheet = document.getElementById("sheet");
   const handle = document.getElementById("handle");
   const x = document.getElementById("sheetX");
-  if (scrim) scrim.onclick = () => { state.sheet = null; paint(); };
+  if (scrim) scrim.onclick = () => { state.sheet = null; state.productId = ""; paint(); };
   if (x) x.onclick = () => {
-    if (state.sheet === "picker") state.sheet = "position";
-    else state.sheet = null;
+    if (state.sheet === "picker") state.sheet = state.productId ? "product" : "position";
+    else {
+      state.sheet = null;
+      state.productId = "";
+    }
     paint();
   };
   const primary = document.getElementById("primaryAct");
   if (primary) {
     primary.onclick = () => {
+      if (state.productId) {
+        const p = findProduct(state.productId);
+        const acts = productActs(p);
+        return openCompose({
+          kind: "imperative",
+          message: acts.primary.msg,
+          note: fillCopy(C.compose.noteImperative, { delta: acts.primary.delta }),
+          slide: true,
+          button: acts.primary.label,
+        });
+      }
       const p = (state.portfolio.positions || [])[state.posIdx];
       const acts = positionActs(p);
       openCompose({
@@ -1005,13 +1391,37 @@ function bindSheet() {
   const askAct = document.getElementById("askAct");
   if (askAct) {
     askAct.onclick = () => {
+      if (state.productId) {
+        const p = findProduct(state.productId);
+        return openCompose({ kind: "question", message: productActs(p).ask, slide: false });
+      }
       const p = (state.portfolio.positions || [])[state.posIdx];
       openCompose({ kind: "question", message: positionActs(p).ask, slide: false });
+    };
+  }
+  const chartAct = document.getElementById("chartAct");
+  if (chartAct) {
+    chartAct.onclick = () => {
+      const p = findProduct(state.productId);
+      if (p) openProductChart(p.symbol);
     };
   }
   app.querySelectorAll("[data-draft]").forEach((el) => {
     el.onclick = () => {
       haptic("select");
+      if (state.productId) {
+        const p = findProduct(state.productId);
+        const d = productWatchDrafts(p)[Number(el.getAttribute("data-draft"))];
+        return openCompose({
+          kind: "conditional",
+          message: d.text,
+          fire_kind: d.fire,
+          note: d.fire === "act" ? C.compose.noteWatchAct : C.compose.noteWatchTell,
+          slide: true,
+          button: C.compose.sendWatch,
+          instrument: p.symbol,
+        });
+      }
       const p = (state.portfolio.positions || [])[state.posIdx];
       const d = watchDrafts(p)[Number(el.getAttribute("data-draft"))];
       openCompose({
@@ -1029,6 +1439,13 @@ function bindSheet() {
   if (pauseAct) pauseAct.onclick = () => onRowAct(state.insId, "pause", false);
   const resumeAct = document.getElementById("resumeAct");
   if (resumeAct) resumeAct.onclick = () => onRowAct(state.insId, "resume", false);
+  const cancelAct = document.getElementById("cancelAct");
+  if (cancelAct) {
+    cancelAct.onclick = () => {
+      const row = instructions().find((r) => r.instruction_id === state.insId);
+      if (row) cancelInPlace(row);
+    };
+  }
   const askIns = document.getElementById("askIns");
   if (askIns) askIns.onclick = () => onRowAct(state.insId, "ask", false);
   const openThread = document.getElementById("openThread");
@@ -1038,7 +1455,7 @@ function bindSheet() {
 
 function bindSheetDrag(sheet, handle) {
   const kind = state.sheet;
-  const half = kind === "position" ? 280 : kind === "instruction" ? 260 : 0;
+  const half = kind === "position" || kind === "product" ? 280 : kind === "instruction" ? 260 : 0;
   const container = kind === "position" ? 620 : kind === "instruction" ? 640 : 400;
   if (kind === "picker") {
     if (handle) handle.onclick = () => {};
@@ -1074,6 +1491,7 @@ function bindSheetDrag(sheet, handle) {
     sheet.style.transition = "transform 240ms cubic-bezier(.2,.8,.3,1)";
     if (vel > 0.8 || y > half + 130) {
       state.sheet = null;
+      state.productId = "";
       paint();
       return;
     }
@@ -1122,6 +1540,7 @@ function openCompose(payload) {
   state.compose = payload;
   state.view = "compose";
   state.sheet = null;
+  state.searchOpen = false;
   paint();
 }
 
@@ -1306,6 +1725,150 @@ function openThreadLink() {
   if (tg && typeof tg.close === "function") tg.close();
 }
 
+let voiceRecorder = null;
+let voiceChunks = [];
+let voiceStream = null;
+let voiceWanted = false;
+
+function bindVoice() {
+  const btn = document.getElementById("voiceBtn");
+  if (!btn) return;
+  btn.addEventListener("contextmenu", (ev) => ev.preventDefault());
+  btn.addEventListener("pointerdown", (ev) => {
+    if (ev.button != null && ev.button !== 0) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    try {
+      btn.setPointerCapture(ev.pointerId);
+    } catch (_) {
+      /* capture optional */
+    }
+    startVoice(btn);
+  });
+  const end = (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    finishVoice(btn);
+  };
+  btn.addEventListener("pointerup", end);
+  btn.addEventListener("pointercancel", (ev) => {
+    ev.preventDefault();
+    abortVoice(btn);
+  });
+}
+
+async function startVoice(btn) {
+  if (voiceWanted) return;
+  voiceWanted = true;
+  voiceChunks = [];
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    voiceWanted = false;
+    showToast(C.toasts.voiceDenied);
+    return;
+  }
+  try {
+    voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (_) {
+    voiceWanted = false;
+    showToast(C.toasts.voiceDenied);
+    return;
+  }
+  if (!voiceWanted) {
+    abortVoice(btn);
+    return;
+  }
+  const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+    ? "audio/webm;codecs=opus"
+    : MediaRecorder.isTypeSupported("audio/webm")
+      ? "audio/webm"
+      : "";
+  try {
+    voiceRecorder = mime ? new MediaRecorder(voiceStream, { mimeType: mime }) : new MediaRecorder(voiceStream);
+  } catch (_) {
+    abortVoice(btn);
+    showToast(C.toasts.voiceDenied);
+    return;
+  }
+  voiceRecorder.ondataavailable = (ev) => {
+    if (ev.data && ev.data.size) voiceChunks.push(ev.data);
+  };
+  voiceRecorder.start();
+  btn.classList.add("hot");
+  btn.setAttribute("aria-label", C.voice.recording);
+  haptic("impact", "medium");
+}
+
+function abortVoice(btn) {
+  voiceWanted = false;
+  try {
+    if (voiceRecorder && voiceRecorder.state !== "inactive") voiceRecorder.stop();
+  } catch (_) {
+    /* ignore */
+  }
+  voiceRecorder = null;
+  voiceChunks = [];
+  if (voiceStream) {
+    voiceStream.getTracks().forEach((t) => t.stop());
+    voiceStream = null;
+  }
+  if (btn) {
+    btn.classList.remove("hot");
+    btn.setAttribute("aria-label", C.voice.hold);
+  }
+}
+
+function finishVoice(btn) {
+  if (!voiceWanted || !voiceRecorder) {
+    abortVoice(btn);
+    return;
+  }
+  const recorder = voiceRecorder;
+  const mime = recorder.mimeType || "audio/webm";
+  recorder.onstop = async () => {
+    const blob = new Blob(voiceChunks, { type: mime });
+    abortVoice(btn);
+    if (!blob.size) {
+      showToast(C.toasts.voiceEmpty);
+      return;
+    }
+    btn.classList.add("sending");
+    showToast(C.voice.sending);
+    try {
+      const audio_base64 = await blobToBase64(blob);
+      const out = await api("/api/v1/mini-app/voice", {
+        method: "POST",
+        body: { audio_base64, mime: blob.type || mime },
+      });
+      const heard = (out && out.transcript) || "";
+      if (heard) showToast(fillCopy(C.toasts.voiceHeard, { text: heard }));
+      else showToast((out && out.speech) || C.toasts.voiceEmpty);
+    } catch (_) {
+      showToast(C.toasts.voiceFailed);
+    } finally {
+      btn.classList.remove("sending");
+    }
+  };
+  try {
+    recorder.stop();
+  } catch (_) {
+    abortVoice(btn);
+    showToast(C.toasts.voiceFailed);
+  }
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const data = String(reader.result || "");
+      const comma = data.indexOf(",");
+      resolve(comma >= 0 ? data.slice(comma + 1) : data);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
 async function api(path, opts) {
   const headers = { Authorization: "Bearer " + sessionToken };
   const init = { headers };
@@ -1375,7 +1938,7 @@ function startPoll() {
   clearInterval(ageTimer);
   pollTimer = setInterval(refreshLedger, 2000);
   ageTimer = setInterval(() => {
-    if (state.view === "main") paint();
+    if (state.view === "main" && !state.searchOpen) paint();
   }, 1000);
 }
 
@@ -1413,9 +1976,24 @@ const PREVIEW_PORTFOLIO = {
   flags: { primary_view: "ledger", jobline_negative: false, family: "blue" },
 };
 
+const PREVIEW_PRODUCTS = [
+  { id: "spot:ETH", symbol: "ETH", name: "Ether", product: "spot", quote_symbol: "USDT", mark_price: "3588.12", keywords: "ETH ether spot usdt" },
+  { id: "perp:ETH", symbol: "ETH", name: "Ether", product: "perp", quote_symbol: "USDT", mark_price: "3588.12", keywords: "ETH ether perp perpetual usdt" },
+  { id: "lend:ETH", symbol: "ETH", name: "Ether", product: "lend", mark_price: "3588.12", keywords: "ETH ether lend lending" },
+  { id: "spot:WBTC", symbol: "WBTC", name: "Wrapped Bitcoin", product: "spot", quote_symbol: "USDT", mark_price: "97500.00", keywords: "WBTC wrapped bitcoin btc spot usdt" },
+  { id: "perp:WBTC", symbol: "WBTC", name: "Wrapped Bitcoin", product: "perp", quote_symbol: "USDT", mark_price: "97500.00", keywords: "WBTC wrapped bitcoin btc perp perpetual usdt" },
+  { id: "lend:WBTC", symbol: "WBTC", name: "Wrapped Bitcoin", product: "lend", mark_price: "97500.00", keywords: "WBTC wrapped bitcoin btc lend lending" },
+  { id: "spot:SOL", symbol: "SOL", name: "Solana", product: "spot", quote_symbol: "USDT", mark_price: "178.40", keywords: "SOL solana spot usdt" },
+  { id: "perp:SOL", symbol: "SOL", name: "Solana", product: "perp", quote_symbol: "USDT", mark_price: "178.40", keywords: "SOL solana perp perpetual usdt" },
+  { id: "lend:SOL", symbol: "SOL", name: "Solana", product: "lend", mark_price: "178.40", keywords: "SOL solana lend lending" },
+  { id: "lend:USDC", symbol: "USDC", name: "USD Coin", product: "lend", mark_price: "1", keywords: "USDC usd coin lend lending" },
+  { id: "lend:USDT", symbol: "USDT", name: "Tether", product: "lend", mark_price: "1", keywords: "USDT tether lend lending" },
+];
+
 function previewBoot() {
   const pv = previewState();
   state.portfolio = PREVIEW_PORTFOLIO;
+  state.products = PREVIEW_PRODUCTS;
   state.flags = PREVIEW_PORTFOLIO.flags;
   if (pv === "empty") {
     state.ledger = [];
@@ -1433,6 +2011,7 @@ function previewBoot() {
   state.ledger = [
     {
       instruction_id: "roll",
+      task_id: "roll",
       status: "awaiting_confirm",
       display_status: "needs you",
       sentence: "At maturity, roll the lend into the 30-day if the rate holds at 9% or better",
@@ -1442,6 +2021,7 @@ function previewBoot() {
     },
     {
       instruction_id: "perp",
+      task_id: "perp",
       status: "watching",
       display_status: "watching",
       sentence: "If ETH touches $3,400, close half the perp",
@@ -1453,6 +2033,7 @@ function previewBoot() {
     },
     {
       instruction_id: "floor",
+      task_id: "floor",
       status: "watching",
       display_status: "watching",
       sentence: "If ETH drops to $2,650 (floor +10%), tell me",
@@ -1600,6 +2181,7 @@ function renderChartShell(params, status, data) {
 }
 
 async function loadChartView(params) {
+  state.view = "chart";
   renderChartShell(params, "loading", null);
   const initData = (tg && tg.initData) || (previewState() === "dev" ? "dev" : "");
   try {
@@ -1636,8 +2218,12 @@ async function boot() {
   const initData = (tg && tg.initData) || (preview === "dev" ? "dev" : "");
   try {
     await ensureSession(initData);
-    const port = await api("/api/v1/mini-app/portfolio");
+    const [port, catalog] = await Promise.all([
+      api("/api/v1/mini-app/portfolio"),
+      api("/api/v1/mini-app/products").catch(() => ({ products: [] })),
+    ]);
     state.portfolio = port;
+    state.products = catalog.products || [];
     if (port.flags) state.flags = port.flags;
     if (state.flags.primary_view === "portfolio") state.tab = "portfolio";
     await refreshLedger();

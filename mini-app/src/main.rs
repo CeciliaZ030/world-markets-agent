@@ -1,4 +1,5 @@
-//! Telegram Mini App server: portfolio snapshot, instruction ledger, charts.
+//! Telegram Mini App server: portfolio snapshot, instruction ledger, charts,
+//! the tradeable-product catalog, Desk context, and hold-to-talk voice notes.
 //!
 //! Init-data HMAC follows Telegram's WebApp algorithm (HMAC-SHA256 keyed by
 //! `WebAppData`, then HMAC of the sorted data-check string). The Mini App spec's
@@ -36,10 +37,10 @@ struct AppState {
     account_id: Option<u64>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     dev_bypass: bool,
+    desk_token: String,
 }
 
 struct Session {
-    #[allow(dead_code)]
     telegram_user_id: u64,
     expires_at: Instant,
 }
@@ -75,11 +76,13 @@ async fn main() {
         account_id: world_markets::mini_app::account_id_from_env(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         dev_bypass,
+        desk_token: std::env::var("DESK_BRIDGE_TOKEN").unwrap_or_default(),
     };
 
     let app = Router::new()
         .route("/api/v1/mini-app/auth", post(auth_handler))
         .route("/api/v1/mini-app/portfolio", get(portfolio_handler))
+        .route("/api/v1/mini-app/products", get(products_handler))
         .route("/api/v1/mini-app/chart", get(chart_handler))
         .route(
             "/api/v1/mini-app/ledger/summary",
@@ -88,6 +91,8 @@ async fn main() {
         .route("/api/v1/mini-app/ledger/{id}", get(ledger_one_handler))
         .route("/api/v1/mini-app/ledger", get(ledger_handler))
         .route("/api/v1/mini-app/compose", post(compose_handler))
+        .route("/api/v1/mini-app/voice", post(voice_handler))
+        .route("/api/v1/desk/context", get(desk_context_handler))
         .route("/api/v1/mini-app/health", get(health_handler))
         .fallback(static_handler)
         .layer(CorsLayer::permissive())
@@ -191,6 +196,23 @@ async fn portfolio_handler(State(state): State<AppState>, headers: HeaderMap) ->
         }
         Err(err) => {
             tracing::error!(error = %err, "portfolio task join failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
+        }
+    }
+}
+
+async fn products_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !session_ok(&state, &headers) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    match spawn_blocking(world_markets::mini_app::load_products).await {
+        Ok(Ok(products)) => Json(products).into_response(),
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, "products fetch failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "products task join failed");
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
         }
     }
@@ -316,6 +338,9 @@ async fn compose_handler(
     let Some(account_id) = state.account_id else {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed");
     };
+    let chat_id = session_telegram_user(&state, &headers);
+    let bot_token = state.bot_token.clone();
+    let kind = body.kind.clone().unwrap_or_default();
     let payload = json!({
         "account_id": account_id,
         "correlation_id": body.correlation_id,
@@ -325,7 +350,36 @@ async fn compose_handler(
         "fire_kind": body.fire_kind,
         "instrument": body.instrument,
     });
-    match spawn_blocking(move || world_markets::mini_app::submit_compose(&payload)).await {
+    match spawn_blocking(move || -> Result<Value, String> {
+        let value = world_markets::mini_app::submit_compose(&payload)?;
+        if kind == "cancel" {
+            let command = value
+                .pointer("/thread/command")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| payload_message(&payload));
+            let mut lines = vec![command];
+            if let Some(reply) = value
+                .pointer("/thread/reply")
+                .or_else(|| value.get("reply"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                lines.push(reply.to_string());
+            }
+            if let Some(chat_id) = chat_id {
+                if let Err(err) =
+                    world_markets::mini_app::post_chat_lines(&bot_token, chat_id, &lines)
+                {
+                    tracing::warn!(error = %err, "cancel chat echo failed");
+                }
+            }
+        }
+        Ok(value)
+    })
+    .await
+    {
         Ok(Ok(value)) => Json(value).into_response(),
         Ok(Err(err)) => {
             tracing::error!(error = %err, "compose failed");
@@ -338,6 +392,103 @@ async fn compose_handler(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct VoiceRequest {
+    #[serde(default)]
+    audio_base64: Option<String>,
+    #[serde(default)]
+    mime: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+async fn desk_context_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !desk_or_session_ok(&state, &headers) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let Some(account_id) = state.account_id else {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed");
+    };
+    match spawn_blocking(move || world_markets::mini_app::load_desk_context(account_id)).await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, "desk context failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "desk context join failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
+        }
+    }
+}
+
+async fn voice_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<VoiceRequest>,
+) -> Response {
+    if !session_ok(&state, &headers) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let chat_id = session_telegram_user(&state, &headers);
+    let bot_token = state.bot_token.clone();
+    let session_id = chat_id
+        .map(|id| format!("tg-{id}"))
+        .unwrap_or_else(|| "mini".to_string());
+    let payload = json!({
+        "session_id": session_id,
+        "audio_base64": body.audio_base64,
+        "mime": body.mime,
+        "text": body.text,
+        "complete_tts": true,
+    });
+    match spawn_blocking(move || -> Result<Value, String> {
+        let value = world_markets::mini_app::post_desk_voice(&payload)?;
+        let mut lines = Vec::new();
+        if let Some(transcript) = value.get("transcript").and_then(|v| v.as_str()) {
+            if !transcript.is_empty() {
+                lines.push(format!("Voice note: {transcript}"));
+            }
+        }
+        if let Some(speech) = value.get("speech").and_then(|v| v.as_str()) {
+            if !speech.is_empty() {
+                lines.push(speech.to_string());
+            }
+        }
+        if let Some(chat_id) = chat_id {
+            if let Err(err) = world_markets::mini_app::post_chat_lines(&bot_token, chat_id, &lines) {
+                tracing::warn!(error = %err, "voice chat echo failed");
+            }
+        }
+        Ok(value)
+    })
+    .await
+    {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, "voice note failed");
+            let code = if err.contains("not reachable") {
+                StatusCode::BAD_GATEWAY
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            json_error(code, "desk_unavailable")
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "voice note join failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
+        }
+    }
+}
+
+fn payload_message(payload: &Value) -> String {
+    payload
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("cancel task")
+        .to_string()
+}
+
 fn session_ok(state: &AppState, headers: &HeaderMap) -> bool {
     let Some(token) = bearer_token(headers) else {
         return false;
@@ -345,6 +496,33 @@ fn session_ok(state: &AppState, headers: &HeaderMap) -> bool {
     let mut sessions = state.sessions.lock().expect("session lock");
     sessions.retain(|_, session| session.expires_at > Instant::now());
     sessions.contains_key(&token)
+}
+
+fn desk_or_session_ok(state: &AppState, headers: &HeaderMap) -> bool {
+    if session_ok(state, headers) {
+        return true;
+    }
+    let presented = desk_token(headers);
+    if !state.desk_token.is_empty() {
+        return presented.as_deref() == Some(state.desk_token.as_str());
+    }
+    state.dev_bypass
+}
+
+fn desk_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-desk-token")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn session_telegram_user(state: &AppState, headers: &HeaderMap) -> Option<u64> {
+    let token = bearer_token(headers)?;
+    let mut sessions = state.sessions.lock().expect("session lock");
+    sessions.retain(|_, session| session.expires_at > Instant::now());
+    let id = sessions.get(&token)?.telegram_user_id;
+    (id != 0).then_some(id)
 }
 
 fn unix_now() -> u64 {
@@ -427,5 +605,18 @@ mod tests {
                 "ledger route must not mutate: {trimmed}"
             );
         }
+    }
+
+    #[test]
+    fn products_route_is_get() {
+        let src = include_str!("main.rs");
+        assert!(src.contains(r#".route("/api/v1/mini-app/products", get(products_handler))"#));
+    }
+
+    #[test]
+    fn voice_is_not_a_ledger_route() {
+        let src = include_str!("main.rs");
+        assert!(src.contains(r#".route("/api/v1/mini-app/voice", post(voice_handler))"#));
+        assert!(src.contains(r#".route("/api/v1/desk/context", get(desk_context_handler))"#));
     }
 }

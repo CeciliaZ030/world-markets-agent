@@ -11,13 +11,14 @@ use rust_decimal::Decimal;
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::brain::BrainClient;
-use crate::client::{Account, Asset, BASE_TOKEN_ID, WorldClient};
+use crate::client::{Account, Asset, BASE_TOKEN_ID, Market, WorldClient};
 use crate::liquidation_risk::{self, PortfolioMetrics};
 use crate::lookups::notional_usdt;
 use crate::mandate::{Mandate, parse_decimal};
+use crate::pnl::PnlLedger;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PortfolioResponse {
@@ -50,6 +51,27 @@ pub struct PositionRow {
     pub can_exit: bool,
     pub watch_count: u32,
     pub keywords: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProductsResponse {
+    pub products: Vec<ProductRow>,
+    pub block_number: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProductRow {
+    pub id: String,
+    pub symbol: String,
+    pub name: String,
+    pub product: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote_symbol: Option<String>,
+    pub mark_price: String,
+    pub keywords: String,
+    pub base_token_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote_token_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -117,6 +139,74 @@ pub fn load_portfolio(account_id: u64) -> Result<PortfolioResponse, String> {
     let metrics = liquidation_risk::compute_metrics(client, &account, &assets, block_number)?;
     let floor = mandate_floor();
     assemble(client, &account, &assets, &metrics, floor, block_number)
+}
+
+/// Full tradeable catalog: every live spot, perp, and lend book.
+pub fn load_products() -> Result<ProductsResponse, String> {
+    let client = shared_client();
+    let markets = client.list_markets()?;
+    let block_number = client.block_number()?;
+    let mut products: Vec<ProductRow> = markets.into_iter().map(product_from_market).collect();
+    products.sort_by(|a, b| {
+        a.symbol
+            .cmp(&b.symbol)
+            .then_with(|| product_rank(&a.product).cmp(&product_rank(&b.product)))
+    });
+    Ok(ProductsResponse {
+        products,
+        block_number,
+    })
+}
+
+fn product_from_market(market: Market) -> ProductRow {
+    let quote = market
+        .quote_token
+        .as_ref()
+        .map(|asset| asset.symbol.clone());
+    let product = canonical_product(&market.product);
+    ProductRow {
+        id: format!("{product}:{}", market.base_token.symbol),
+        symbol: market.base_token.symbol.clone(),
+        name: market.base_token.name.clone(),
+        product: product.clone(),
+        quote_symbol: quote.clone(),
+        mark_price: market.mark_price,
+        keywords: product_keywords(
+            &market.base_token.symbol,
+            &market.base_token.name,
+            &product,
+            quote.as_deref(),
+        ),
+        base_token_id: market.base_token.token_id,
+        quote_token_id: market.quote_token.as_ref().map(|asset| asset.token_id),
+    }
+}
+
+fn canonical_product(product: &str) -> String {
+    match product {
+        "perpetual" => "perp".to_string(),
+        "lending" => "lend".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn product_rank(product: &str) -> u8 {
+    match product {
+        "spot" => 0,
+        "perp" => 1,
+        "lend" => 2,
+        _ => 3,
+    }
+}
+
+fn product_keywords(symbol: &str, name: &str, product: &str, quote: Option<&str>) -> String {
+    let kind = match product {
+        "spot" => "spot",
+        "perp" | "perpetual" => "perp perpetual",
+        "lend" | "lending" => "lend lending",
+        other => other,
+    };
+    format!("{} {} {} {}", symbol, name, kind, quote.unwrap_or(""))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -488,8 +578,98 @@ pub fn load_instruction(account_id: u64, id: &str) -> Result<Value, String> {
     BrainClient::from_env().ledger_one(account_id, id)
 }
 
+pub fn load_pnl(account_id: u64) -> Result<Value, String> {
+    let client = shared_client();
+    let assets = client.assets()?;
+    let account = client.account(account_id, &assets)?;
+    let ledger = PnlLedger::default();
+    let report = crate::pnl::report(client, &ledger, &account, None)?;
+    serde_json::to_value(report).map_err(|err| err.to_string())
+}
+
+/// Live account + catalog + brain ledger + PnL for The Desk (same rails as the plugin).
+pub fn load_desk_context(account_id: u64) -> Result<Value, String> {
+    let portfolio = load_portfolio(account_id)?;
+    let products = load_products()?;
+    let ledger = load_ledger(account_id).ok();
+    let ledger_summary = load_ledger_summary(account_id).ok();
+    let pnl = load_pnl(account_id).ok();
+    Ok(json!({
+        "ok": true,
+        "account_id": account_id,
+        "paper": false,
+        "portfolio": portfolio,
+        "products": products,
+        "ledger": ledger,
+        "ledger_summary": ledger_summary,
+        "pnl": pnl,
+    }))
+}
+
 pub fn submit_compose(body: &Value) -> Result<Value, String> {
     BrainClient::from_env().compose(body)
+}
+
+/// Best-effort Bot API send. Failures are logged by the caller; they must not
+/// undo a completed ledger cancel.
+pub fn post_chat_lines(bot_token: &str, chat_id: u64, lines: &[String]) -> Result<(), String> {
+    if bot_token.is_empty() || chat_id == 0 || lines.is_empty() {
+        return Ok(());
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|err| err.to_string())?;
+    let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
+    for text in lines {
+        if text.trim().is_empty() {
+            continue;
+        }
+        let response = client
+            .post(&url)
+            .json(&json!({ "chat_id": chat_id, "text": text, "disable_notification": true }))
+            .send()
+            .map_err(|err| err.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("telegram sendMessage {}", response.status()));
+        }
+    }
+    Ok(())
+}
+
+/// Forward a Mini App voice note to The Desk Cage. STT and assent live there.
+pub fn post_desk_voice(body: &Value) -> Result<Value, String> {
+    let base = std::env::var("DESK_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:8765".to_string());
+    let url = format!("{}/api/voice/note", base.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(90))
+        .build()
+        .map_err(|err| err.to_string())?;
+    let mut request = client.post(&url).json(body);
+    if let Ok(token) = std::env::var("DESK_BRIDGE_TOKEN") {
+        if !token.trim().is_empty() {
+            request = request.header("X-Desk-Token", token);
+        }
+    }
+    let response = request
+        .send()
+        .map_err(|err| format!("desk is not reachable at {url} ({err})"))?;
+    let status = response.status();
+    let value: Value = response.json().map_err(|err| {
+        format!("desk returned invalid JSON from {url}: {err}")
+    })?;
+    if !status.is_success() {
+        let detail = value
+            .get("detail")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("error").and_then(Value::as_str))
+            .unwrap_or("desk rejected the voice note");
+        return Err(detail.to_string());
+    }
+    Ok(value)
 }
 
 fn risk_score(metrics: &PortfolioMetrics, eligible: bool) -> u8 {
@@ -665,5 +845,39 @@ mod tests {
             distance_pct(Decimal::from(100), Some(Decimal::from(53))),
             Some("47".to_string())
         );
+    }
+
+    #[test]
+    fn product_keywords_cover_type_and_quote() {
+        assert!(
+            product_keywords("WETH", "Wrapped Ether", "perp", Some("USDT")).contains("perpetual")
+        );
+        assert!(product_keywords("WETH", "Wrapped Ether", "lend", None).contains("lending"));
+        let row = product_from_market(Market {
+            product: "perpetual".into(),
+            book: "0x1".into(),
+            base_token: Asset {
+                token_id: 2,
+                symbol: "WETH".into(),
+                name: "Wrapped Ether".into(),
+                token_type: "crypto".into(),
+                erc20_address: "0x0".into(),
+                erc20_decimals: 18,
+                vault_decimals: 8,
+                position_decimals: 8,
+                risk_price_percent: 5,
+                risk_slippage_percent: 0.5,
+            },
+            quote_token: None,
+            buy_token_id: None,
+            pay_token_id: None,
+            mark_price_raw: 0,
+            mark_price: "3500".into(),
+        });
+        assert_eq!(row.id, "perp:WETH");
+        assert_eq!(row.product, "perp");
+        assert_eq!(row.base_token_id, 2);
+        assert_eq!(product_rank("spot"), 0);
+        assert!(product_rank("spot") < product_rank("lend"));
     }
 }

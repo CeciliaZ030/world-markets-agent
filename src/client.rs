@@ -803,6 +803,128 @@ impl WorldClient {
         })
     }
 
+    /// Live spot / perp / lend books. Zero-address books are omitted.
+    pub(crate) fn list_markets(&self) -> Result<Vec<Market>, String> {
+        let assets = self.assets()?;
+        let quote = assets
+            .iter()
+            .find(|asset| asset.token_id == BASE_TOKEN_ID)
+            .cloned()
+            .ok_or_else(|| "[world-markets] base token config is missing".to_string())?;
+
+        let mut specs = Vec::new();
+        let mut meta: Vec<(&str, usize)> = Vec::new();
+        for (idx, asset) in assets.iter().enumerate() {
+            if asset.token_id != BASE_TOKEN_ID {
+                specs.push((
+                    self.exchange,
+                    encode_call(&getSpotOrderBookCall {
+                        token1: asset.token_id,
+                        token2: quote.token_id,
+                    }),
+                    getSpotOrderBookCall::SIGNATURE,
+                ));
+                meta.push(("spot", idx));
+                specs.push((
+                    self.exchange,
+                    encode_call(&getPerpOrderBookCall {
+                        token1: asset.token_id,
+                        token2: quote.token_id,
+                    }),
+                    getPerpOrderBookCall::SIGNATURE,
+                ));
+                meta.push(("perp", idx));
+            }
+            specs.push((
+                self.exchange,
+                encode_call(&getLendOrderBookCall {
+                    tokenId: asset.token_id,
+                }),
+                getLendOrderBookCall::SIGNATURE,
+            ));
+            meta.push(("lend", idx));
+        }
+
+        let raws = self.eth_call_many_hex_loose(&specs)?;
+        let mut live = Vec::new();
+        for ((product, idx), raw) in meta.iter().zip(raws) {
+            let Ok(hex) = raw else {
+                continue;
+            };
+            match *product {
+                "spot" => {
+                    if let Ok(ret) = decode_hex_return::<getSpotOrderBookCall>(&hex)
+                        && !ret.book.is_zero()
+                    {
+                        live.push((
+                            "spot",
+                            *idx,
+                            ret.book,
+                            Some(ret.buyToken),
+                            Some(ret.payToken),
+                        ));
+                    }
+                }
+                "perp" => {
+                    if let Ok(ret) = decode_hex_return::<getPerpOrderBookCall>(&hex)
+                        && !ret.book.is_zero()
+                    {
+                        live.push((
+                            "perp",
+                            *idx,
+                            ret.book,
+                            Some(ret.buyToken),
+                            Some(ret.payToken),
+                        ));
+                    }
+                }
+                "lend" => {
+                    if let Ok(ret) = decode_hex_return::<getLendOrderBookCall>(&hex)
+                        && !ret.book.is_zero()
+                    {
+                        live.push(("lend", *idx, ret.book, None, None));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mark_ids: Vec<u32> = live
+            .iter()
+            .map(|(_, idx, ..)| assets[*idx].token_id)
+            .collect();
+        let marks = self.mark_prices(mark_ids).unwrap_or_default();
+        let mut out = Vec::with_capacity(live.len());
+        for (product, idx, book, buy_token_id, pay_token_id) in live {
+            let base = assets[idx].clone();
+            let (mark_price_raw, mark_price) = marks
+                .get(&base.token_id)
+                .cloned()
+                .or_else(|| {
+                    (base.token_id == BASE_TOKEN_ID).then(|| {
+                        const ONE_RAW: u64 = 1 << 5;
+                        (ONE_RAW, decode_price(ONE_RAW))
+                    })
+                })
+                .unwrap_or((0, "0".to_string()));
+            out.push(Market {
+                product: product.to_string(),
+                book: format!("{book:#x}"),
+                quote_token: if product == "lend" {
+                    None
+                } else {
+                    Some(quote.clone())
+                },
+                base_token: base,
+                buy_token_id,
+                pay_token_id,
+                mark_price_raw,
+                mark_price,
+            });
+        }
+        Ok(out)
+    }
+
     pub(crate) fn open_orders(
         &self,
         market: &Market,
@@ -1344,6 +1466,22 @@ mod tests {
         assert!(block > 0);
         assert!(!assets.is_empty());
         assert!(assets.iter().any(|asset| asset.token_id == 1));
+    }
+
+    #[test]
+    #[ignore = "requires live UniFi RPC"]
+    fn lists_live_tradeable_markets() {
+        let client = WorldClient::default();
+        let markets = client.list_markets().unwrap();
+        assert!(!markets.is_empty());
+        assert!(markets.iter().any(|m| m.product == "spot"));
+        assert!(markets.iter().any(|m| m.product == "perp"));
+        assert!(markets.iter().any(|m| m.product == "lend"));
+        assert!(
+            markets
+                .iter()
+                .all(|m| m.book != "0x0000000000000000000000000000000000000000")
+        );
     }
 
     #[test]
