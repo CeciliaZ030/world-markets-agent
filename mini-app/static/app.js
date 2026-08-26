@@ -382,15 +382,18 @@ function heartbeatText() {
   };
 }
 
+function backIconHtml() {
+  return `<svg class="back-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>`;
+}
+
 function headerHtml(mode) {
-  const back = mode === "root" ? "⌄" : "‹";
   const showSearch =
     mode === "root" && (state.searchOpen || state.tab === "portfolio" || !voiceHomeOn());
   const search = showSearch ? searchBarHtml() : "";
   const sub = voiceHomeOn() ? C.header.subtitle : C.header.subtitleLedger;
   const hdrCls = "header" + (showSearch ? " with-search" : "");
   return `<header class="${hdrCls}">
-    <button type="button" class="header-btn" id="backBtn" aria-label="Back">${back}</button>
+    <button type="button" class="header-btn" id="backBtn" aria-label="Back">${backIconHtml()}</button>
     <div class="header-main">
       <h1 class="header-title">${escapeHtml(C.header.title)}</h1>
       <p class="header-sub">${escapeHtml(sub)}</p>
@@ -656,12 +659,8 @@ function bindChrome() {
     document.documentElement.style.setProperty("--header-h", header.offsetHeight + "px");
   }
   if (tg && tg.BackButton) {
-    if (state.sheet || state.view !== "main" || state.searchOpen) {
-      tg.BackButton.show();
-      tg.BackButton.onClick(goBack);
-    } else {
-      tg.BackButton.hide();
-    }
+    tg.BackButton.show();
+    tg.BackButton.onClick(goBack);
   }
 }
 
@@ -758,6 +757,7 @@ function micSvg() {
 function voiceStatusText() {
   const phase = state.voice.phase;
   if (phase === "listening") {
+    if (!voiceReady) return C.voice.starting;
     const s = Math.floor((state.voice.heldMs || 0) / 1000);
     const m = Math.floor(s / 60);
     const ss = String(s % 60).padStart(2, "0");
@@ -965,6 +965,7 @@ function zoneRows(rows) {
         i === rows.length - 1 ? "last" : "",
         row.status === "done" ? "is-done" : "",
         row.voice_draft ? "voice-draft" : "",
+        row.voice_draft && Date.now() - (row.voice_landed_at || 0) < 500 ? "fresh" : "",
       ]
         .filter(Boolean)
         .join(" ");
@@ -1343,6 +1344,10 @@ function watchDrafts(p) {
   return out;
 }
 
+function sheetBackHtml() {
+  return `<button type="button" class="header-btn sheet-back" id="sheetX" aria-label="Back">${backIconHtml()}</button>`;
+}
+
 function sheetHtml() {
   const half = state.sheet === "position" || state.sheet === "product" ? 280 : state.sheet === "instruction" ? 260 : 0;
   const y = state.sheet === "pick" || state.sheet === "picker" ? 0 : state.detent === "full" ? 0 : half;
@@ -1362,7 +1367,7 @@ function positionSheet(y) {
     return `<div class="scrim" id="scrim"></div>
       <div class="sheet pick" id="sheet" style="transform:translateY(${y}px)">
         <div class="handle" id="handle"></div>
-        <div class="sheet-h"><h2>${escapeHtml(fillCopy(C.picker.title, { position: p.symbol }))}</h2><button type="button" class="x" id="sheetX">✕</button></div>
+        <div class="sheet-h">${sheetBackHtml()}<h2>${escapeHtml(fillCopy(C.picker.title, { position: p.symbol }))}</h2></div>
         <div class="sheet-body">
           <p class="note">${escapeHtml(C.picker.sub)}</p>
           ${drafts
@@ -1386,7 +1391,7 @@ function positionSheet(y) {
   return `<div class="scrim" id="scrim"></div>
     <div class="sheet pos" id="sheet" style="transform:translateY(${y}px)">
       <div class="handle" id="handle"></div>
-      <div class="sheet-h"><div><h2>${escapeHtml(p.symbol)}</h2><div class="sub">${usd(p.usd_value)} · ${escapeHtml(p.quantity)}</div></div><button type="button" class="x" id="sheetX">✕</button></div>
+      <div class="sheet-h">${sheetBackHtml()}<div><h2>${escapeHtml(p.symbol)}</h2><div class="sub">${usd(p.usd_value)} · ${escapeHtml(p.quantity)}</div></div></div>
       <div class="sheet-body">
         <div class="fact-card">${escapeHtml(jobline(p) || p.asset_type)}${p.watch_count ? `<div class="k">${escapeHtml(fillCopy(C.position.watched, { n: p.watch_count }))}</div>` : ""}</div>
         <div class="act-lab">${escapeHtml(C.position.actsLabel)}</div>
@@ -1488,7 +1493,7 @@ function productSheet(y) {
     return `<div class="scrim" id="scrim"></div>
       <div class="sheet pick" id="sheet" style="transform:translateY(${y}px)">
         <div class="handle" id="handle"></div>
-        <div class="sheet-h"><h2>${escapeHtml(fillCopy(C.picker.title, { position: p.symbol }))}</h2><button type="button" class="x" id="sheetX">✕</button></div>
+        <div class="sheet-h">${sheetBackHtml()}<h2>${escapeHtml(fillCopy(C.picker.title, { position: p.symbol }))}</h2></div>
         <div class="sheet-body">
           <p class="note">${escapeHtml(C.picker.sub)}</p>
           ${drafts
@@ -1512,7 +1517,7 @@ function productSheet(y) {
   return `<div class="scrim" id="scrim"></div>
     <div class="sheet prod" id="sheet" style="transform:translateY(${y}px)">
       <div class="handle" id="handle"></div>
-      <div class="sheet-h"><div><h2>${escapeHtml(p.symbol)}</h2><div class="sub">${escapeHtml(kind)}${mark ? " · " + escapeHtml(mark) : ""}</div></div><button type="button" class="x" id="sheetX">✕</button></div>
+      <div class="sheet-h">${sheetBackHtml()}<div><h2>${escapeHtml(p.symbol)}</h2><div class="sub">${escapeHtml(kind)}${mark ? " · " + escapeHtml(mark) : ""}</div></div></div>
       <div class="sheet-body">
         <div class="act-lab">${escapeHtml(C.position.actsLabel)}</div>
         ${
@@ -1567,7 +1572,7 @@ function instructionSheet(y) {
   return `<div class="scrim" id="scrim"></div>
     <div class="sheet ins" id="sheet" style="transform:translateY(${y}px)">
       <div class="handle" id="handle"></div>
-      <div class="sheet-h"><div><h2>${escapeHtml(row.sentence)}</h2><div class="chip ${chipClass(row.status)}">${escapeHtml(row.display_status || (clientProgress(row) != null ? clientProgress(row) + "%" : ""))}</div></div><button type="button" class="x" id="sheetX">✕</button></div>
+      <div class="sheet-h">${sheetBackHtml()}<div><h2>${escapeHtml(row.sentence)}</h2><div class="chip ${chipClass(row.status)}">${escapeHtml(row.display_status || (clientProgress(row) != null ? clientProgress(row) + "%" : ""))}</div></div></div>
       <div class="sheet-body">
         <div class="fact-card">${facts.map(([k, v]) => `<div class="k">${escapeHtml(k)}</div><div>${escapeHtml(v)}</div>`).join("")}</div>
         ${acts}
@@ -1945,6 +1950,7 @@ async function doSend() {
 }
 
 function renderSent() {
+  document.body.className = "";
   const s = state.sent;
   const row = s.id ? instructions().find((r) => r.instruction_id === s.id) : null;
   app.innerHTML =
@@ -1978,6 +1984,7 @@ function renderSent() {
 }
 
 function renderBlocked() {
+  document.body.className = "";
   const b = state.blocked || {};
   app.innerHTML =
     headerHtml("inner") +
@@ -2033,6 +2040,7 @@ let voiceRecorder = null;
 let voiceChunks = [];
 let voiceStream = null;
 let voiceWanted = false;
+let voiceReady = false;
 let voiceStartedAt = 0;
 let voiceTick = null;
 let voiceNudgeTimer = null;
@@ -2048,7 +2056,7 @@ function bindVoice() {
     if (ev.button != null && ev.button !== 0) return;
     ev.preventDefault();
     ev.stopPropagation();
-      try {
+    try {
       btn.setPointerCapture(ev.pointerId);
     } catch (_) {
       /* capture optional */
@@ -2105,6 +2113,10 @@ function onVoiceDown(btn) {
 function onVoiceUp() {
   if (voiceMode() === "tap") return;
   if (state.voice.phase !== "listening") return;
+  if (!voiceReady) {
+    cancelVoice("short");
+    return;
+  }
   const held = Date.now() - (voiceStartedAt || 0);
   if (held < 600) {
     cancelVoice("short");
@@ -2170,6 +2182,11 @@ function startVoiceTick() {
   clearInterval(voiceTick);
   voiceTick = setInterval(() => {
     if (state.voice.phase !== "listening") return;
+    if (!voiceReady) {
+      const status = document.getElementById("voiceStatus");
+      if (status) status.textContent = voiceStatusText();
+      return;
+    }
     state.voice.heldMs = Date.now() - (voiceStartedAt || Date.now());
     const status = document.getElementById("voiceStatus");
     if (status) status.textContent = voiceStatusText();
@@ -2264,6 +2281,7 @@ function beginListening(btn) {
     return;
   }
   voiceWanted = true;
+  voiceReady = false;
   voiceChunks = [];
   voiceStartedAt = Date.now();
   state.voice.phase = "listening";
@@ -2278,7 +2296,7 @@ function beginListening(btn) {
     return;
   }
   navigator.mediaDevices
-    .getUserMedia({ audio: true })
+    .getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } })
     .then((stream) => {
       if (!voiceWanted || state.voice.phase !== "listening") {
         stream.getTracks().forEach((t) => t.stop());
@@ -2286,7 +2304,6 @@ function beginListening(btn) {
       }
       voiceStream = stream;
       startAnalyser(stream);
-      startLiveWords();
       const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
         ? "audio/webm;codecs=opus"
         : MediaRecorder.isTypeSupported("audio/webm")
@@ -2303,8 +2320,16 @@ function beginListening(btn) {
       voiceRecorder.ondataavailable = (ev) => {
         if (ev.data && ev.data.size) voiceChunks.push(ev.data);
       };
-      voiceRecorder.start();
+      try {
+        voiceRecorder.start(100);
+      } catch (_) {
+        voiceRecorder.start();
+      }
+      voiceStartedAt = Date.now();
+      voiceReady = true;
+      startLiveWords();
       if (btn) btn.classList.add("hot");
+      syncVoiceDom();
     })
     .catch(() => {
       onMicDenied();
@@ -2326,6 +2351,7 @@ function onMicDenied() {
 
 function teardownVoice() {
   voiceWanted = false;
+  voiceReady = false;
   clearInterval(voiceTick);
   voiceTick = null;
   stopLiveWords();
@@ -2355,7 +2381,7 @@ function cancelVoice(reason) {
 }
 
 function commitVoice() {
-  if (!voiceWanted) {
+  if (!voiceWanted || !voiceReady) {
     cancelVoice("short");
     return;
   }
@@ -2367,6 +2393,7 @@ function commitVoice() {
   const recorder = voiceRecorder;
   const mime = (recorder && recorder.mimeType) || "audio/webm";
   const started = voiceStartedAt;
+  const liveText = state.voice.transcript || "";
   if (!recorder) {
     teardownVoice();
     state.voice.phase = "idle";
@@ -2388,9 +2415,17 @@ function commitVoice() {
       const duration_secs = started ? (Date.now() - started) / 1000 : undefined;
       const out = await api("/api/v1/mini-app/voice", {
         method: "POST",
-        body: { audio_base64, mime: blob.type || mime, duration_secs },
+        body: {
+          audio_base64,
+          mime: blob.type || mime,
+          duration_secs,
+          live_text: liveText || undefined,
+        },
       });
-      const heard = (out && (out.transcript || out.heard_echo)) || "";
+      const heard = preferTranscript(
+        (out && (out.transcript || out.heard_echo)) || "",
+        liveText,
+      );
       if (heard) {
         const payload =
           (out && out.send_payload) || {
@@ -2399,6 +2434,7 @@ function commitVoice() {
             utterance_id: out && out.utterance_id,
             correlation_id: out && out.correlation_id,
           };
+        payload.message = heard;
         const inTelegram = tg && tg.initData && typeof tg.sendData === "function";
         if (inTelegram) {
           try {
@@ -2430,6 +2466,17 @@ function commitVoice() {
   }
 }
 
+function preferTranscript(stt, live) {
+  const heard = String(stt || "").trim();
+  const liveText = String(live || "").trim();
+  if (!liveText) return heard;
+  const stub = /^(hi|hello|hey|thanks|thank you|thanks for watching|you|hmm|um|uh|yes|yeah|ok|okay|the|a)[.!?]?$/i;
+  if (!heard || stub.test(heard)) {
+    if (liveText.split(/\s+/).length >= 3 || liveText.length > heard.length) return liveText;
+  }
+  return heard;
+}
+
 function landVoiceDraft(text, correlation_id, instruction_id) {
   const id = instruction_id || correlation_id;
   const row = {
@@ -2438,6 +2485,7 @@ function landVoiceDraft(text, correlation_id, instruction_id) {
     status: "with_aomi",
     display_status: C.draftRow.chip,
     voice_draft: true,
+    voice_landed_at: Date.now(),
     kind: "voice",
     correlation_id,
     created_at: nowSecs(),
@@ -2518,9 +2566,19 @@ async function refreshLedger() {
     const cor = new Set(
       state.ledger.map((r) => r.correlation_id).filter(Boolean),
     );
-    state.optimistic = state.optimistic.filter(
-      (r) => !ids.has(r.instruction_id) && !(r.correlation_id && cor.has(r.correlation_id)),
-    );
+    state.optimistic = state.optimistic.filter((r) => {
+      if (ids.has(r.instruction_id) || (r.correlation_id && cor.has(r.correlation_id))) {
+        return false;
+      }
+      if (r.voice_draft) {
+        const created = Number(r.created_at) || 0;
+        return !state.ledger.some((led) => {
+          const at = Number(led.created_at) || 0;
+          return at && created && at >= created - 5;
+        });
+      }
+      return true;
+    });
     for (const row of state.ledger) {
       if (state.pending[row.instruction_id] && row.status !== prev[row.instruction_id]) {
         delete state.pending[row.instruction_id];
@@ -2542,14 +2600,35 @@ async function refreshLedger() {
   }
 }
 
+function patchLiveClock() {
+  maybeFlushDue();
+  if (state.view !== "main" || state.searchOpen || state.voice.phase === "listening") return;
+  const hb = isVoiceHome() ? homeHeartbeatText() : heartbeatText();
+  document.querySelectorAll(".heartbeat").forEach((el) => {
+    el.innerHTML = `<span class="dot ${hb.dot}"></span>${escapeHtml(hb.text)}`;
+  });
+  document.querySelectorAll("[data-row]").forEach((el) => {
+    const id = el.getAttribute("data-row");
+    const row = instructions().find((r) => r.instruction_id === id);
+    if (!row || row.status !== "pending_execute") return;
+    const n = remainingSecs(row);
+    const glyph = el.querySelector(".glyph");
+    if (glyph) glyph.textContent = n == null ? "·" : String(n);
+    const sub = el.querySelector(".sub");
+    if (sub) sub.textContent = fillCopy(C.sub.pendingExecute, { n: n == null ? "—" : n });
+    const pct = clientProgress(row);
+    const meter = el.querySelector(".meter span");
+    if (meter && pct != null) meter.style.width = Number(pct) + "%";
+    const slot = el.querySelector(".pct-slot");
+    if (slot && pct != null) slot.textContent = String(pct) + "%";
+  });
+}
+
 function startPoll() {
   clearInterval(pollTimer);
   clearInterval(ageTimer);
   pollTimer = setInterval(refreshLedger, 2000);
-  ageTimer = setInterval(() => {
-    maybeFlushDue();
-    if (state.view === "main" && !state.searchOpen && state.voice.phase !== "listening") paint();
-  }, 1000);
+  ageTimer = setInterval(patchLiveClock, 1000);
 }
 
 function tunePoll() {
@@ -2889,6 +2968,16 @@ async function loadChartView(params) {
   }
 }
 
+function warmMic() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+  navigator.mediaDevices
+    .getUserMedia({ audio: true })
+    .then((stream) => stream.getTracks().forEach((t) => t.stop()))
+    .catch(() => {
+      /* permission prompt happens on first hold */
+    });
+}
+
 async function boot() {
   const preview = previewState();
   const chart = chartParams();
@@ -2930,6 +3019,7 @@ async function boot() {
     }
     paint();
     startPoll();
+    warmMic();
   } catch (err) {
     if (err && err.message === "unauthorized") return renderUnauthorized();
     renderError(() => boot());

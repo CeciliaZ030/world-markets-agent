@@ -84,12 +84,12 @@ const COPY = {
   errorRow:
     "can't reach the ledger — your instructions are safe; this view is stale.",
   ledgerFooter:
-    "read-only — voice composes, the thread signs · progress is a projection of engine records",
+    "voice and text move money — this view is a projection of engine records",
   ledgerFooterLegacy:
     "read-only here — voice and text in the thread move money · this view is a projection of engine records",
   draftRow: {
-    chip: "awaiting confirm",
-    sub: "sent to thread — nothing runs until you sign",
+    chip: "with aomi",
+    sub: "heard — aomi is taking it",
   },
   listening: {
     label: "LISTENING",
@@ -236,8 +236,9 @@ const COPY = {
     hold: "hold to talk",
     tapIdle: "tap to talk — tap again to send",
     listening: "release to send · slide off to cancel · {m}:{ss}",
-    drafted: "drafted — atop NEEDS YOU · the thread signs",
+    drafted: "heard — aomi is taking it",
     recording: "recording — release to send",
+    starting: "starting mic…",
     sending: "sending to aomi",
     shortTap: "hold to talk",
     slideOff: "slid off — cancelled, nothing sent",

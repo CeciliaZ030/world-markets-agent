@@ -26,7 +26,10 @@
 mod auth;
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -427,6 +430,8 @@ struct VoiceRequest {
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
+    live_text: Option<String>,
+    #[serde(default)]
     duration_secs: Option<f64>,
 }
 
@@ -499,16 +504,18 @@ async fn voice_handler(
         "audio_base64": body.audio_base64,
         "mime": body.mime,
         "text": body.text,
+        "live_text": body.live_text,
         "duration_secs": body.duration_secs,
         "source": "mini_app",
     });
     match spawn_blocking(move || -> Result<Value, String> {
-        let value = world_markets::mini_app::ingest_voice_note(account_id, &payload)?;
+        let mut value = world_markets::mini_app::ingest_voice_note(account_id, &payload)?;
         let heard = value
             .get("heard_echo")
             .or_else(|| value.get("transcript"))
             .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
         if !heard.is_empty() {
             if let Some(chat_id) = chat_id {
                 let line = format!("heard: {heard}");
@@ -516,6 +523,36 @@ async fn voice_handler(
                     world_markets::mini_app::post_chat_lines(&bot_token, chat_id, &[line])
                 {
                     tracing::warn!(error = %err, "voice heard-echo failed");
+                }
+            } else if dispatch_local_agent_turn(&heard) {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("dispatched".to_string(), json!(true));
+                }
+            } else {
+                let correlation_id = value
+                    .get("correlation_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                match world_markets::mini_app::submit_compose(&json!({
+                    "account_id": account_id,
+                    "kind": "voice",
+                    "message": heard,
+                    "correlation_id": correlation_id,
+                    "instruction_id": correlation_id,
+                })) {
+                    Ok(composed) => {
+                        if let Some(obj) = value.as_object_mut() {
+                            obj.insert("composed".to_string(), json!(true));
+                            if let Some(id) = composed
+                                .pointer("/instruction/instruction_id")
+                                .and_then(Value::as_str)
+                            {
+                                obj.insert("instruction_id".to_string(), json!(id));
+                            }
+                        }
+                    }
+                    Err(err) => tracing::warn!(error = %err, "voice compose fallback failed"),
                 }
             }
         }
@@ -542,6 +579,129 @@ async fn voice_handler(
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
         }
     }
+}
+
+/// Local Mini App (`preview=dev`, no Telegram user): feed the transcript to
+/// `aomi-run --prompt` so the plugin can `execute_world_order` on the same
+/// rails as chat. The sidecar signs with `WORLD_PRIVATE_KEY`. Returns false
+/// when the agent binary, plugin, or an LLM key is missing.
+fn dispatch_local_agent_turn(transcript: &str) -> bool {
+    let transcript = transcript.trim();
+    if transcript.is_empty() {
+        return false;
+    }
+    let Some(plugin) = plugin_lib() else {
+        tracing::warn!("local agent skipped: build the plugin (`cargo build`)");
+        return false;
+    };
+    let Some(provider) = local_llm_provider() else {
+        tracing::warn!("local agent skipped: set OPENROUTER_API_KEY (or OPENAI/ANTHROPIC)");
+        return false;
+    };
+    let Some(bin) = aomi_run_bin() else {
+        tracing::warn!("local agent skipped: aomi-run is not on PATH");
+        return false;
+    };
+    let env_file = PathBuf::from(".env");
+    let log_path = std::env::temp_dir().join("world-markets-agent.log");
+    let transcript = transcript.to_string();
+    std::thread::spawn(move || {
+        let mut cmd = Command::new(&bin);
+        cmd.arg(&plugin)
+            .arg("--env-file")
+            .arg(&env_file)
+            .arg("--provider")
+            .arg(provider)
+            .arg("--prompt")
+            .arg(&transcript)
+            .stdin(Stdio::null());
+        if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+            if let Ok(clone) = file.try_clone() {
+                cmd.stdout(Stdio::from(clone));
+                cmd.stderr(Stdio::from(file));
+            }
+        }
+        match cmd.status() {
+            Ok(status) if status.success() => {
+                tracing::info!(prompt = %transcript, "local agent turn finished");
+            }
+            Ok(status) => {
+                tracing::warn!(code = ?status.code(), "local agent turn exited");
+            }
+            Err(err) => tracing::warn!(error = %err, "local agent turn failed to start"),
+        }
+    });
+    tracing::info!(provider, "dispatched local agent turn");
+    true
+}
+
+fn local_llm_provider() -> Option<&'static str> {
+    let filled = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .is_some()
+    };
+    if filled("OPENROUTER_API_KEY") {
+        Some("openrouter")
+    } else if filled("OPENAI_API_KEY") {
+        Some("openai")
+    } else if filled("ANTHROPIC_API_KEY") {
+        Some("anthropic")
+    } else {
+        None
+    }
+}
+
+fn aomi_run_bin() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("AOMI_RUN") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let candidate = dir.join("aomi-run");
+            candidate.is_file().then_some(candidate)
+        })
+    })
+}
+
+fn plugin_lib() -> Option<PathBuf> {
+    let names = [
+        "libworld_markets.dylib",
+        "libworld_markets.so",
+        "world_markets.dll",
+    ];
+    let mut roots = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            roots.push(dir.to_path_buf());
+            if let Some(parent) = dir.parent() {
+                roots.push(parent.to_path_buf());
+            }
+        }
+    }
+    for root in roots {
+        for profile in ["debug", "release"] {
+            for name in names {
+                let path = root.join("target").join(profile).join(name);
+                if path.is_file() {
+                    return Some(path);
+                }
+                let path = root.join(profile).join(name);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn payload_message(payload: &Value) -> String {
@@ -728,5 +888,14 @@ mod tests {
         }
         assert!(src.contains(r#".route("/api/v1/mini-app/share", post(share_handler))"#));
         assert!(src.contains("prepare_introduction"));
+    }
+
+    #[test]
+    fn local_voice_dispatches_aomi_run_prompt() {
+        let src = include_str!("main.rs");
+        assert!(src.contains("dispatch_local_agent_turn"));
+        assert!(src.contains("aomi-run"));
+        assert!(src.contains("--prompt"));
+        assert!(src.contains("live_text"));
     }
 }
