@@ -40,6 +40,7 @@ let toastTimer = null;
 let burstTimer = null;
 let suppressClickUntil = 0;
 const flushedIds = new Set();
+const DISMISS_KEY = "aomi.ledger.dismissed";
 
 const state = {
   view: "main",
@@ -72,6 +73,7 @@ const state = {
   ledgerStatus: "loading",
   pending: {},
   optimistic: [],
+  dismissed: new Set(),
   voice: {
     phase: "idle",
     heldMs: 0,
@@ -200,10 +202,36 @@ function instructionStart(raw) {
 
 function remainingSecs(row) {
   if (!row || row.status !== "pending_execute") return null;
-  if (row.execute_at) return Math.max(0, Number(row.execute_at) - nowSecs());
+  const delay = Number(row.delay_secs) || 3;
+  if (row.execute_at) {
+    const rem = (Number(row.execute_at) * 1000 - Date.now()) / 1000;
+    if (!Number.isFinite(rem)) return null;
+    return Math.max(0, Math.min(delay, Math.ceil(rem)));
+  }
   if (row.remaining_secs != null) return Math.max(0, Number(row.remaining_secs));
   return null;
 }
+
+function loadDismissed() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(DISMISS_KEY) || "[]");
+    state.dismissed = new Set((Array.isArray(raw) ? raw : []).map(String));
+  } catch (_) {
+    state.dismissed = new Set();
+  }
+}
+
+function rememberDismissed(id) {
+  if (!id) return;
+  state.dismissed.add(String(id));
+  try {
+    localStorage.setItem(DISMISS_KEY, JSON.stringify([...state.dismissed].slice(-400)));
+  } catch (_) {
+    /* quota */
+  }
+}
+
+loadDismissed();
 
 function clientProgress(row) {
   if (!row) return null;
@@ -235,6 +263,7 @@ function instructions() {
   const out = [];
   for (const row of state.optimistic.concat(state.ledger)) {
     if (seen.has(row.instruction_id)) continue;
+    if (state.dismissed && state.dismissed.has(String(row.instruction_id))) continue;
     seen.add(row.instruction_id);
     out.push(row);
   }
@@ -247,12 +276,12 @@ function zoneOf(row) {
   }
   if (row.status === "pending_execute" || row.status === "executing") return "motion";
   if (row.status === "watching" || row.status === "paused") return "watch";
+  if (row.status === "cant") return "cant";
   const today = new Date().toISOString().slice(0, 10);
   const changed = new Date((row.status_changed_at || row.updated_at || 0) * 1000)
     .toISOString()
     .slice(0, 10);
   if (row.status === "done" && changed === today) return "done";
-  if (row.status === "cant" && changed === today) return "done";
   return "earlier";
 }
 
@@ -263,7 +292,7 @@ function glyph(row) {
   if (row.status === "executing") return { g: "", spin: true };
   if (row.status === "pending_execute") {
     const n = remainingSecs(row);
-    return { g: n == null ? "·" : String(n), cls: "faint" };
+    return { g: n == null ? "·" : String(n), cls: "count" };
   }
   if (row.status === "paused") return { g: "❚❚", cls: "faint" };
   if (row.status === "done") return { g: "✓", cls: "pos" };
@@ -290,7 +319,8 @@ function cancellable(row) {
     row.status === "with_aomi" ||
     row.status === "awaiting_confirm" ||
     row.status === "triggered" ||
-    row.status === "pending_execute"
+    row.status === "pending_execute" ||
+    row.status === "executing"
   );
 }
 
@@ -329,6 +359,46 @@ async function cancelInPlace(row) {
   }
 }
 
+function archivable(row) {
+  return row && (row.status === "done" || row.status === "cant");
+}
+
+async function archiveInPlace(rowOrId) {
+  const row =
+    typeof rowOrId === "string"
+      ? instructions().find((r) => r.instruction_id === rowOrId)
+      : rowOrId;
+  if (!row || !archivable(row)) return;
+  haptic("impact", "medium");
+  rememberDismissed(row.instruction_id);
+  state.ledger = state.ledger.filter((r) => r.instruction_id !== row.instruction_id);
+  state.optimistic = state.optimistic.filter((r) => r.instruction_id !== row.instruction_id);
+  if (state.openSwipe === row.instruction_id) state.openSwipe = "";
+  if (state.insId === row.instruction_id) {
+    state.sheet = null;
+    state.insId = null;
+  }
+  showToast(C.toasts.archived);
+  paint();
+  const preview = previewState();
+  if (preview && preview !== "dev") return;
+  try {
+    const initData = (tg && tg.initData) || (preview === "dev" ? "dev" : "");
+    await ensureSession(initData);
+    await api("/api/v1/mini-app/compose", {
+      method: "POST",
+      body: {
+        kind: "archive",
+        instruction_id: row.instruction_id,
+        message: "",
+      },
+    });
+    refreshLedger();
+  } catch (_) {
+    showToast(C.toasts.archiveFailed);
+  }
+}
+
 function subLine(row) {
   if (state.pending[row.instruction_id] === "pause") return C.sub.pendingPause;
   if (state.pending[row.instruction_id] === "resume") return C.sub.pendingResume;
@@ -345,7 +415,11 @@ function subLine(row) {
     return fillCopy(C.sub.pendingExecute, { n: n == null ? "—" : n });
   }
   if (row.status === "executing") {
-    return fillCopy(C.sub.executing, {
+    const type = String(row.order_type || (row.params && row.params.order_type) || "")
+      .toUpperCase();
+    const labeled = type === "TWAP" || type === "DCA";
+    return fillCopy(labeled ? C.sub.executing : C.sub.executingMarket, {
+      type: labeled ? type : "filling",
       i: row.slice_i || "—",
       n: row.slice_n || "—",
       price: row.avg_price || "—",
@@ -395,14 +469,25 @@ function backIconHtml() {
   return `<svg class="back-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>`;
 }
 
+function hasInAppBack() {
+  return Boolean(
+    state.searchOpen ||
+      state.sheet ||
+      (state.view && state.view !== "main") ||
+      state.tab === "portfolio",
+  );
+}
+
 function headerHtml(mode) {
   const showSearch =
     mode === "root" && (state.searchOpen || state.tab === "portfolio" || !voiceHomeOn());
   const search = showSearch ? searchBarHtml() : "";
   const sub = voiceHomeOn() ? C.header.subtitle : C.header.subtitleLedger;
   const hdrCls = "header" + (showSearch ? " with-search" : "");
+  const showBack = mode !== "root" || hasInAppBack();
+  const backHidden = showBack ? "" : ' style="visibility:hidden" aria-hidden="true" tabindex="-1"';
   return `<header class="${hdrCls}">
-    <button type="button" class="header-btn" id="backBtn" aria-label="Back">${backIconHtml()}</button>
+    <button type="button" class="header-btn" id="backBtn" aria-label="Back"${backHidden}>${backIconHtml()}</button>
     <div class="header-main">
       <h1 class="header-title">${escapeHtml(C.header.title)}</h1>
       <p class="header-sub">${escapeHtml(sub)}</p>
@@ -535,6 +620,10 @@ function showToast(msg) {
   paint();
 }
 
+function closeToChat() {
+  if (tg && typeof tg.close === "function") tg.close();
+}
+
 function goBack() {
   haptic("impact", "light");
   if (state.searchOpen) {
@@ -568,7 +657,12 @@ function goBack() {
     paint();
     return;
   }
-  if (tg && typeof tg.close === "function") tg.close();
+  if (state.tab === "portfolio") {
+    state.tab = "ledger";
+    paint();
+    return;
+  }
+  closeToChat();
 }
 
 function closeSearch() {
@@ -649,7 +743,7 @@ function bindChrome() {
   const back = document.getElementById("backBtn");
   if (back) back.onclick = goBack;
   const bottom = document.getElementById("bottomBtn");
-  if (bottom) bottom.onclick = goBack;
+  if (bottom) bottom.onclick = closeToChat;
   const more = document.getElementById("moreBtn");
   if (more) {
     more.onclick = () => {
@@ -667,9 +761,20 @@ function bindChrome() {
   if (header) {
     document.documentElement.style.setProperty("--header-h", header.offsetHeight + "px");
   }
-  if (tg && tg.BackButton) {
+  syncTgBackButton();
+}
+
+let tgBackBound = false;
+function syncTgBackButton() {
+  if (!tg || !tg.BackButton) return;
+  if (hasInAppBack()) {
     tg.BackButton.show();
-    tg.BackButton.onClick(goBack);
+    if (!tgBackBound) {
+      tgBackBound = true;
+      tg.BackButton.onClick(goBack);
+    }
+  } else if (typeof tg.BackButton.hide === "function") {
+    tg.BackButton.hide();
   }
 }
 
@@ -773,6 +878,7 @@ function voiceStatusText() {
     return fillCopy(C.voice.listening, { m, ss });
   }
   if (phase === "drafted") return C.voice.drafted;
+  if (phase === "sending") return C.voice.processing || C.voice.sending;
   return voiceMode() === "tap" ? C.voice.tapIdle : C.voice.hold;
 }
 
@@ -781,29 +887,36 @@ function voiceDockHtml() {
   const nudge = state.voice.nudge
     ? `<div class="voice-nudge" id="voiceNudge">${escapeHtml(state.voice.nudge)}</div>`
     : `<div class="voice-nudge" id="voiceNudge" hidden></div>`;
-  const words =
-    liveWordsOn() && phase === "listening" && state.voice.transcript
-      ? `<div class="listen-words" id="liveWords">${escapeHtml(state.voice.transcript)}<span class="listen-caret">${escapeHtml(C.listening.caret)}</span></div>`
-      : `<div class="listen-words" id="liveWords"${liveWordsOn() && phase === "listening" ? "" : " hidden"}><span class="listen-caret">${escapeHtml(C.listening.caret)}</span></div>`;
+  const words = `<div class="listen-words" id="liveWords"${
+    liveWordsOn() && phase === "listening" ? "" : " hidden"
+  }>${
+    phase === "listening"
+      ? escapeHtml(state.voice.transcript || "") +
+        `<span class="listen-caret">${escapeHtml(C.listening.caret)}</span>`
+      : `<span class="listen-caret">${escapeHtml(C.listening.caret)}</span>`
+  }</div>`;
   const typePulse = state.voice.typePulse ? " type-pulse" : "";
   return (
     `<div class="home-ledger-wrap">` +
     `<div class="home-ledger${phase === "listening" ? " dim" : ""}" id="homeLedger">` +
     ledgerZonesHtml() +
     `</div>` +
-    `<div class="listen-scrim${phase === "listening" ? " on" : ""}" id="listenScrim"><div class="listen-lab">${escapeHtml(C.listening.label)}</div>${words}</div>` +
+    `<div class="listen-scrim${phase === "listening" ? " on" : ""}" id="listenScrim"><div class="listen-lab">${escapeHtml(C.listening.label)}</div></div>` +
     `</div>` +
     `<div class="voice-dock ${phase}" id="voiceDock">` +
     nudge +
+    words +
     `<button type="button" class="voice-hero" id="voiceBtn" aria-label="${escapeHtml(voiceStatusText())}">` +
     `<div class="voice-halo"></div>` +
     `<div class="rip"></div><div class="rip d2"></div>` +
     micSvg() +
     `<div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i></div>` +
+    `<div class="spin sending-spin"></div>` +
     `<div class="check">✓</div>` +
     `</button>` +
     `<div class="voice-status" id="voiceStatus">${escapeHtml(voiceStatusText())}</div>` +
     `</div>` +
+    nearMatchHtml() +
     `<div class="home-acts">` +
     `<button type="button" class="home-act${typePulse}" id="typeInstead">${escapeHtml(C.homeActs.type)}</button>` +
     `<button type="button" class="home-act port" id="goPortfolio">${escapeHtml(C.homeActs.portfolio)}</button>` +
@@ -814,6 +927,21 @@ function voiceDockHtml() {
 function voiceHomeHtml() {
   const hb = homeHeartbeatText();
   return homeStripHtml(hb) + voiceDockHtml();
+}
+
+function nearMatchHtml() {
+  const nm = state.nearMatch;
+  if (!nm) return "";
+  const word = nm.asked_entity || "";
+  const frame = nm.message || fillCopy(C.cant.nearMatchFrame, { word });
+  const controls = Array.isArray(nm.controls) ? nm.controls : [];
+  const chips = controls
+    .map((label) => {
+      const escape = /meant /i.test(String(label));
+      return `<button type="button" class="near-chip${escape ? " escape" : ""}" data-near="${escapeHtml(String(label))}">${escapeHtml(String(label))}</button>`;
+    })
+    .join("");
+  return `<div class="near-match"><div class="frame">${escapeHtml(frame)}</div><div class="near-match-chips">${chips}</div></div>`;
 }
 
 function bindHomeActs() {
@@ -838,6 +966,12 @@ function bindHomeActs() {
       paint();
     };
   }
+  app.querySelectorAll("[data-near]").forEach((btn) => {
+    btn.onclick = () => {
+      const label = btn.getAttribute("data-near") || "";
+      if (label) sendNearMatchChoice(label);
+    };
+  });
 }
 
 function ledgerZonesHtml() {
@@ -845,6 +979,7 @@ function ledgerZonesHtml() {
   const needs = rows.filter((r) => zoneOf(r) === "needs");
   const motion = rows.filter((r) => zoneOf(r) === "motion");
   const watch = rows.filter((r) => zoneOf(r) === "watch");
+  const cant = rows.filter((r) => zoneOf(r) === "cant");
   const done = rows.filter((r) => zoneOf(r) === "done");
   const earlier = rows.filter((r) => zoneOf(r) === "earlier");
   const paused = watch.filter((r) => r.status === "paused").length;
@@ -862,13 +997,8 @@ function ledgerZonesHtml() {
   return (
     zoneBlock("needs", C.zones.needsYou, "lab-accent", needs.length, needs) +
     zoneBlock("motion", C.zones.inMotion, "lab-accent", motion.length, motion) +
-    zoneBlock(
-      "watch",
-      C.zones.watching,
-      "lab-faint",
-      fillCopy(C.zones.watchingCount, { w: watchingN, p: paused }),
-      watch,
-    ) +
+    zoneBlock("watch", C.zones.watching, "lab-faint", fillCopy(C.zones.watchingCount, { w: watchingN, p: paused }), watch) +
+    zoneBlock("cant", C.zones.cant, "lab-faint", cant.length, cant) +
     zoneBlock("done", C.zones.doneToday, "lab-pos", done.length, done) +
     (earlier.length
       ? `<div class="zone-h" id="earlierToggle"><span class="lab lab-faint">${escapeHtml(C.zones.earlier)} ${state.earlierOpen ? "▴" : "▾"}</span><span class="n">${escapeHtml(C.zones.earlierSub)}</span></div>` +
@@ -893,6 +1023,7 @@ function ledgerHtml(hb, compact) {
   const needs = rows.filter((r) => zoneOf(r) === "needs");
   const motion = rows.filter((r) => zoneOf(r) === "motion");
   const watch = rows.filter((r) => zoneOf(r) === "watch");
+  const cant = rows.filter((r) => zoneOf(r) === "cant");
   const done = rows.filter((r) => zoneOf(r) === "done");
   const paused = watch.filter((r) => r.status === "paused").length;
   const watchingN = watch.length - paused;
@@ -910,6 +1041,7 @@ function ledgerHtml(hb, compact) {
         }),
       )}</span></div>` +
       reportLine("✓", C.launch.done, done, "pos") +
+      (cant.length ? reportLine("·", C.launch.cant, cant, "faint") : "") +
       `<div class="heartbeat"><span class="dot ${hb.dot}"></span>${escapeHtml(hb.text)}</div>` +
       strip +
       `<p class="teach">${escapeHtml(C.launch.hint)}</p>`
@@ -919,6 +1051,7 @@ function ledgerHtml(hb, compact) {
   return (
     strip +
     `<div class="heartbeat"><span class="dot ${hb.dot}"></span>${escapeHtml(hb.text)}</div>` +
+    nearMatchHtml() +
     ledgerZonesHtml()
   );
 }
@@ -948,11 +1081,14 @@ function zoneRows(rows) {
   return rows
     .map((row, i) => {
       const g = glyph(row);
-      const swipable =
+      const archiveSwipe = archivable(row) && !state.pending[row.instruction_id];
+      const actionSwipe =
         (row.status === "watching" || row.status === "paused") &&
         !state.pending[row.instruction_id];
+      const swipable = archiveSwipe || actionSwipe;
       const pct = clientProgress(row);
       const inMotion = row.status === "pending_execute" || row.status === "executing";
+      const rem = remainingSecs(row);
       const meter =
         inMotion && pct != null
           ? `<div class="meter"><span style="width:${Number(pct)}%"></span></div>`
@@ -960,16 +1096,20 @@ function zoneRows(rows) {
             ? `<div class="meter ${row.distance.near ? "warn" : ""}"><span style="width:${row.distance.pct}%"></span></div>`
             : "";
       const value =
-        inMotion && pct != null
-          ? `<span class="pct-slot num">${escapeHtml(String(pct))}%</span>`
-          : row.display_status
-            ? `<span class="chip ${row.voice_draft ? "warn" : chipClass(row.status)}">${escapeHtml(row.display_status)}</span>`
-            : "";
+        row.status === "pending_execute" && rem != null
+          ? `<span class="count-chip num">${escapeHtml(String(rem))}</span>`
+          : inMotion && pct != null
+            ? `<span class="pct-slot num">${escapeHtml(String(pct))}%</span>`
+            : row.display_status
+              ? `<span class="chip ${row.voice_draft ? "warn" : chipClass(row.status)}">${escapeHtml(row.display_status)}</span>`
+              : "";
       const open = state.openSwipe === row.instruction_id;
       const canCancel = cancellable(row);
-      const chips = swipable
-        ? `<div class="swipe-under"><button type="button" class="swipe-chip primary" data-act="${row.status === "paused" ? "resume" : "pause"}" data-id="${escapeHtml(row.instruction_id)}">${row.status === "paused" ? "Resume" : "Pause"}</button><button type="button" class="swipe-chip ask" data-act="ask" data-id="${escapeHtml(row.instruction_id)}">Ask</button></div>`
-        : "";
+      const chips = archiveSwipe
+        ? `<div class="swipe-under"><button type="button" class="swipe-chip archive" data-act="archive" data-id="${escapeHtml(row.instruction_id)}">${escapeHtml(C.instruction.archive)}</button></div>`
+        : actionSwipe
+          ? `<div class="swipe-under"><button type="button" class="swipe-chip primary" data-act="${row.status === "paused" ? "resume" : "pause"}" data-id="${escapeHtml(row.instruction_id)}">${row.status === "paused" ? "Resume" : "Pause"}</button><button type="button" class="swipe-chip ask" data-act="ask" data-id="${escapeHtml(row.instruction_id)}">Ask</button></div>`
+          : "";
       const rowCls = [
         i === rows.length - 1 ? "last" : "",
         row.status === "done" ? "is-done" : "",
@@ -979,9 +1119,10 @@ function zoneRows(rows) {
       ]
         .filter(Boolean)
         .join(" ");
-      return `<div class="row ${rowCls}" data-row="${escapeHtml(row.instruction_id)}" data-swipe="${swipable ? "1" : "0"}">
+      const swipeKind = archiveSwipe ? "archive" : actionSwipe ? "1" : "0";
+      return `<div class="row ${rowCls}" data-row="${escapeHtml(row.instruction_id)}" data-swipe="${swipeKind}">
         ${chips}
-        <div class="row-front" style="${open ? "transform:translateX(-140px)" : ""}">
+        <div class="row-front" style="${open ? `transform:translateX(-${archiveSwipe ? 88 : 140}px)` : ""}">
           <div class="glyph ${g.cls}">${g.spin ? '<div class="spin"></div>' : escapeHtml(g.g)}</div>
           <div class="row-body">
             <div class="title-row"><div class="title">${escapeHtml(row.sentence)}</div>${value}${canCancel ? `<button type="button" class="row-x" data-cancel="${escapeHtml(row.instruction_id)}" aria-label="${escapeHtml(C.instruction.cancel)}">×</button>` : ""}</div>
@@ -1032,16 +1173,21 @@ function bindLedger() {
 
 function bindRowSwipe(el, isPosition) {
   const id = el.getAttribute("data-row");
-  const swipable = el.getAttribute("data-swipe") === "1";
+  const swipeMode = el.getAttribute("data-swipe") || "0";
+  const swipable = swipeMode === "1" || swipeMode === "archive";
   const front = el.querySelector(".row-front");
-  const reveal = isPosition && el.getAttribute("data-ask-only") === "1" ? 70 : 140;
+  const reveal =
+    isPosition && el.getAttribute("data-ask-only") === "1"
+      ? 70
+      : swipeMode === "archive"
+        ? 88
+        : 140;
   let x0 = 0;
   let y0 = 0;
   let dx = 0;
   let t0 = 0;
   let tracking = false;
   let aborted = false;
-  const limit = isPosition ? 230 : reveal + 20;
 
   function rubber(v) {
     const cap = isPosition ? 260 : reveal;
@@ -1089,24 +1235,33 @@ function bindRowSwipe(el, isPosition) {
     t0 = performance.now();
     tracking = true;
     aborted = false;
-    front.setPointerCapture(ev.pointerId);
+    try {
+      front.setPointerCapture(ev.pointerId);
+    } catch (_) {
+      /* capture optional */
+    }
     front.style.transition = "none";
   });
-  front.addEventListener("pointermove", (ev) => {
-    if (!tracking) return;
-    const mx = ev.clientX - x0;
-    const my = ev.clientY - y0;
-    if (!aborted && Math.abs(my) > 12 && Math.abs(my) > Math.abs(mx)) {
-      aborted = true;
-      front.style.transform = "";
-      return;
-    }
-    if (Math.abs(mx) > 6 && Math.abs(mx) > Math.abs(my) * 1.2) {
-      dx = rubber(mx);
-      if (dx < -8) haptic("impact", "light");
-      front.style.transform = `translateX(${dx}px)`;
-    }
-  });
+  front.addEventListener(
+    "pointermove",
+    (ev) => {
+      if (!tracking) return;
+      const mx = ev.clientX - x0;
+      const my = ev.clientY - y0;
+      if (!aborted && Math.abs(my) > 12 && Math.abs(my) > Math.abs(mx)) {
+        aborted = true;
+        front.style.transform = "";
+        return;
+      }
+      if (Math.abs(mx) > 6 && Math.abs(mx) > Math.abs(my) * 1.2) {
+        ev.preventDefault();
+        dx = rubber(mx);
+        if (dx < -8) haptic("impact", "light");
+        front.style.transform = `translateX(${dx}px)`;
+      }
+    },
+    { passive: false },
+  );
   function end() {
     if (!tracking) return;
     tracking = false;
@@ -1119,11 +1274,13 @@ function bindRowSwipe(el, isPosition) {
       onRowAct(id, "primary", true);
       return;
     }
+    if (swipeMode === "archive" && !aborted && (dx < -(reveal + 24) || (dx < -56 && vel < -0.85))) {
+      front.style.transform = `translateX(-${el.getBoundingClientRect().width || 320}px)`;
+      archiveInPlace(id);
+      return;
+    }
     if (dx < -(reveal * 0.5) || vel < -0.9) {
       state.openSwipe = id;
-      if (!isPosition && dx < -(reveal + 20)) {
-        /* instruction rows rubber-band; still only open */
-      }
     } else {
       state.openSwipe = "";
     }
@@ -1152,6 +1309,9 @@ function onRowAct(id, act, isPosition) {
   }
   const row = instructions().find((r) => r.instruction_id === id);
   if (!row) return;
+  if (act === "archive") {
+    return archiveInPlace(row);
+  }
   if (act === "ask") {
     return openCompose({
       kind: "question",
@@ -1551,7 +1711,6 @@ function instructionSheet(y) {
   const needs = row.status === "awaiting_confirm" || row.status === "triggered";
   const executing = row.status === "executing";
   const cant = row.status === "cant";
-  const g = glyph(row);
   const facts = cant
     ? [
         [C.cant.factAsked, row.asked_entity || row.params?.asked || row.sentence],
@@ -1616,14 +1775,16 @@ function bindSheet() {
   const handle = document.getElementById("handle");
   const x = document.getElementById("sheetX");
   if (scrim) scrim.onclick = () => { state.sheet = null; state.productId = ""; paint(); };
-  if (x) x.onclick = () => {
-    if (state.sheet === "picker") state.sheet = state.productId ? "product" : "position";
-    else {
-      state.sheet = null;
-      state.productId = "";
-    }
-    paint();
-  };
+  if (x) {
+    x.onclick = () => {
+      if (state.sheet === "picker") state.sheet = state.productId ? "product" : "position";
+      else {
+        state.sheet = null;
+        state.productId = "";
+      }
+      paint();
+    };
+  }
   const primary = document.getElementById("primaryAct");
   if (primary) {
     primary.onclick = () => {
@@ -1759,6 +1920,9 @@ function bindSheetDrag(sheet, handle) {
     sheet.style.transform = `translateY(${y}px)`;
   }
   function onDown(ev) {
+    if (ev.target && ev.target.closest && ev.target.closest("button, .act, .draft, a, input, textarea")) {
+      return;
+    }
     y0 = ev.clientY;
     start = state.detent === "full" ? 0 : half;
     t0 = performance.now();
@@ -1944,6 +2108,22 @@ async function doSend() {
   if (c.kind === "pause" || c.kind === "resume") {
     if (c.instruction_id) state.pending[c.instruction_id] = c.kind;
   }
+  const heardKind = recorded && (recorded.kind || recorded.voice_kind);
+  if (
+    heardKind === "cant" ||
+    heardKind === "near_match" ||
+    heardKind === "unclear"
+  ) {
+    state.compose = null;
+    state.view = "main";
+    applyHeardOutcome(recorded, c.message, correlation_id);
+    return;
+  }
+  if (heardKind === "resolved") {
+    const rewritten =
+      (recorded && (recorded.rewritten_text || recorded.remaining_text)) || c.message;
+    c.message = rewritten;
+  }
   if (c.kind !== "question") {
     const id =
       (recorded && recorded.instruction && recorded.instruction.instruction_id) ||
@@ -2113,11 +2293,10 @@ function pointInCircle(btn, x, y) {
 }
 
 function onVoiceDown(btn) {
-  if (state.voice.phase === "drafted") {
+  if (state.voice.phase === "drafted" || state.voice.phase === "sending") {
     clearTimeout(voiceDraftTimer);
     state.voice.phase = "idle";
     syncVoiceDom();
-    return;
   }
   if (voiceMode() === "tap") {
     if (state.voice.phase === "listening") {
@@ -2254,6 +2433,25 @@ function stopAnalyser() {
   });
 }
 
+function paintLiveWords() {
+  const words = document.getElementById("liveWords");
+  if (!words) return;
+  const show = liveWordsOn() && state.voice.phase === "listening";
+  words.hidden = !show;
+  if (show) {
+    words.innerHTML =
+      escapeHtml(state.voice.transcript || "") +
+      `<span class="listen-caret">${escapeHtml(C.listening.caret)}</span>`;
+  }
+}
+
+function applyLiveTranscript(text) {
+  const raw = String(text || "").trim();
+  const correct = typeof window.correctLiveTranscript === "function" ? window.correctLiveTranscript : null;
+  state.voice.transcript = correct ? correct(raw) : raw;
+  paintLiveWords();
+}
+
 function startLiveWords() {
   stopLiveWords();
   if (!liveWordsOn()) return;
@@ -2266,14 +2464,7 @@ function startLiveWords() {
     rec.onresult = (ev) => {
       let t = "";
       for (let i = 0; i < ev.results.length; i++) t += ev.results[i][0].transcript;
-      state.voice.transcript = t.trim();
-      const words = document.getElementById("liveWords");
-      if (words) {
-        words.hidden = false;
-        words.innerHTML =
-          escapeHtml(state.voice.transcript) +
-          `<span class="listen-caret">${escapeHtml(C.listening.caret)}</span>`;
-      }
+      applyLiveTranscript(t);
     };
     rec.start();
     liveRec = rec;
@@ -2369,13 +2560,23 @@ function onMicDenied() {
   }
 }
 
-function teardownVoice() {
+function closeCaptureImmediate() {
   voiceWanted = false;
   voiceReady = false;
   clearInterval(voiceTick);
   voiceTick = null;
   stopLiveWords();
   stopAnalyser();
+  if (voiceStream) {
+    voiceStream.getTracks().forEach((t) => t.stop());
+    voiceStream = null;
+  }
+  const btn = document.getElementById("voiceBtn");
+  if (btn) btn.classList.remove("hot");
+}
+
+function teardownVoice() {
+  closeCaptureImmediate();
   try {
     if (voiceRecorder && voiceRecorder.state !== "inactive") voiceRecorder.stop();
   } catch (_) {
@@ -2383,12 +2584,6 @@ function teardownVoice() {
   }
   voiceRecorder = null;
   voiceChunks = [];
-  if (voiceStream) {
-    voiceStream.getTracks().forEach((t) => t.stop());
-    voiceStream = null;
-  }
-  const btn = document.getElementById("voiceBtn");
-  if (btn) btn.classList.remove("hot");
 }
 
 function cancelVoice(reason) {
@@ -2398,6 +2593,85 @@ function cancelVoice(reason) {
   syncVoiceDom();
   if (reason === "slide") showNudge(C.voice.slideOff);
   else if (reason === "short") showNudge(C.voice.shortTap);
+}
+
+function closeRecordingUi(phase, correlation_id, liveText) {
+  closeCaptureImmediate();
+  if (liveText) {
+    landVoiceDraft(liveText, correlation_id);
+  } else {
+    state.voice.phase = phase || "sending";
+    syncVoiceDom();
+  }
+}
+
+async function submitVoiceBlob(blob, mime, started, liveText, correlation_id) {
+  if (!blob || !blob.size) {
+    if (!liveText) {
+      state.voice.phase = "idle";
+      syncVoiceDom();
+      showToast(C.toasts.voiceEmpty);
+    }
+    return;
+  }
+  try {
+    const audio_base64 = await blobToBase64(blob);
+    const duration_secs = started ? (Date.now() - started) / 1000 : undefined;
+    const out = await api("/api/v1/mini-app/voice", {
+      method: "POST",
+      body: {
+        audio_base64,
+        mime: blob.type || mime,
+        duration_secs,
+        live_text: liveText || undefined,
+      },
+    });
+    const heard = preferTranscript(
+      (out && (out.transcript || out.heard_echo)) || "",
+      liveText,
+    );
+    if (heard) {
+      const payload =
+        (out && out.send_payload) || {
+          kind: "voice",
+          message: heard,
+          utterance_id: out && out.utterance_id,
+          correlation_id: (out && out.correlation_id) || correlation_id,
+        };
+      payload.message = heard;
+      const inTelegram = tg && tg.initData && typeof tg.sendData === "function";
+      const kind =
+        (out && (out.voice_kind || (out.heard_handled && out.heard_handled.kind))) || "";
+      const skipSend = out && out.skip_send_data;
+      if (inTelegram && !skipSend) {
+        try {
+          tg.sendData(JSON.stringify(payload));
+        } catch (_) {
+          /* host may still ingest via webhook */
+        }
+      }
+      const cid = payload.correlation_id || correlation_id || newId();
+      if (kind === "cant" || kind === "unclear" || kind === "near_match") {
+        applyHeardOutcome(out.heard_handled || out, heard, cid);
+        burstPoll();
+      } else {
+        landVoiceDraft(heard, cid, out && out.instruction_id);
+        burstPoll();
+      }
+    } else if (!liveText) {
+      state.voice.phase = "idle";
+      syncVoiceDom();
+      showToast((out && out.speech) || C.toasts.voiceEmpty);
+    }
+  } catch (_) {
+    if (!liveText) {
+      state.voice.phase = "idle";
+      syncVoiceDom();
+      showToast(C.toasts.voiceFailed);
+    } else {
+      showToast(C.toasts.voiceFailed);
+    }
+  }
 }
 
 function commitVoice() {
@@ -2414,75 +2688,29 @@ function commitVoice() {
   const mime = (recorder && recorder.mimeType) || "audio/webm";
   const started = voiceStartedAt;
   const liveText = state.voice.transcript || "";
+  const correlation_id = newId();
+  const chunks = voiceChunks;
+  haptic("notify", "success");
+  closeRecordingUi("sending", correlation_id, liveText);
   if (!recorder) {
-    teardownVoice();
-    state.voice.phase = "idle";
-    syncVoiceDom();
+    if (liveText) submitVoiceBlob(new Blob(chunks.slice(), { type: mime }), mime, started, liveText, correlation_id);
     return;
   }
-  haptic("notify", "success");
-  recorder.onstop = async () => {
-    const blob = new Blob(voiceChunks.slice(), { type: mime });
-    teardownVoice();
-    if (!blob.size) {
-      state.voice.phase = "idle";
-      syncVoiceDom();
-      showToast(C.toasts.voiceEmpty);
-      return;
-    }
-    try {
-      const audio_base64 = await blobToBase64(blob);
-      const duration_secs = started ? (Date.now() - started) / 1000 : undefined;
-      const out = await api("/api/v1/mini-app/voice", {
-        method: "POST",
-        body: {
-          audio_base64,
-          mime: blob.type || mime,
-          duration_secs,
-          live_text: liveText || undefined,
-        },
-      });
-      const heard = preferTranscript(
-        (out && (out.transcript || out.heard_echo)) || "",
-        liveText,
-      );
-      if (heard) {
-        const payload =
-          (out && out.send_payload) || {
-            kind: "voice",
-            message: heard,
-            utterance_id: out && out.utterance_id,
-            correlation_id: out && out.correlation_id,
-          };
-        payload.message = heard;
-        const inTelegram = tg && tg.initData && typeof tg.sendData === "function";
-        if (inTelegram) {
-          try {
-            tg.sendData(JSON.stringify(payload));
-          } catch (_) {
-            /* host may still ingest via webhook */
-          }
-        }
-        landVoiceDraft(heard, payload.correlation_id || newId(), out && out.instruction_id);
-        burstPoll();
-      } else {
-        state.voice.phase = "idle";
-        syncVoiceDom();
-        showToast((out && out.speech) || C.toasts.voiceEmpty);
-      }
-    } catch (_) {
-      state.voice.phase = "idle";
-      syncVoiceDom();
-      showToast(C.toasts.voiceFailed);
-    }
+  const finish = (blob) => {
+    voiceRecorder = null;
+    voiceChunks = [];
+    submitVoiceBlob(blob, mime, started, liveText, correlation_id);
+  };
+  recorder.onstop = () => {
+    finish(new Blob(voiceChunks.slice(), { type: mime }));
   };
   try {
+    if (typeof recorder.requestData === "function" && recorder.state === "recording") {
+      recorder.requestData();
+    }
     recorder.stop();
   } catch (_) {
-    teardownVoice();
-    state.voice.phase = "idle";
-    syncVoiceDom();
-    showToast(C.toasts.voiceFailed);
+    finish(new Blob(chunks.slice(), { type: mime }));
   }
 }
 
@@ -2524,6 +2752,87 @@ function landVoiceDraft(text, correlation_id, instruction_id) {
       paint();
     }
   }, 2400);
+}
+
+function applyHeardOutcome(handled, fallbackText, correlation_id) {
+  const kind = handled && (handled.kind || handled.voice_kind);
+  state.voice.phase = "idle";
+  state.voice.transcript = "";
+  if (kind === "near_match") {
+    state.nearMatch = handled;
+    paint();
+    return;
+  }
+  state.nearMatch = null;
+  if (kind === "unclear") {
+    if (isVoiceHome()) showNudge(handled.message || C.toasts.voiceEmpty);
+    else showToast(handled.message || C.toasts.voiceEmpty);
+    paint();
+    return;
+  }
+  if (kind === "cant") {
+    const ins = handled.instruction;
+    if (ins && ins.instruction_id) {
+      const row = {
+        ...ins,
+        status: "cant",
+        display_status: ins.display_status || "can't",
+        correlation_id: correlation_id || ins.correlation_id,
+        created_at: ins.created_at || nowSecs(),
+        updated_at: ins.updated_at || nowSecs(),
+      };
+      state.optimistic = state.optimistic
+        .filter(
+          (r) =>
+            r.instruction_id !== row.instruction_id &&
+            r.correlation_id !== (correlation_id || row.correlation_id),
+        )
+        .concat([row]);
+    }
+    paint();
+    refreshLedger();
+    return;
+  }
+  if (kind === "resolved") {
+    const text =
+      (handled && (handled.rewritten_text || handled.remaining_text)) || fallbackText;
+    landVoiceDraft(text, correlation_id, handled && handled.instruction_id);
+    return;
+  }
+  paint();
+}
+
+async function sendNearMatchChoice(label) {
+  haptic("select");
+  const correlation_id = newId();
+  const payload = {
+    correlation_id,
+    kind: "text",
+    message: label,
+  };
+  const inTelegram = tg && tg.initData && typeof tg.sendData === "function";
+  if (inTelegram) {
+    try {
+      tg.sendData(JSON.stringify(payload));
+    } catch (_) {
+      /* host may still ingest via webhook */
+    }
+  }
+  state.nearMatch = null;
+  let recorded = null;
+  if (!inTelegram || previewState()) {
+    try {
+      recorded = await api("/api/v1/mini-app/compose", {
+        method: "POST",
+        body: payload,
+      });
+    } catch (_) {
+      recorded = null;
+    }
+  }
+  if (recorded) applyHeardOutcome(recorded, label, correlation_id);
+  else paint();
+  refreshLedger();
 }
 
 function blobToBase64(blob) {
@@ -2580,7 +2889,14 @@ async function refreshLedger() {
       needs_you: sum.needs_you,
       last_check_at: sum.last_check_at,
     };
-    state.ledger = led.instructions || [];
+    const priorById = Object.fromEntries(
+      (state.ledger || []).map((row) => [row.instruction_id, row]),
+    );
+    state.ledger = (led.instructions || []).map((row) => {
+      const prior = priorById[row.instruction_id];
+      if (prior && prior.trail && !row.trail) return { ...row, trail: prior.trail };
+      return row;
+    });
     state.ledgerStatus = "ok";
     const ids = new Set(state.ledger.map((r) => r.instruction_id));
     const cor = new Set(
@@ -2591,11 +2907,12 @@ async function refreshLedger() {
         return false;
       }
       if (r.voice_draft) {
-        const created = Number(r.created_at) || 0;
-        return !state.ledger.some((led) => {
-          const at = Number(led.created_at) || 0;
-          return at && created && at >= created - 5;
+        const sentence = String(r.sentence || "").trim().toLowerCase();
+        const matched = state.ledger.some((led) => {
+          const s = String(led.sentence || "").trim().toLowerCase();
+          return Boolean(s && sentence && s === sentence);
         });
+        return !matched;
       }
       return true;
     });
@@ -2639,6 +2956,8 @@ function patchLiveClock() {
     const pct = clientProgress(row);
     const meter = el.querySelector(".meter span");
     if (meter && pct != null) meter.style.width = Number(pct) + "%";
+    const count = el.querySelector(".count-chip");
+    if (count && n != null) count.textContent = String(n);
     const slot = el.querySelector(".pct-slot");
     if (slot && pct != null) slot.textContent = String(pct) + "%";
   });
@@ -2648,7 +2967,7 @@ function startPoll() {
   clearInterval(pollTimer);
   clearInterval(ageTimer);
   pollTimer = setInterval(refreshLedger, 2000);
-  ageTimer = setInterval(patchLiveClock, 1000);
+  ageTimer = setInterval(patchLiveClock, 250);
 }
 
 function tunePoll() {
@@ -2672,20 +2991,42 @@ function maybeFlushDue() {
   const preview = previewState();
   if (preview && preview !== "dev") return;
   for (const row of instructions()) {
-    if (row.status !== "pending_execute") continue;
-    const rem = remainingSecs(row);
-    if (rem == null || rem > 0) continue;
-    if (flushedIds.has(row.instruction_id)) continue;
-    flushedIds.add(row.instruction_id);
+    if (!isFlushDue(row)) continue;
+    const key = flushKey(row);
+    if (flushedIds.has(key)) continue;
+    flushedIds.add(key);
     api("/api/v1/mini-app/compose", {
       method: "POST",
       body: { kind: "flush_execute", instruction_id: row.instruction_id, message: "" },
     })
       .then(() => refreshLedger())
       .catch(() => {
-        flushedIds.delete(row.instruction_id);
+        flushedIds.delete(key);
       });
   }
+}
+
+function isFlushDue(row) {
+  if (!row) return false;
+  if (row.status === "pending_execute") {
+    const rem = remainingSecs(row);
+    return rem != null && rem <= 0;
+  }
+  if (row.status === "executing") {
+    if (row.next_slice_at) return nowSecs() >= Number(row.next_slice_at);
+    const fills = Array.isArray(row.child_fills) ? row.child_fills.length : 0;
+    return fills === 0;
+  }
+  return false;
+}
+
+function flushKey(row) {
+  return [
+    row.instruction_id,
+    row.status,
+    row.slice_i || 0,
+    row.next_slice_at || row.execute_at || 0,
+  ].join(":");
 }
 
 function renderUnauthorized() {
@@ -2820,15 +3161,37 @@ function previewBoot() {
       expires_at: nowSecs() + 86400 * 26,
       distance: { mark: "3588", pct: 26, near: false },
     },
+    {
+      instruction_id: "cant-beef",
+      task_id: "cant-beef",
+      status: "cant",
+      display_status: "can't",
+      sentence: "Buy fifty of beef",
+      kind: "cant",
+      asked_entity: "beef",
+      cant_kind: "no_market",
+      status_changed_at: nowSecs() - 20,
+      updated_at: nowSecs() - 20,
+    },
+    {
+      instruction_id: "done-eth",
+      task_id: "done-eth",
+      status: "done",
+      display_status: "done",
+      sentence: "Buy 0.05 ETH spot at market",
+      kind: "trade",
+      receipt: "filled 0.05 ETH",
+      status_changed_at: nowSecs() - 120,
+      updated_at: nowSecs() - 120,
+    },
   ];
   state.summary = { holding: 5, needs_you: 1, last_check_at: nowSecs() - 4 };
   state.ledgerStatus = "ok";
   state.compact = pv !== "loaded";
+  loadSpeechOntology();
   paint();
   clearInterval(ageTimer);
-  ageTimer = setInterval(() => {
-    if (state.view === "main" && !state.searchOpen && state.voice.phase !== "listening") paint();
-  }, 1000);
+  ageTimer = setInterval(patchLiveClock, 250);
 }
 
 function chartParams() {
@@ -2998,7 +3361,20 @@ function warmMic() {
     });
 }
 
+function loadSpeechOntology() {
+  const apply = (data) => {
+    if (data && data.entries && typeof window.setOntologyEntries === "function") {
+      window.setOntologyEntries(data.entries);
+    }
+  };
+  fetch("/api/v1/mini-app/speech-ontology")
+    .then((res) => (res.ok ? res.json() : null))
+    .then(apply)
+    .catch(() => {});
+}
+
 async function boot() {
+  loadSpeechOntology();
   const preview = previewState();
   const chart = chartParams();
   if (chart) return loadChartView(chart);
