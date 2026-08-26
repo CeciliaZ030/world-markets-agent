@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   SHARE,
   CANT,
+  alreadyTrueMessage,
   attachSetCopy,
   bundleMessage,
   expiredMessage,
@@ -29,6 +30,33 @@ test("set copy is tool-filled and never a trade", () => {
   assert.match(text, /`ETH`/);
   assert.match(text, /`2180`/);
   assert.match(text, /I won't buy or sell anything/);
+  assert.equal(text.includes("so that's"), false);
+});
+
+test("already-true copy names the mark and the two controls", () => {
+  const text = alreadyTrueMessage({
+    symbol: "WETH",
+    predicate: { symbol: "WETH", level: "3000" },
+    now: "2465.71",
+  });
+  assert.match(text, /already true/);
+  assert.match(text, /`WETH`/);
+  assert.match(text, /`2465.71`/);
+  assert.match(text, /`3000`/);
+  const attached = attachSetCopy({
+    ok: true,
+    stored: false,
+    already_true: true,
+    now: "2465.71",
+    symbol: "WETH",
+    predicate: { symbol: "WETH", level: "3000" },
+  });
+  assert.deepEqual(attached.controls, [
+    "Watch the next crossing",
+    "Change the level",
+  ]);
+  assert.equal(attached.already_true, true);
+  assert.equal(attached.now, "2465.71");
 });
 
 test("clarify and fold return paste-ready messages", () => {

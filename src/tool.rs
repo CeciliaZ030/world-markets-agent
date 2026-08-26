@@ -2426,6 +2426,10 @@ pub(crate) struct SetWorldWatchArgs {
     /// once (default) or repeats.
     #[serde(default)]
     pub(crate) fire_mode: Option<String>,
+    /// True when the user chose Watch the next crossing after an already-true watch.
+    /// Arms an edge trigger: fire only after the predicate is observed false, then true.
+    #[serde(default)]
+    pub(crate) fire_on_transition: Option<bool>,
     /// Ledger instruction id from a mini-app compose, when confirming the same row.
     #[serde(default)]
     pub(crate) instruction_id: Option<String>,
@@ -2443,7 +2447,7 @@ impl DynAomiTool for SetWorldWatch {
     type App = WorldMarketsApp;
     type Args = SetWorldWatchArgs;
     const NAME: &'static str = "set_world_watch";
-    const DESCRIPTION: &'static str = "Store an exact, tool-checkable watch. Vague triggers return a clarifying question and store nothing. Send `message` and `controls` verbatim. A watch messages; it never trades.";
+    const DESCRIPTION: &'static str = "Store an exact, tool-checkable watch. Vague triggers return a clarifying question and store nothing. Returns `now` (mark at creation) and `already_true`. If already_true, nothing is armed — paste message and controls; do not treat it as a silent arm. Pass fire_on_transition=true when the user chose Watch the next crossing. Send `message` and `controls` verbatim. A watch messages; it never trades.";
 
     fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
         let account_id = WorldMarketsApp::account_id(&ctx, args.account_id)
@@ -2469,10 +2473,20 @@ impl DynAomiTool for SetWorldWatch {
             "symbol": args.symbol,
             "token_id": token_id,
             "fire_mode": args.fire_mode,
+            "fire_on_transition": args.fire_on_transition,
             "mark_at_set": mark_at_set,
             "instruction_id": args.instruction_id,
             "correlation_id": args.correlation_id,
         }))?;
+        let now = result
+            .get("now")
+            .cloned()
+            .filter(|value| !value.is_null())
+            .or_else(|| mark_at_set.clone().map(Value::from));
+        let already_true = result
+            .get("already_true")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         Ok(json!({
             "source": "world-markets-brain",
             "executable": false,
@@ -2480,6 +2494,8 @@ impl DynAomiTool for SetWorldWatch {
             "message": result.get("message"),
             "controls": result.get("controls"),
             "preview_only": true,
+            "now": now,
+            "already_true": already_true,
         }))
     }
 }

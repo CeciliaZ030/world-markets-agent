@@ -31,29 +31,21 @@ function daysLeft(expiresAt, now) {
   return String(Math.ceil(secs / 86400));
 }
 
-function impliedLevel(mark, pct, op) {
-  const m = Number(mark);
-  const p = Number(pct);
-  if (!Number.isFinite(m) || !Number.isFinite(p)) return null;
-  const signed = op === "lte" ? -p : p;
-  return (m * (1 + signed / 100)).toFixed(2);
-}
-
 export function setMessage(watch, now = Math.floor(Date.now() / 1000)) {
   const pred = watch.predicate || {};
   const sym = pred.symbol || "";
   const mark = watch.mark_at_set;
-  let implied = null;
-  if (pred.kind === "pct_move" && mark) {
-    implied = impliedLevel(mark, pred.pct, pred.op);
-  } else if (pred.kind === "price_level") {
-    implied = pred.level;
-  }
-  const impliedBit = implied ? `, so that's ${mono(implied)}` : "";
   return [
-    `Watching ${mono(sym)} for ${pred.resolved || "your trigger"}. Now ${mono(mark)}${impliedBit}.`,
+    `Watching ${mono(sym)} for ${pred.resolved || "your trigger"}. Now ${mono(mark)}.`,
     `This is a heads-up, not a trade. I won't buy or sell anything. Expires in ${mono(daysLeft(watch.expires_at, now))} days.`,
   ].join("\n");
+}
+
+export function alreadyTrueMessage({ symbol, predicate, now: mark }) {
+  const pred = predicate || {};
+  const sym = pred.symbol || symbol || "";
+  const level = pred.level || pred.resolved || "";
+  return `That's already true — ${mono(sym)} is at ${mono(mark)}, past your ${mono(level)} level. Want the next crossing, or a different level?`;
 }
 
 export function clarifyMessage(symbol) {
@@ -108,9 +100,24 @@ export function attachSetCopy(result, now) {
       controls: (result.options || []).map((o) => o.label),
     };
   }
+  if (result.already_true && !result.stored) {
+    return {
+      ...result,
+      already_true: true,
+      now: result.now ?? result.watch?.mark_at_set ?? null,
+      message: alreadyTrueMessage({
+        symbol: result.symbol,
+        predicate: result.predicate || result.watch?.predicate,
+        now: result.now ?? result.watch?.mark_at_set,
+      }),
+      controls: ["Watch the next crossing", "Change the level"],
+    };
+  }
   if (result.ok && result.watch) {
     return {
       ...result,
+      already_true: false,
+      now: result.now ?? result.watch.mark_at_set ?? null,
       message: setMessage(result.watch, now),
       controls: ["Change the trigger", "Cancel this watch"],
     };
