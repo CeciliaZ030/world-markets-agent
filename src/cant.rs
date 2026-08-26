@@ -5,6 +5,7 @@
 use serde_json::{Value, json};
 
 use crate::brain::BrainClient;
+use crate::client::{Asset, asset_by_symbol};
 use crate::mini_app::load_products;
 use crate::speech_ontology::{self, Channel, LexiconEntry};
 
@@ -33,6 +34,31 @@ pub(crate) fn try_heard(account_id: u64, text: &str, extra: Option<&Value>) -> O
         }
         Err(_) => None,
     }
+}
+
+/// Backstop for when a trade-shaped ask was parsed against an asset that is not
+/// in the universe. Primary route is model-side (`render_lookup`); this fires
+/// when the model wrongly calls preview/check instead.
+pub(crate) fn heard_unknown_trade_asset(
+    account_id: Option<u64>,
+    text: Option<&str>,
+    side: &str,
+    quantity: &str,
+    symbol: &str,
+    assets: &[Asset],
+) -> Option<Value> {
+    if asset_by_symbol(assets, symbol).is_ok() {
+        return None;
+    }
+    let account_id = account_id?;
+    let heard_text = text
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| format!("{} {} of {}", side.trim(), quantity.trim(), symbol.trim()));
+    let value = try_heard(account_id, &heard_text, None)?;
+    let kind = value.get("kind").and_then(Value::as_str).unwrap_or("");
+    matches!(kind, "cant" | "near_match" | "unclear").then_some(value)
 }
 
 fn attach_normalized(account_id: u64, text: &str, obj: &mut serde_json::Map<String, Value>) {
@@ -171,5 +197,35 @@ mod tests {
     #[test]
     fn empty_heard_falls_through() {
         assert!(try_heard(1, "   ", None).is_none());
+    }
+
+    #[test]
+    fn known_symbol_does_not_enter_heard_backstop() {
+        let assets = [Asset {
+            token_id: 2,
+            symbol: "WETH".into(),
+            name: "Wrapped Ether".into(),
+            token_type: "crypto".into(),
+            erc20_address: "0x0".into(),
+            erc20_decimals: 18,
+            vault_decimals: 8,
+            position_decimals: 8,
+            risk_price_percent: 5,
+            risk_slippage_percent: 0.5,
+        }];
+        assert!(heard_unknown_trade_asset(
+            Some(17),
+            Some("buy me $50 of WETH"),
+            "buy",
+            "50",
+            "WETH",
+            &assets,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn unknown_symbol_without_account_falls_through() {
+        assert!(heard_unknown_trade_asset(None, Some("buy me $50 of beef"), "buy", "50", "beef", &[]).is_none());
     }
 }

@@ -1584,6 +1584,25 @@ mod tests {
         assert_eq!(out.normalized_text, "buy fifty dollars worth of beef");
         assert!(out.proposals.is_empty());
         assert_eq!(out.channel, Channel::Text);
+        assert!(
+            out.unknown_instruments
+                .iter()
+                .any(|row| row.eq_ignore_ascii_case("beef")),
+            "out-of-universe 'beef' must land as unknown, not unmatched-silent: {:?}",
+            out.unknown_instruments
+        );
+    }
+
+    #[test]
+    fn buy_me_50_of_beef_is_unknown_instrument_not_canonical() {
+        let out = norm("buy me $50 of beef", Channel::Text);
+        assert!(
+            out.action_ir.as_ref().is_none_or(|ir| ir.instrument.is_none()),
+            "beef must not resolve to a universe instrument: {:?}",
+            out.action_ir
+        );
+        assert!(out.proposals.is_empty());
+        assert!(!out.normalized_text.to_ascii_lowercase().contains("eth"));
     }
 
     #[test]

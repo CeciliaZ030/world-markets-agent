@@ -202,6 +202,9 @@ pub(crate) struct WorldTradeArgs {
     /// Optional expected owner wallet.
     #[serde(default)]
     pub(crate) wallet_address: Option<String>,
+    /// The user's whole sentence. Required so an unknown asset can take the heard/CANT path.
+    #[serde(default)]
+    pub(crate) text: Option<String>,
 }
 
 pub(crate) struct ExecuteWorldOrder;
@@ -696,6 +699,20 @@ impl WorldMarketsApp {
 
         let access = self.access(args.account_id, args.wallet_address.as_deref(), ctx)?;
         let (assets, account) = self.live_account(&access)?;
+        if let Some(heard) = crate::cant::heard_unknown_trade_asset(
+            WorldMarketsApp::account_id(ctx, args.account_id),
+            args.text.as_deref(),
+            &args.side,
+            &args.quantity,
+            &args.base_symbol,
+            &assets,
+        ) {
+            return Ok(crate::tasks::attach_open_instructions(
+                &self.brain,
+                WorldMarketsApp::account_id(ctx, args.account_id),
+                heard,
+            ));
+        }
         let base = asset_by_symbol(&assets, &args.base_symbol)?;
         let quote = asset_by_symbol(&assets, &args.quote_symbol)?;
         let market = self
@@ -1281,7 +1298,7 @@ impl DynAomiTool for PreviewWorldTrade {
     type App = WorldMarketsApp;
     type Args = WorldTradeArgs;
     const NAME: &'static str = "preview_world_trade";
-    const DESCRIPTION: &'static str = "Preview a World spot or perpetual intent from live state and return the deterministic mandate verdict. It never stages or executes.";
+    const DESCRIPTION: &'static str = "Preview a World spot or perpetual intent from live state and return the deterministic mandate verdict. It never stages or executes. Host: pass text=the user's whole sentence. If the named asset is not in the universe, the tool returns the heard/CANT surface with skip_llm — send message (and controls) and do not call the LLM. Unfulfillable never executes.";
 
     fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
         app.trade_preview(args, &ctx)
@@ -1292,7 +1309,7 @@ impl DynAomiTool for CheckWorldMandate {
     type App = WorldMarketsApp;
     type Args = WorldTradeArgs;
     const NAME: &'static str = "check_world_mandate";
-    const DESCRIPTION: &'static str = "Evaluate one structured World trade intent against the bound mandate and live account/market state. Returns the exact allow or deny rule; it does not execute.";
+    const DESCRIPTION: &'static str = "Evaluate one structured World trade intent against the bound mandate and live account/market state. Returns the exact allow or deny rule; it does not execute. Host: pass text=the user's whole sentence. If the named asset is not in the universe, the tool returns the heard/CANT surface with skip_llm — send message (and controls) and do not call the LLM. Unfulfillable never executes.";
 
     fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
         let preview = app.trade_preview(args, &ctx)?;
@@ -3110,6 +3127,7 @@ mod tests {
                     quantity: "0.01".to_string(),
                     account_id: None,
                     wallet_address: None,
+                    text: None,
                 },
                 &ctx,
             )
