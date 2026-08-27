@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 const ONTOLOGY_JSON: &str = include_str!("../assets/speech_ontology.json");
-const ONTOLOGY_VERSION: u32 = 2;
+const ONTOLOGY_VERSION: u32 = 3;
 const EXTRA_KEYTERM_BUDGET: usize = 40;
 const MAX_EDIT_DISTANCE: usize = 1;
 
@@ -504,7 +504,7 @@ fn normalize_key(surface: &str) -> String {
 pub fn intensifier_for(term: &str) -> u8 {
     match kind_for(term).as_deref() {
         Some("instrument") => 5,
-        Some("act" | "size_frame" | "size" | "unit" | "product" | "order_type") => 3,
+        Some("act" | "opener" | "size_frame" | "size" | "unit" | "product" | "order_type") => 3,
         _ => 2,
     }
 }
@@ -522,27 +522,17 @@ pub fn boostable_keyterms() -> Vec<String> {
         .filter(|row| row.kind != "confusable" && allows_channel(&row.channels, Channel::Speech))
         .collect();
     ranked.sort_by(|a, b| {
-        kind_rank(&a.kind)
-            .cmp(&kind_rank(&b.kind))
-            .then(
-                b.confidence
-                    .partial_cmp(&a.confidence)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
-            .then(
-                a.surface_form
-                    .to_ascii_lowercase()
-                    .cmp(&b.surface_form.to_ascii_lowercase()),
-            )
+        kind_rank(&a.kind).cmp(&kind_rank(&b.kind)).then(
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
     });
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for row in ranked {
         let term = row.surface_form.trim();
-        if !is_boost_token(term) {
-            continue;
-        }
-        if term.eq_ignore_ascii_case("if") {
+        if !is_boost_token(term, &row.kind) {
             continue;
         }
         let key = term.to_ascii_lowercase();
@@ -554,15 +544,25 @@ pub fn boostable_keyterms() -> Vec<String> {
     out
 }
 
-fn is_boost_token(term: &str) -> bool {
+fn is_boost_token(term: &str, kind: &str) -> bool {
     let trimmed = term.trim();
-    trimmed.len() >= 2 && !trimmed.contains(char::is_whitespace)
+    if trimmed.len() < 2 || trimmed.eq_ignore_ascii_case("if") {
+        return false;
+    }
+    let words = trimmed.split_whitespace().count();
+    if words == 0 || words > 3 {
+        return false;
+    }
+    if words > 1 {
+        return matches!(kind, "act" | "opener");
+    }
+    true
 }
 
 fn kind_rank(kind: &str) -> u8 {
     match kind {
-        "instrument" => 0,
-        "act" => 1,
+        "opener" | "act" => 0,
+        "instrument" => 1,
         "order_type" => 2,
         "size_frame" => 3,
         "size" | "unit" => 4,
@@ -581,7 +581,11 @@ pub fn seed_keyterms(catalog: &[String], holdings: &[String]) -> Vec<String> {
             return;
         }
         let trimmed = term.trim();
-        if !is_boost_token(trimmed) {
+        if trimmed.len() < 2 || trimmed.eq_ignore_ascii_case("if") {
+            return;
+        }
+        let words = trimmed.split_whitespace().count();
+        if words == 0 || words > 3 {
             return;
         }
         let key = trimmed.to_ascii_lowercase();
@@ -631,6 +635,12 @@ pub fn normalize_utterance(
 
     let universe = InstrumentUniverse::new(catalog, lexicon, channel);
     let mut slots: Vec<UtteranceSlot> = Vec::new();
+    if let Some(eth_slot) = repair_eth_heard_as_eight(&mut tokens, channel) {
+        slots.push(eth_slot);
+    }
+    if let Some(opener_slot) = restore_speech_opener(&mut tokens, channel) {
+        slots.push(opener_slot);
+    }
     if let Some(size_slot) = apply_repairs(&mut tokens, channel) {
         slots.push(size_slot);
     }
@@ -1135,9 +1145,7 @@ fn number_word(token: &str) -> Option<String> {
 }
 
 const MONEY_VERBS: &[&str] = &["put", "spend", "invest", "deploy"];
-const CURRENCY_MARKERS: &[&str] = &[
-    "usd", "usdt", "dollar", "dollars", "worth", "bucks", "buck",
-];
+const CURRENCY_MARKERS: &[&str] = &["usd", "usdt", "dollar", "dollars", "worth", "bucks", "buck"];
 const BUY_ACTS: &[&str] = &[
     "buy", "sell", "long", "short", "shorts", "longs", "purchase", "dump",
 ];
@@ -1170,10 +1178,14 @@ pub fn classify_size_tokens(tokens: &[String], instrument: Option<&str>) -> Size
     let window_lo = idx.saturating_sub(3);
     let window_hi = (idx + 4).min(tokens.len());
     let window = &tokens[window_lo..window_hi];
-    let has_currency = window.iter().any(|t| CURRENCY_MARKERS.iter().any(|m| m == t))
-        || tokens.iter().any(|t| CURRENCY_MARKERS.iter().any(|m| m == t) && {
-            let pos = tokens.iter().position(|x| x == t).unwrap_or(0);
-            pos.abs_diff(idx) <= 4
+    let has_currency = window
+        .iter()
+        .any(|t| CURRENCY_MARKERS.iter().any(|m| m == t))
+        || tokens.iter().any(|t| {
+            CURRENCY_MARKERS.iter().any(|m| m == t) && {
+                let pos = tokens.iter().position(|x| x == t).unwrap_or(0);
+                pos.abs_diff(idx) <= 4
+            }
         });
     let money_verb = tokens.iter().any(|t| MONEY_VERBS.iter().any(|v| v == t));
     let inst = instrument
@@ -1186,8 +1198,8 @@ pub fn classify_size_tokens(tokens: &[String], instrument: Option<&str>) -> Size
         (Some(n), _) if inst.as_deref() == Some(n) => true,
         _ => false,
     };
-    let has_of_asset = tokens.get(idx + 1).map(String::as_str) == Some("of")
-        && tokens.get(idx + 2).is_some();
+    let has_of_asset =
+        tokens.get(idx + 1).map(String::as_str) == Some("of") && tokens.get(idx + 2).is_some();
     let kind = if has_currency {
         SizeKind::Quote
     } else if money_verb {
@@ -1226,8 +1238,12 @@ pub fn infer_side_tokens(tokens: &[String]) -> Option<String> {
 
 pub fn infer_product(sentence: &str) -> Option<String> {
     let tokens = tokenize(sentence);
-    if tokens.iter().any(|t| matches!(t.as_str(), "perp" | "perpetual" | "perps" | "short" | "long"))
-    {
+    if tokens.iter().any(|t| {
+        matches!(
+            t.as_str(),
+            "perp" | "perpetual" | "perps" | "short" | "long"
+        )
+    }) {
         return Some("perp".to_string());
     }
     if tokens
@@ -1292,7 +1308,16 @@ const FOOD: &[&str] = &[
     "rice", "corn", "wheat", "soy", "soybeans",
 ];
 const COMMODITY: &[&str] = &[
-    "gold", "silver", "oil", "crude", "gas", "wheat", "corn", "copper", "platinum", "palladium",
+    "gold",
+    "silver",
+    "oil",
+    "crude",
+    "gas",
+    "wheat",
+    "corn",
+    "copper",
+    "platinum",
+    "palladium",
 ];
 const EQUITY: &[&str] = &[
     "tsla", "aapl", "nvda", "msft", "amzn", "goog", "meta", "spy", "qqq", "stock", "stocks",
@@ -1326,7 +1351,9 @@ pub fn instrument_category(noun: &str) -> Option<&'static str> {
 /// Buy-verb + a concrete noun with no universe hit → CANT category. No noun → unclear.
 pub fn unfulfillable_kind(sentence: &str, unknown: &[String]) -> Option<(&'static str, String)> {
     let tokens = tokenize(sentence);
-    let has_act = tokens.iter().any(|t| BUY_ACTS.iter().any(|a| a == t) || MONEY_VERBS.iter().any(|a| a == t));
+    let has_act = tokens
+        .iter()
+        .any(|t| BUY_ACTS.iter().any(|a| a == t) || MONEY_VERBS.iter().any(|a| a == t));
     if !has_act {
         return None;
     }
@@ -1339,7 +1366,10 @@ pub fn unfulfillable_kind(sentence: &str, unknown: &[String]) -> Option<(&'stati
             || CURRENCY_MARKERS.iter().any(|m| m == t)
             || BUY_ACTS.iter().any(|a| a == t)
             || MONEY_VERBS.iter().any(|a| a == t)
-            || matches!(t.as_str(), "of" | "the" | "my" | "me" | "a" | "an" | "some" | "into" | "on" | "with")
+            || matches!(
+                t.as_str(),
+                "of" | "the" | "my" | "me" | "a" | "an" | "some" | "into" | "on" | "with"
+            )
         {
             continue;
         }
@@ -1360,6 +1390,223 @@ fn is_size_filler(token: &str, ont: &Ontology) -> bool {
         || token == "a"
         || token == "the"
         || token == "open"
+}
+
+/// "buy 5 eth" is often heard as "five five eight" or "58": buy→five, eth→eight,
+/// then smart_format concatenates the digits. SOL does not sound like a number,
+/// so "buy 5 SOL" survives. Collapse only when no other instrument is present.
+fn repair_eth_heard_as_eight(tokens: &mut Vec<String>, channel: Channel) -> Option<UtteranceSlot> {
+    if channel != Channel::Speech || tokens.is_empty() {
+        return None;
+    }
+    if has_money_frame(tokens) || has_named_instrument(tokens) {
+        return None;
+    }
+    let act = tokens
+        .first()
+        .filter(|t| is_trade_act(t))
+        .cloned();
+    if tokens.first().is_some_and(|t| is_question_opener(t)) {
+        return None;
+    }
+    if !eth_collapsed_as_eight(tokens) {
+        return None;
+    }
+    let surface = tokens.join(" ");
+    let verb = act.unwrap_or_else(|| "buy".to_string());
+    tokens.clear();
+    tokens.push(verb);
+    tokens.push("5".to_string());
+    tokens.push("eth".to_string());
+    Some(UtteranceSlot {
+        kind: "instrument".to_string(),
+        surface,
+        target: "ETH".to_string(),
+        source: "eth_eight_rule".to_string(),
+    })
+}
+
+fn is_trade_act(token: &str) -> bool {
+    matches!(
+        token,
+        "buy"
+            | "sell"
+            | "long"
+            | "short"
+            | "lend"
+            | "borrow"
+            | "close"
+            | "unwind"
+    )
+}
+
+fn is_question_opener(token: &str) -> bool {
+    matches!(
+        token,
+        "what" | "whats" | "why" | "how" | "who" | "when" | "where" | "can" | "could" | "should"
+    )
+}
+
+fn is_five_token(token: &str) -> bool {
+    token == "5" || token == "five"
+}
+
+fn is_eight_token(token: &str) -> bool {
+    matches!(token, "8" | "eight" | "ate")
+}
+
+fn is_five_eight_num(token: &str) -> bool {
+    token == "58"
+}
+
+fn eth_collapsed_as_eight(tokens: &[String]) -> bool {
+    let rest: &[String] = if tokens.first().is_some_and(|t| is_trade_act(t)) {
+        &tokens[1..]
+    } else {
+        tokens
+    };
+    match rest {
+        [n] if is_five_eight_num(n) => true,
+        [a, b] if is_five_token(a) && is_eight_token(b) => true,
+        [a, b, c] if is_five_token(a) && is_five_token(b) && is_eight_token(c) => true,
+        _ => false,
+    }
+}
+
+fn has_money_frame(tokens: &[String]) -> bool {
+    tokens.iter().any(|t| {
+        matches!(
+            t.as_str(),
+            "dollars" | "bucks" | "worth" | "percent" | "notional"
+        )
+    })
+}
+
+fn has_named_instrument(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| {
+        matches!(kind_for(token).as_deref(), Some("instrument"))
+            || matches!(
+                token.as_str(),
+                "eth"
+                    | "weth"
+                    | "ether"
+                    | "ethereum"
+                    | "btc"
+                    | "wbtc"
+                    | "bitcoin"
+                    | "sol"
+                    | "solana"
+                    | "usdc"
+                    | "usdt"
+            )
+    })
+}
+
+/// Speech often drops the first word. "buy 5 ETH" lands as "5.05 ETH" because
+/// "buy" and "five" share a diphthong and smart_format fuses the two numbers.
+/// Users almost never start with a numeral; restore `buy` when they did.
+fn restore_speech_opener(tokens: &mut Vec<String>, channel: Channel) -> Option<UtteranceSlot> {
+    if channel != Channel::Speech || tokens.is_empty() {
+        return None;
+    }
+    if tokens.iter().any(|t| is_utterance_opener(t)) {
+        return None;
+    }
+    if !looks_like_sized_instrument(tokens) {
+        return None;
+    }
+    let qty = leading_command_qty(&tokens[0])?;
+    let surface = tokens[0].clone();
+    tokens[0] = qty;
+    tokens.insert(0, "buy".to_string());
+    Some(UtteranceSlot {
+        kind: "act".to_string(),
+        surface,
+        target: "buy".to_string(),
+        source: "opener_rule".to_string(),
+    })
+}
+
+fn leading_command_qty(token: &str) -> Option<String> {
+    if !is_number_token(token) {
+        return None;
+    }
+    if let Some((whole, frac)) = token.split_once('.') {
+        if !whole.is_empty()
+            && whole.chars().all(|c| c.is_ascii_digit())
+            && !frac.is_empty()
+            && frac.chars().all(|c| c.is_ascii_digit())
+        {
+            if frac.chars().all(|c| c == '0') {
+                return Some(whole.to_string());
+            }
+            if frac.starts_with('0') && frac.trim_start_matches('0') == whole {
+                return Some(whole.to_string());
+            }
+        }
+    }
+    Some(token.to_string())
+}
+
+fn is_utterance_opener(token: &str) -> bool {
+    match kind_for(token).as_deref() {
+        Some("act" | "opener") => true,
+        _ => matches!(
+            token,
+            "what"
+                | "whats"
+                | "why"
+                | "how"
+                | "who"
+                | "when"
+                | "where"
+                | "can"
+                | "could"
+                | "should"
+                | "show"
+                | "list"
+                | "tell"
+                | "buy"
+                | "sell"
+                | "unwind"
+                | "leverage"
+                | "long"
+                | "short"
+                | "lend"
+                | "borrow"
+                | "close"
+                | "cancel"
+                | "watch"
+                | "pause"
+                | "resume"
+                | "open"
+        ),
+    }
+}
+
+fn looks_like_sized_instrument(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| {
+        matches!(
+            kind_for(token).as_deref(),
+            Some("instrument") | Some("size_frame")
+        ) || matches!(
+            token.as_str(),
+            "eth"
+                | "weth"
+                | "ether"
+                | "ethereum"
+                | "btc"
+                | "wbtc"
+                | "bitcoin"
+                | "sol"
+                | "solana"
+                | "usdc"
+                | "usdt"
+                | "dollars"
+                | "bucks"
+                | "worth"
+        )
+    })
 }
 
 fn apply_repairs(tokens: &mut Vec<String>, channel: Channel) -> Option<UtteranceSlot> {
@@ -1790,8 +2037,8 @@ mod tests {
     }
 
     #[test]
-    fn ontology_version_is_two() {
-        assert_eq!(ONTOLOGY_VERSION, 2);
+    fn ontology_version_is_three() {
+        assert_eq!(ONTOLOGY_VERSION, 3);
         assert!(!boostable_keyterms().is_empty());
         assert!(!ontology().frames.is_empty());
         assert!(!ontology().repairs.is_empty());
@@ -1805,22 +2052,22 @@ mod tests {
         assert!(out.hits.is_empty());
         assert_eq!(out.proposed_confusables.len(), 1);
         assert_eq!(out.proposed_confusables[0].surface, "beef");
-        assert_eq!(out.proposed_confusables[0].target, "ETH");
+        assert_eq!(out.proposed_confusables[0].target, "WETH");
     }
 
     #[test]
     fn these_in_worth_of_frame_proposes_eth_not_rewrite() {
         let out = repair("buy fifty dollars worth of these");
         assert_eq!(out.text, "buy fifty dollars worth of these");
-        assert_eq!(out.proposed_confusables[0].target, "ETH");
+        assert_eq!(out.proposed_confusables[0].target, "WETH");
         assert!(out.hits.is_empty());
     }
 
     #[test]
-    fn eth_in_worth_of_frame_stays_eth() {
+    fn eth_in_worth_of_frame_rewrites_to_weth() {
         let out = repair("buy fifty dollars worth of ETH");
-        assert_eq!(out.text, "buy fifty dollars worth of ETH");
-        assert!(out.hits.iter().any(|h| h.normalized_target == "ETH"));
+        assert_eq!(out.text, "buy fifty dollars worth of WETH");
+        assert!(out.hits.iter().any(|h| h.normalized_target == "WETH"));
         assert_eq!(out.hits.len(), 1);
     }
 
@@ -1841,11 +2088,11 @@ mod tests {
     fn dollar_550_in_worth_of_frame_becomes_fifty() {
         assert_eq!(
             text("buy $550 worth of ETH"),
-            "buy fifty dollars worth of ETH"
+            "buy fifty dollars worth of WETH"
         );
         assert_eq!(
             text("buy 550 dollars worth of ETH"),
-            "buy fifty dollars worth of ETH"
+            "buy fifty dollars worth of WETH"
         );
     }
 
@@ -1853,7 +2100,7 @@ mod tests {
     fn fifteen_is_not_rewritten() {
         assert_eq!(
             text("buy 15 dollars worth of ETH"),
-            "buy 15 dollars worth of ETH"
+            "buy 15 dollars worth of WETH"
         );
     }
 
@@ -1866,8 +2113,42 @@ mod tests {
         assert!(lower.iter().any(|t| t == "worth"));
         assert!(lower.iter().any(|t| t == "twap"));
         assert!(lower.iter().any(|t| t == "dca"));
+        assert!(lower.iter().any(|t| t == "unwind"));
+        assert!(lower.iter().any(|t| t == "leverage up"));
+        assert!(lower.iter().any(|t| t == "how much"));
         assert!(!lower.iter().any(|t| t == "beef" || t == "these"));
+        let buy = lower.iter().position(|t| t == "buy").expect("buy");
+        let eth = lower.iter().position(|t| t == "eth").expect("eth");
+        assert!(buy < eth, "command openers must seed before instruments: {lower:?}");
         assert!(terms.len() <= EXTRA_KEYTERM_BUDGET);
+    }
+
+    #[test]
+    fn speech_restores_buy_when_five_fuses_to_decimal() {
+        assert_eq!(text("5.05 ETH"), "buy 5 WETH");
+        assert_eq!(text("5.05 ether"), "buy 5 WETH");
+        assert_eq!(text("5 ETH"), "buy 5 WETH");
+        assert_eq!(text("5.0 sol"), "buy 5 SOL");
+        assert_eq!(text("buy 5.05 ETH"), "buy 5.05 WETH");
+        assert_eq!(text("sell 5 ETH"), "sell 5 WETH");
+        assert_eq!(text("how much is 5 ETH"), "how much is 5 WETH");
+        let typed = normalize_utterance("5.05 ETH", Channel::Text, &[], &[]);
+        assert_eq!(typed.normalized_text, "5.05 WETH");
+    }
+
+    #[test]
+    fn speech_collapses_five_five_eight_to_buy_5_eth() {
+        assert_eq!(text("five five eight"), "buy 5 WETH");
+        assert_eq!(text("58"), "buy 5 WETH");
+        assert_eq!(text("5 8"), "buy 5 WETH");
+        assert_eq!(text("five eight"), "buy 5 WETH");
+        assert_eq!(text("buy 5 eight"), "buy 5 WETH");
+        assert_eq!(text("buy 58"), "buy 5 WETH");
+        assert_eq!(text("sell 5 eight"), "sell 5 WETH");
+        assert_eq!(text("buy 58 SOL"), "buy 58 SOL");
+        assert_eq!(text("buy 5 SOL"), "buy 5 SOL");
+        let typed = normalize_utterance("58", Channel::Text, &[], &[]);
+        assert_eq!(typed.normalized_text, "58");
     }
 
     #[test]
@@ -1880,25 +2161,41 @@ mod tests {
     fn eath_near_miss_proposes_eth() {
         let out = repair("buy fifty dollars worth of eath");
         assert_eq!(out.text, "buy fifty dollars worth of eath");
-        assert_eq!(out.proposed_confusables[0].target, "ETH");
+        assert_eq!(out.proposed_confusables[0].target, "WETH");
     }
 
     #[test]
     fn buy_it_proposes_eth_cancel_it_does_not() {
         let buy = repair("buy it");
         assert_eq!(buy.text, "buy it");
-        assert_eq!(buy.proposed_confusables[0].target, "ETH");
+        assert_eq!(buy.proposed_confusables[0].target, "WETH");
         assert_eq!(text("cancel it"), "cancel it");
         assert_eq!(text("watch these"), "watch these");
         let sell = repair("sell these");
         assert_eq!(sell.text, "sell these");
-        assert_eq!(sell.proposed_confusables[0].target, "ETH");
+        assert_eq!(sell.proposed_confusables[0].target, "WETH");
     }
 
     #[test]
-    fn wrapped_ether_maps_to_weth() {
+    fn spoken_eth_names_map_to_weth() {
+        assert_eq!(
+            text("buy fifty dollars worth of ether"),
+            "buy fifty dollars worth of WETH"
+        );
+        assert_eq!(
+            text("buy fifty dollars worth of ethereum"),
+            "buy fifty dollars worth of WETH"
+        );
+        assert_eq!(
+            text("buy fifty dollars worth of ETH"),
+            "buy fifty dollars worth of WETH"
+        );
         assert_eq!(
             text("buy fifty dollars worth of wrapped ether"),
+            "buy fifty dollars worth of WETH"
+        );
+        assert_eq!(
+            text("buy fifty dollars worth of wrapped ethereum"),
             "buy fifty dollars worth of WETH"
         );
     }
@@ -1942,7 +2239,9 @@ mod tests {
     fn buy_me_50_of_beef_is_unknown_instrument_not_canonical() {
         let out = norm("buy me $50 of beef", Channel::Text);
         assert!(
-            out.action_ir.as_ref().is_none_or(|ir| ir.instrument.is_none()),
+            out.action_ir
+                .as_ref()
+                .is_none_or(|ir| ir.instrument.is_none()),
             "beef must not resolve to a universe instrument: {:?}",
             out.action_ir
         );
@@ -1951,21 +2250,21 @@ mod tests {
     }
 
     #[test]
-    fn text_ether_rewrites_to_eth() {
+    fn text_ether_rewrites_to_weth() {
         let out = norm("buy fifty dollars worth of ether", Channel::Text);
-        assert_eq!(out.normalized_text, "buy fifty dollars worth of ETH");
+        assert_eq!(out.normalized_text, "buy fifty dollars worth of WETH");
         assert!(out.proposals.is_empty());
         assert!(
             out.slots
                 .iter()
-                .any(|s| s.kind == "instrument" && s.target == "ETH" && s.source == "alias")
+                .any(|s| s.kind == "instrument" && s.target == "WETH" && s.source == "alias")
         );
     }
 
     #[test]
     fn text_channel_skips_speech_size_mishear() {
         let out = norm("buy 550 dollars worth of ETH", Channel::Text);
-        assert_eq!(out.normalized_text, "buy 550 dollars worth of ETH");
+        assert_eq!(out.normalized_text, "buy 550 dollars worth of WETH");
         assert!(!out.slots.iter().any(|s| s.source == "size_rule"));
         assert_eq!(out.grammar, GrammarStatus::Matched);
         assert_eq!(out.action_ir.unwrap().size.as_deref(), Some("550"));
@@ -1998,7 +2297,7 @@ mod tests {
         assert_eq!(matched.grammar, GrammarStatus::Matched);
         let ir = matched.action_ir.expect("matched IR");
         assert_eq!(ir.act, "buy");
-        assert_eq!(ir.instrument.as_deref(), Some("ETH"));
+        assert_eq!(ir.instrument.as_deref(), Some("WETH"));
         assert_eq!(ir.size.as_deref(), Some("fifty"));
         assert_eq!(ir.frame_id.as_deref(), Some("buy_sell"));
 
@@ -2041,7 +2340,7 @@ mod tests {
     #[test]
     fn size_rule_slot_uses_size_rule_source() {
         let out = norm("buy $550 worth of ETH", Channel::Speech);
-        assert_eq!(out.normalized_text, "buy fifty dollars worth of ETH");
+        assert_eq!(out.normalized_text, "buy fifty dollars worth of WETH");
         assert!(
             out.slots
                 .iter()
@@ -2059,7 +2358,10 @@ mod tests {
 
     #[test]
     fn parse_size_quote_vs_base() {
-        assert_eq!(parse_size("buy $200 of ETH", Some("ETH")).kind, SizeKind::Quote);
+        assert_eq!(
+            parse_size("buy $200 of ETH", Some("ETH")).kind,
+            SizeKind::Quote
+        );
         assert_eq!(
             parse_size("put 300 into ether", Some("ETH")).kind,
             SizeKind::Quote
@@ -2076,7 +2378,10 @@ mod tests {
             parse_size("buy 0.02 WETH", Some("WETH")).kind,
             SizeKind::Base
         );
-        assert_eq!(parse_size("buy 200 WETH", Some("WETH")).kind, SizeKind::Base);
+        assert_eq!(
+            parse_size("buy 200 WETH", Some("WETH")).kind,
+            SizeKind::Base
+        );
         assert_eq!(parse_size("buy 200", None).kind, SizeKind::Ambiguous);
         assert_eq!(parse_amount_token("5k").as_deref(), Some("5000"));
         assert_eq!(parse_amount_token("0.02").as_deref(), Some("0.02"));

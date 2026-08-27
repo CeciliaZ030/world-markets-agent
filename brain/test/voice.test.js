@@ -73,8 +73,11 @@ test("empty-account keyterms still include ETH buy and worth", () => {
   assert.ok(lower.includes("eth"), `ETH missing from ${terms.join(",")}`);
   assert.ok(lower.includes("buy"), `buy missing from ${terms.join(",")}`);
   assert.ok(lower.includes("worth"), `worth missing from ${terms.join(",")}`);
+  assert.ok(lower.includes("unwind"), `unwind missing from ${terms.join(",")}`);
+  assert.ok(lower.includes("leverage up"), `leverage up missing from ${terms.join(",")}`);
   assert.ok(!lower.includes("beef"));
   assert.ok(!lower.includes("these"));
+  assert.ok(lower.indexOf("buy") < lower.indexOf("eth"), `openers must precede instruments: ${terms.join(",")}`);
 });
 
 test("utterance keeps repaired_from and heard_echo is repaired text", () => {

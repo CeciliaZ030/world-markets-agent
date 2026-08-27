@@ -150,8 +150,9 @@ export function fillerSet() {
 
 export function kindRank(kind) {
   const rank = {
-    instrument: 0,
-    act: 1,
+    opener: 0,
+    act: 0,
+    instrument: 1,
     order_type: 2,
     size_frame: 3,
     size: 4,
@@ -163,12 +164,18 @@ export function kindRank(kind) {
   return rank[kind] ?? 9;
 }
 
-function isBoostToken(term) {
+function isBoostToken(term, kind) {
   const trimmed = String(term || "").trim();
-  return trimmed.length >= 2 && !/\s/.test(trimmed) && trimmed.toLowerCase() !== "if";
+  if (trimmed.length < 2 || trimmed.toLowerCase() === "if") return false;
+  const words = trimmed.split(/\s+/).filter(Boolean).length;
+  if (words === 0 || words > 3) return false;
+  if (words > 1) {
+    return kind === "act" || kind === "opener";
+  }
+  return true;
 }
 
-/** Single-token, non-confusable surfaces for Deepgram keywords. */
+/** Command and question openers first, then instruments. Phrases allowed. */
 export function ontologyKeyterms() {
   const ranked = [...ontologyEntries()]
     .filter((row) => row.kind !== "confusable" && channelsOf(row).includes("speech"))
@@ -181,7 +188,7 @@ export function ontologyKeyterms() {
   const out = [];
   for (const row of ranked) {
     const term = String(row.surface_form || "").trim();
-    if (!isBoostToken(term)) continue;
+    if (!isBoostToken(term, row.kind)) continue;
     const key = term.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);

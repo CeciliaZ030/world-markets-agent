@@ -786,6 +786,36 @@ pub fn transcribe_live(account_id: u64, body: &Value) -> Result<Value, String> {
     crate::voice::transcribe_live(account_id, body)
 }
 
+pub fn deepgram_ready() -> bool {
+    crate::stt::deepgram_configured()
+}
+
+/// Same keyterm seed as ingest, for live HTTP fallback and the streaming proxy.
+pub fn voice_stream_keyterms(account_id: u64) -> Vec<String> {
+    crate::voice::voice_keyterms_for(account_id)
+}
+
+/// Instant keyterms for the live WebSocket: never blocks on brain or chain.
+pub fn voice_stream_keyterms_fast(account_id: u64) -> Vec<String> {
+    crate::voice::voice_stream_keyterms_fast(account_id)
+}
+
+pub fn voice_keyterm_boosts(keyterms: &[String]) -> Vec<String> {
+    crate::stt::keyterm_params(keyterms)
+}
+
+pub fn deepgram_stream_query(sample_rate: u32) -> Vec<(&'static str, String)> {
+    crate::stt::deepgram_stream_query(sample_rate)
+}
+
+pub fn deepgram_replace_pairs() -> &'static [(&'static str, &'static str)] {
+    crate::stt::deepgram_replace_pairs()
+}
+
+pub fn stream_transcript_text(value: &Value) -> Option<(String, bool)> {
+    crate::stt::stream_transcript(value)
+}
+
 pub fn ontology_summary() -> Result<Value, String> {
     BrainClient::from_env().ontology_summary()
 }

@@ -10,6 +10,7 @@ process.env.WORLD_BRAIN_DIR = dir;
 const {
   channelsOf,
   entryCounts,
+  instrumentAlias,
   ontologyEntries,
   ontologyFingerprint,
   ontologyFrames,
@@ -27,8 +28,8 @@ const {
 const { ingestUtterance, setConsent, upsertLexicon } = await import("../src/voice.js");
 const { handleHeard, __testables } = await import("../src/cant.js");
 
-test("version stays 2 and confusables are speech-only", () => {
-  assert.equal(ONTOLOGY_VERSION, 2);
+test("version stays 3 and confusables are speech-only", () => {
+  assert.equal(ONTOLOGY_VERSION, 3);
   for (const row of ontologyEntries()) {
     if (row.kind === "confusable") {
       assert.deepEqual(channelsOf(row), ["speech"]);
@@ -67,7 +68,7 @@ test("snapshot is append-only on fingerprint change", () => {
   assert.equal(again.fingerprint, first.fingerprint);
   assert.equal(again.ts, first.ts);
   const summary = ontologySummary();
-  assert.equal(summary.version, 2);
+  assert.equal(summary.version, 3);
   assert.equal(summary.last_snapshot.ts, first.ts);
   assert.ok(summary.fingerprint_short);
 });
@@ -109,22 +110,31 @@ test("extractEntity uses instrument slot surface and skips cancel these", () => 
   const { extractEntity } = __testables();
   assert.equal(
     extractEntity("buy fifty dollars worth of ether", [
-      { kind: "instrument", surface: "ether", target: "ETH", source: "alias" },
+      { kind: "instrument", surface: "ether", target: "WETH", source: "alias" },
     ]),
-    "eth",
+    "weth",
   );
   assert.equal(
     extractEntity("buy fifty dollars worth of ETH", [
-      { kind: "instrument", surface: "ether", target: "ETH", source: "alias" },
+      { kind: "instrument", surface: "ETH", target: "WETH", source: "alias" },
     ]),
-    "eth",
+    "weth",
   );
   assert.equal(extractEntity("cancel these watches", []), null);
   const heard = handleHeard("ont-3", {
     text: "cancel these watches",
-    universe: [{ symbol: "ETH", name: "Ether" }],
+    universe: [{ symbol: "WETH", name: "Wrapped Ether" }],
   });
   assert.notEqual(heard.kind, "near_match");
+});
+
+test("eth ether ethereum alias to weth like btc aliases to wbtc", () => {
+  assert.equal(instrumentAlias("eth"), "WETH");
+  assert.equal(instrumentAlias("ether"), "WETH");
+  assert.equal(instrumentAlias("ethereum"), "WETH");
+  assert.equal(instrumentAlias("weth"), "WETH");
+  assert.equal(instrumentAlias("btc"), "WBTC");
+  assert.equal(instrumentAlias("bitcoin"), "WBTC");
 });
 
 test("order_type surfaces include market limit twap dca", () => {

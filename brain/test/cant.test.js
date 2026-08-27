@@ -95,6 +95,27 @@ test("in-book asset does not create a cant row", () => {
   assert.equal(listInstructions(account).filter((row) => row.status === "cant").length, 0);
 });
 
+test("eth ether ethereum resolve on a World book that only lists WETH", () => {
+  const world = [
+    { symbol: "WETH", name: "Wrapped Ether" },
+    { symbol: "WBTC", name: "Wrapped Bitcoin" },
+  ];
+  const account = "cant-5-world";
+  for (const text of [
+    "Buy $50 of ETH",
+    "Buy $50 of eth",
+    "Buy $50 of ether",
+    "Buy $50 of ethereum",
+    "Buy $50 of BTC",
+    "Buy $50 of bitcoin",
+  ]) {
+    const out = handleHeard(account, { text, universe: world });
+    assert.equal(out.kind, "unmatched", text);
+    assert.equal(out.skip_llm, false, text);
+  }
+  assert.equal(listInstructions(account).filter((row) => row.status === "cant").length, 0);
+});
+
 test("phonetic near-match still offers book names", () => {
   const account = "cant-6";
   const first = heard(account, "Buy $50 of etherium");

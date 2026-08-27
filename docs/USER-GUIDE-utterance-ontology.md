@@ -14,11 +14,13 @@ That file is compiled into the plugin and also loaded by brain. There is no seco
 
 The normalizer:
 
-- Rewrites exact aliases on **both** channels (`ether` → `ETH`).
-- **Proposes** speech confusables (`beef` → ETH) and never silently maps them.
+- Rewrites exact aliases on **both** channels (`ether` → `WETH`, `bitcoin` → `WBTC`).
+- **Proposes** speech confusables (`beef` → WETH) and never silently maps them.
 - Does **not** apply speech confusables on typed text (`buy fifty dollars worth of beef` stays `beef`).
-- Slot-gates control phrases: `cancel these watches` / `watch these` do not propose ETH.
+- Slot-gates control phrases: `cancel these watches` / `watch these` do not propose WETH.
 - Speech-only size repair: `$550` / `550` in a buy/sell + worth-of frame → `fifty`. Typed `550` stays `550`.
+- Speech-only opener repair: a transcript that starts with a number (`5.05 ETH`, `5 ETH`) and has no command/question word → `buy 5 WETH`. “buy 5” is often fused to `5.05` because *buy* and *five* share a diphthong. Typed `5.05 ETH` is unchanged.
+- Speech-only ETH/eight collapse: `five five eight` / `58` / `buy 5 eight` → `buy 5 WETH`. “eth” is heard as “eight”; SOL does not sound like a digit so `buy 5 SOL` is left alone. Typed `58` stays `58`.
 - Attaches grammar (`matched` / `partial` / `none`) and an action IR for **logging**. IR does not place a trade and is not stuffed into the LLM system prompt.
 
 Per-account confirmations still go to the **lexicon** under the brain data dir, not into git.
@@ -29,7 +31,7 @@ Per-account confirmations still go to the **lexicon** under the brain data dir, 
 - The Mini App never places orders. Confirm still happens in the agent thread.
 - Grammar “matched” is not auto-execute.
 - Do not put the ontology dump into the skill / LLM prompt.
-- Hold-to-talk UX, STT model (`nova-2`), ledger layout, and `aomi-run` dispatch are unchanged by this page.
+- Hold-to-talk UX, STT model (`nova-3`), ledger layout, and `aomi-run` dispatch are unchanged by this page.
 
 ## How to open the analytics page
 
@@ -76,14 +78,16 @@ Same sentence, two inputs:
 
 | You say / type | Speech | Text |
 |---|---|---|
-| `buy fifty dollars worth of ETH` | normalized ETH, grammar matched | same |
-| `buy fifty dollars worth of ether` | ETH (alias) | ETH (alias) |
-| `buy fifty dollars worth of beef` | stays `beef`, **proposes** ETH | stays `beef`, **no** proposal |
-| `cancel these watches` | no ETH proposal | no ETH proposal |
+| `buy fifty dollars worth of ETH` | normalized WETH, grammar matched | same |
+| `buy fifty dollars worth of ether` | WETH (alias) | WETH (alias) |
+| `buy fifty dollars worth of beef` | stays `beef`, **proposes** WETH | stays `beef`, **no** proposal |
+| `cancel these watches` | no WETH proposal | no WETH proposal |
+| `5.05 ETH` (said “buy 5 ETH”) | `buy 5 WETH` | stays `5.05 WETH` |
+| `five five eight` / `58` (said “buy 5 ETH”) | `buy 5 WETH` | stays `58` |
 
 Typed compose in the Mini App (`type instead` → slide to send) POSTs `/api/v1/mini-app/compose`. Local `?preview=dev` is the same path as the hosted Mini App compose, not a second client-side dictionary.
 
-Hold-to-talk is still `POST /api/v1/mini-app/voice` (Deepgram `nova-2` + keyterms). After STT, the same normalizer runs with `channel: speech`.
+Hold-to-talk is still `POST /api/v1/mini-app/voice` (Deepgram `nova-3` + keyterm prompting). After STT, the same normalizer runs with `channel: speech`.
 
 A successful normalize writes a full record (channel, slots, proposals, grammar, action IR). The agent still sees `normalized_text`. Unknown in-universe names can still wall as `can't` if the live catalog does not trade that symbol — that is catalog, not a missed rewrite.
 
@@ -91,7 +95,7 @@ A successful normalize writes a full record (channel, slots, proposals, grammar,
 
 ### Now
 
-- **version** — `assets/speech_ontology.json` `"version"` (currently 2).
+- **version** — `assets/speech_ontology.json` `"version"` (currently 3).
 - **fingerprint** — hash of entries + frames + repairs. Changes when you edit the JSON.
 - **entries / speech-only / both channels** — speech-only rows are acoustic confusables; omitted `channels` means both speech and text.
 - **last snapshot** — last time brain recorded a version or fingerprint change (boot, not every stats request).
@@ -118,7 +122,7 @@ Top suggestions. Thresholds live in `brain/src/ontology_stats.js`, not in the HT
 | Banner | Meaning | What you do |
 |---|---|---|
 | `promote_confusable` | Same speech pair proposed n≥5 and accept ≥80% | Add a `kind: "confusable"` row with `"channels": ["speech"]`. Keep proposing — do not silent-map. Add the suggested test. |
-| `add_alias` | Unknown instrument-slot token n≥5 (speech or text) | Add `kind: "instrument"` alias (`ether` → `ETH` style). Omit `channels` so it applies to both. |
+| `add_alias` | Unknown instrument-slot token n≥5 (speech or text) | Add `kind: "instrument"` alias (`ether` → `WETH` style). Omit `channels` so it applies to both. |
 | `add_negative_fixture` | Same confusable rejected ≥3 in a non-instrument frame (`cancel these` …) | Do **not** add a rewrite. Add a slot-gate test so it never proposes. |
 | `alias-did-not-land` / `needs_more_n` | After a snapshot bump, that pair still repairs a lot | Check the JSON actually changed, restart brain, wait for more n. |
 | `frame_gap` | grammar-none + has act is rising | The utterance is trade-shaped but no frame matched. Extend `frames` in the JSON, with a test. |
@@ -144,13 +148,13 @@ Accept rate is `accepted / proposed` (confirms vs how often it was offered).
 ### Entry shapes
 
 ```json
-{ "surface_form": "ether", "normalized_target": "ETH", "kind": "instrument", "confidence": 1.0 }
+{ "surface_form": "ether", "normalized_target": "WETH", "kind": "instrument", "confidence": 1.0 }
 ```
 
 Omitted `"channels"` = both speech and text.
 
 ```json
-{ "surface_form": "beef", "normalized_target": "ETH", "kind": "confusable", "confidence": 1.0, "channels": ["speech"] }
+{ "surface_form": "beef", "normalized_target": "WETH", "kind": "confusable", "confidence": 1.0, "channels": ["speech"] }
 ```
 
 Speech-only. Propose, never rewrite.
@@ -172,7 +176,7 @@ Never copy a one-user confirm into git until the decision queue says the pair is
 Typed (Mini App `type instead`, or `POST /api/v1/mini-app/compose` with a dev session):
 
 - `buy fifty dollars worth of ETH`
-- `buy fifty dollars worth of ether` → record `text` is ETH, `repaired_from` is the ether sentence
+- `buy fifty dollars worth of ether` → record `text` is WETH, `repaired_from` is the ether sentence
 - `cancel these watches` → no proposals
 
 Speech: hold-to-talk the same phrases (needs mic + Deepgram). Confusables should propose, not rewrite.
@@ -186,7 +190,7 @@ Then open the analytics page and check the new snapshot plus speech vs text coun
 | `/dev/ontology` is 404 | Need `?preview=dev`, `MINI_APP_DEV_BYPASS=1`, and Host localhost |
 | Page says brain unreachable | Brain not on `:8788`, or `WORLD_ACCOUNT_ID` missing |
 | No new snapshot after JSON edit | Restart brain; fingerprint is of parsed entries/frames/repairs, not file whitespace |
-| Typed `beef` became ETH | Bug — text must not apply speech confusables |
-| `cancel these` proposed ETH | Slot-gate regression — add/keep a negative fixture |
+| Typed `beef` became WETH | Bug — text must not apply speech confusables |
+| `cancel these` proposed WETH | Slot-gate regression — add/keep a negative fixture |
 | `ether` stayed ether | Alias missing or mini-app/plugin not rebuilt after JSON change |
 | Promote banner but you already added the row | `alias-did-not-land` — confirm snapshot fingerprint matches the file you think is loaded |

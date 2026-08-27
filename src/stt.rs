@@ -1,6 +1,6 @@
 //! Speech-to-text for Mini App / chat voice ingest.
 //!
-//! Deepgram is required for F11 keyterm boost. Whisper is a fallback that
+//! Deepgram Nova-3 is required for F11 keyterm prompting. Whisper is a fallback that
 //! transcribes but cannot apply the lexicon to the recognizer.
 
 use serde_json::Value;
@@ -74,7 +74,11 @@ pub fn transcribe(audio: &[u8], mime: &str, keyterms: &[String]) -> Result<Trans
 }
 
 /// Faster partial captions: no endpointing/punctuation so words land before a pause.
-pub fn transcribe_partial(audio: &[u8], mime: &str, keyterms: &[String]) -> Result<Transcript, SttError> {
+pub fn transcribe_partial(
+    audio: &[u8],
+    mime: &str,
+    keyterms: &[String],
+) -> Result<Transcript, SttError> {
     transcribe_with(audio, mime, keyterms, true)
 }
 
@@ -129,8 +133,11 @@ fn deepgram(
         .header("Authorization", format!("Token {key}"))
         .header("Content-Type", content_type)
         .body(audio.to_vec());
-    for term in keyword_params(keyterms) {
-        request = request.query(&[("keywords", term)]);
+    for term in keyterm_params(keyterms) {
+        request = request.query(&[("keyterm", term)]);
+    }
+    for (from, to) in deepgram_replace_pairs() {
+        request = request.query(&[("replace", format!("{from}:{to}"))]);
     }
     let keyterm_applied = !keyterms.is_empty();
     let response = request
@@ -149,29 +156,89 @@ fn deepgram(
 }
 
 fn deepgram_query(partial: bool) -> Vec<(&'static str, &'static str)> {
+    // Match the Deepgram playground: nova-3 + smart_format. Partial only skips
+    // punctuation so live HTTP fallback stays a bit faster.
     if partial {
         vec![
-            ("model", "nova-2"),
-            ("smart_format", "false"),
+            ("model", "nova-3"),
+            ("smart_format", "true"),
             ("punctuate", "false"),
-            ("numerals", "false"),
-            ("endpointing", "false"),
-            ("filler_words", "false"),
+            ("language", "en"),
         ]
     } else {
         vec![
-            ("model", "nova-2"),
+            ("model", "nova-3"),
             ("smart_format", "true"),
             ("punctuate", "true"),
+            ("language", "en"),
         ]
     }
 }
 
-/// nova-2 `keywords` intensifier is roughly 1–10. Instruments use 5 so ETH/WETH
-/// beat near-misses; acts and size frames use 3; per-account nicknames stay at 2.
-/// Whisper cannot apply this layer. Phrases with spaces are skipped — nova-2
-/// keywords are single tokens (`worth`, not `worth of`).
-fn keyword_params(keyterms: &[String]) -> Vec<String> {
+pub(crate) fn deepgram_stream_query(sample_rate: u32) -> Vec<(&'static str, String)> {
+    let rate = sample_rate.clamp(8_000, 48_000).to_string();
+    vec![
+        ("model", "nova-3".into()),
+        ("encoding", "linear16".into()),
+        ("sample_rate", rate),
+        ("channels", "1".into()),
+        ("interim_results", "true".into()),
+        ("smart_format", "true".into()),
+        ("language", "en".into()),
+    ]
+}
+
+/// Exact Deepgram `replace` pairs. "buy 5 eth" is often emitted as "five five eight".
+pub(crate) fn deepgram_replace_pairs() -> &'static [(&'static str, &'static str)] {
+    &[("five five eight", "buy 5 ETH"), ("five eight", "buy 5 ETH")]
+}
+
+/// Live WebSocket Results payload (`channel.alternatives`), not prerecorded `results.channels`.
+pub(crate) fn stream_transcript(value: &Value) -> Option<(String, bool)> {
+    let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+    if kind == "Error" || kind == "UtteranceEnd" || kind == "Metadata" {
+        return None;
+    }
+    let alt = value
+        .pointer("/channel/alternatives/0")
+        .or_else(|| value.pointer("/results/channels/0/alternatives/0"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let text = alt
+        .get("transcript")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return None;
+    }
+    let is_final = value
+        .get("is_final")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || value
+            .get("speech_final")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    Some((text, is_final))
+}
+
+/// Nova-3 `keyterm` is a plain phrase — no `:intensifier` suffix (that is nova-2
+/// `keywords` only, and nova-3 rejects `keywords` with HTTP 400).
+pub(crate) fn keyterm_params(keyterms: &[String]) -> Vec<String> {
+    keyterms
+        .iter()
+        .take(MAX_KEYTERMS)
+        .map(|term| term.trim())
+        .filter(|term| term.len() >= 2)
+        .map(|term| term.to_string())
+        .collect()
+}
+
+/// nova-2 `keywords` intensifier is roughly 1–10. Kept for tests and any
+/// remaining nova-2 callers. Instruments use 5 so ETH/WETH beat near-misses.
+pub(crate) fn keyword_params(keyterms: &[String]) -> Vec<String> {
     keyterms
         .iter()
         .take(MAX_KEYTERMS)
@@ -227,7 +294,7 @@ fn parse_deepgram(value: Value, keyterm_applied: bool) -> Result<Transcript, Stt
         text,
         words,
         lang: "en".to_string(),
-        stt_version: "deepgram:nova-2".to_string(),
+        stt_version: "deepgram:nova-3".to_string(),
         keyterm_applied,
     })
 }
@@ -346,11 +413,67 @@ mod tests {
     }
 
     #[test]
-    fn live_query_disables_endpointing() {
+    fn live_query_uses_nova3() {
         let q = deepgram_query(true);
-        assert!(q.contains(&("endpointing", "false")));
-        assert!(q.contains(&("punctuate", "false")));
-        assert!(q.contains(&("smart_format", "false")));
-        assert!(q.contains(&("numerals", "false")));
+        assert!(q.contains(&("model", "nova-3")));
+        assert!(q.contains(&("smart_format", "true")));
+        assert!(q.contains(&("language", "en")));
+        assert!(!q.iter().any(|(k, _)| *k == "endpointing"));
+    }
+
+    #[test]
+    fn stream_query_asks_for_interims() {
+        let q = deepgram_stream_query(48_000);
+        assert!(
+            q.iter()
+                .any(|(k, v)| *k == "interim_results" && v == "true")
+        );
+        assert!(q.iter().any(|(k, v)| *k == "model" && v == "nova-3"));
+        assert!(q.iter().any(|(k, v)| *k == "encoding" && v == "linear16"));
+        assert!(q.iter().any(|(k, v)| *k == "sample_rate" && v == "48000"));
+        assert!(q.iter().any(|(k, v)| *k == "smart_format" && v == "true"));
+        assert!(!q.iter().any(|(k, _)| *k == "keywords"));
+        assert!(deepgram_replace_pairs().iter().any(|(from, to)| {
+            *from == "five five eight" && *to == "buy 5 ETH"
+        }));
+    }
+
+    #[test]
+    fn keyterm_params_are_plain_phrases() {
+        let params = keyterm_params(&[
+            "ETH".to_string(),
+            "wrapped ether".to_string(),
+            "x".to_string(),
+            "buy".to_string(),
+        ]);
+        assert_eq!(params, vec!["ETH", "wrapped ether", "buy"]);
+        assert!(!params.iter().any(|t| t.contains(':')));
+    }
+
+    #[test]
+    fn stream_transcript_reads_live_payload() {
+        let interim = stream_transcript(&json!({
+            "type": "Results",
+            "is_final": false,
+            "channel": { "alternatives": [{ "transcript": "buy ether" }] }
+        }))
+        .unwrap();
+        assert_eq!(interim, ("buy ether".to_string(), false));
+        let fin = stream_transcript(&json!({
+            "type": "Results",
+            "is_final": true,
+            "speech_final": true,
+            "channel": { "alternatives": [{ "transcript": "buy fifty ether" }] }
+        }))
+        .unwrap();
+        assert_eq!(fin, ("buy fifty ether".to_string(), true));
+        assert!(stream_transcript(&json!({ "type": "Metadata" })).is_none());
+        assert!(
+            stream_transcript(&json!({
+                "type": "Results",
+                "channel": { "alternatives": [{ "transcript": "  " }] }
+            }))
+            .is_none()
+        );
     }
 }

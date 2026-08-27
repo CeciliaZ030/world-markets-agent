@@ -24,6 +24,7 @@
 //! `POST /api/v1/mini-app/compose` (Telegram sendData ingress), never `/ledger*`.
 
 mod auth;
+mod voice_stream;
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -33,6 +34,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
@@ -111,6 +113,7 @@ async fn main() {
         .route("/api/v1/mini-app/ledger", get(ledger_handler))
         .route("/api/v1/mini-app/compose", post(compose_handler))
         .route("/api/v1/mini-app/voice/live", post(voice_live_handler))
+        .route("/api/v1/mini-app/voice/stream", get(voice_stream_handler))
         .route("/api/v1/mini-app/voice", post(voice_handler))
         .route("/api/v1/mini-app/share", post(share_handler))
         .route(
@@ -615,6 +618,16 @@ struct VoiceRequest {
     live_text: Option<String>,
     #[serde(default)]
     duration_secs: Option<f64>,
+    #[serde(default)]
+    finalized: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VoiceStreamQuery {
+    #[serde(default)]
+    sample_rate: Option<u32>,
+    #[serde(default)]
+    access_token: Option<String>,
 }
 
 async fn share_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -718,6 +731,7 @@ async fn voice_handler(
         "text": body.text,
         "live_text": body.live_text,
         "duration_secs": body.duration_secs,
+        "finalized": body.finalized,
         "source": "mini_app",
     });
     match spawn_blocking(move || -> Result<Value, String> {
@@ -871,6 +885,35 @@ async fn voice_handler(
     }
 }
 
+async fn voice_stream_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<VoiceStreamQuery>,
+) -> Response {
+    if !session_ok_with_query(&state, &headers, q.access_token.as_deref()) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let Some(account_id) = state.account_id else {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed");
+    };
+    if !world_markets::mini_app::deepgram_ready() {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "stt_unconfigured");
+    }
+    let key = std::env::var("DEEPGRAM_API_KEY")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if key.is_empty() {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "stt_unconfigured");
+    }
+    let sample_rate = q.sample_rate.unwrap_or(48_000);
+    // Do not wait on brain/portfolio here — that delayed the upgrade by seconds
+    // and the browser then dumped buffered PCM, which Deepgram heard as noise.
+    let keyterms = world_markets::mini_app::voice_stream_keyterms_fast(account_id);
+    ws.on_upgrade(move |socket| voice_stream::proxy(socket, key, sample_rate, keyterms))
+}
+
 fn prompt_with_ir(text: &str, ir: Option<&Value>) -> String {
     let text = text.trim();
     match ir.filter(|value| value.is_object()) {
@@ -1011,12 +1054,26 @@ fn payload_message(payload: &Value) -> String {
 }
 
 fn session_ok(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(token) = bearer_token(headers) else {
+    session_token_ok(state, bearer_token(headers).as_deref())
+}
+
+fn session_ok_with_query(state: &AppState, headers: &HeaderMap, query_token: Option<&str>) -> bool {
+    if session_ok(state, headers) {
+        return true;
+    }
+    session_token_ok(
+        state,
+        query_token.map(str::trim).filter(|token| !token.is_empty()),
+    )
+}
+
+fn session_token_ok(state: &AppState, token: Option<&str>) -> bool {
+    let Some(token) = token else {
         return false;
     };
     let mut sessions = state.sessions.lock().expect("session lock");
     sessions.retain(|_, session| session.expires_at > Instant::now());
-    sessions.contains_key(&token)
+    sessions.contains_key(token)
 }
 
 fn desk_or_session_ok(state: &AppState, headers: &HeaderMap) -> bool {
@@ -1158,6 +1215,9 @@ mod tests {
         let src = include_str!("main.rs");
         assert!(src.contains(r#".route("/api/v1/mini-app/voice", post(voice_handler))"#));
         assert!(src.contains(r#".route("/api/v1/mini-app/voice/live", post(voice_live_handler))"#));
+        assert!(
+            src.contains(r#".route("/api/v1/mini-app/voice/stream", get(voice_stream_handler))"#)
+        );
         assert!(src.contains("ingest_voice_note"));
         assert!(src.contains("transcribe_live"));
         let desk_fn = format!("post_{}_voice", "desk");
@@ -1174,6 +1234,17 @@ mod tests {
         assert!(live.contains("transcribe_live"));
         assert!(!live.contains("ingest_voice_note"));
         assert!(!live.contains("submit_heard"));
+        let stream = src
+            .split("async fn voice_stream_handler")
+            .nth(1)
+            .and_then(|rest| rest.split("fn prompt_with_ir").next())
+            .expect("voice_stream_handler body");
+        assert!(stream.contains("voice_stream::proxy"));
+        assert!(stream.contains("voice_stream_keyterms_fast"));
+        assert!(!stream.contains("spawn_blocking"));
+        assert!(!stream.contains("ingest_voice_note"));
+        assert!(!stream.contains("submit_heard"));
+        assert!(!stream.contains("submit_compose"));
     }
 
     #[test]
@@ -1225,6 +1296,7 @@ mod tests {
         assert!(src.contains("aomi-run"));
         assert!(src.contains("--prompt"));
         assert!(src.contains("live_text"));
+        assert!(src.contains("finalized"));
     }
 
     #[test]

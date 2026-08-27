@@ -100,6 +100,7 @@ const COPY = {
   listening: {
     label: "LISTENING",
     caret: "▌",
+    finalizing: "HEARING YOU",
   },
   homeActs: {
     type: "⌨ type instead",
@@ -259,6 +260,7 @@ const COPY = {
     drafted: "heard — aomi is taking it",
     recording: "recording — release to send",
     starting: "starting mic…",
+    finalizing: "hearing you…",
     sending: "sending to aomi",
     processing: "processing…",
     shortTap: "hold to talk",

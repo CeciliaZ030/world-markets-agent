@@ -25,12 +25,16 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let finalized = body
+        .get("finalized")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let channel = if typed.is_some() {
         Channel::Text
     } else {
         Channel::Speech
     };
-    let mut transcript = if let Some(text) = typed {
+    let transcript = if let Some(text) = typed {
         Transcript {
             text: text.to_string(),
             words: Vec::new(),
@@ -38,23 +42,21 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
             stt_version: String::new(),
             keyterm_applied: false,
         }
-    } else {
-        let extra = seed_keyterms(account_id);
-        let keyterms = brain
-            .voice_keyterms(account_id, &extra)
-            .unwrap_or_else(|_| extra.clone());
-        let audio = decode_audio(body)?;
-        let mime = body
-            .get("mime")
-            .and_then(Value::as_str)
-            .unwrap_or("audio/webm");
-        stt::transcribe(&audio, mime, &keyterms).map_err(stt_message)?
-    };
-    if typed.is_none() {
+    } else if finalized {
         if let Some(live) = live_text {
-            transcript.text = choose_transcript(&transcript.text, Some(live));
+            Transcript {
+                text: live.to_string(),
+                words: Vec::new(),
+                lang: "en".to_string(),
+                stt_version: "deepgram:nova-3:stream".to_string(),
+                keyterm_applied: true,
+            }
+        } else {
+            transcribe_ingest_audio(account_id, body, &brain, None)?
         }
-    }
+    } else {
+        transcribe_ingest_audio(account_id, body, &brain, live_text)?
+    };
 
     let catalog = cached_catalog_symbols();
     let lexicon = lexicon_for(account_id, &brain);
@@ -201,34 +203,48 @@ fn transcribe_live_text(account_id: u64, body: &Value) -> String {
         .get("mime")
         .and_then(Value::as_str)
         .unwrap_or("audio/webm");
-    let keyterms = live_keyterms(account_id);
+    let keyterms = voice_stream_keyterms_fast(account_id);
     match stt::transcribe_partial(&audio, mime, &keyterms) {
         Ok(transcript) => transcript.text.trim().to_string(),
         Err(_) => String::new(),
     }
 }
 
-fn live_keyterms(_account_id: u64) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    let mut push = |term: &str| {
-        let t = term.trim();
-        if t.len() < 2 || t.contains(char::is_whitespace) {
-            return;
-        }
-        if seen.insert(t.to_ascii_lowercase()) {
-            out.push(t.to_string());
+fn transcribe_ingest_audio(
+    account_id: u64,
+    body: &Value,
+    brain: &BrainClient,
+    live_text: Option<&str>,
+) -> Result<Transcript, String> {
+    let extra = seed_keyterms(account_id);
+    let keyterms = brain
+        .voice_keyterms(account_id, &extra)
+        .unwrap_or_else(|_| extra.clone());
+    let audio = decode_audio(body)?;
+    let mime = body
+        .get("mime")
+        .and_then(Value::as_str)
+        .unwrap_or("audio/webm");
+    let mut transcript = match stt::transcribe(&audio, mime, &keyterms) {
+        Ok(transcript) => transcript,
+        Err(err) => {
+            if let Some(live) = live_text {
+                Transcript {
+                    text: live.to_string(),
+                    words: Vec::new(),
+                    lang: "en".to_string(),
+                    stt_version: String::new(),
+                    keyterm_applied: false,
+                }
+            } else {
+                return Err(stt_message(err));
+            }
         }
     };
-    for term in [
-        "ETH", "WETH", "BTC", "WBTC", "SOL", "USDC", "USDT", "buy", "sell", "watch", "worth",
-    ] {
-        push(term);
+    if let Some(live) = live_text {
+        transcript.text = choose_transcript(&transcript.text, Some(live));
     }
-    for term in speech_ontology::boostable_keyterms().into_iter().take(24) {
-        push(&term);
-    }
-    out
+    Ok(transcript)
 }
 
 fn decode_live_audio(body: &Value) -> Option<Vec<u8>> {
@@ -237,7 +253,11 @@ fn decode_live_audio(body: &Value) -> Option<Vec<u8>> {
         .decode(raw.trim())
         .ok()?;
     let mime = body.get("mime").and_then(Value::as_str).unwrap_or("");
-    let min = if mime.contains("wav") { MIN_LIVE_WAV } else { MIN_LIVE_AUDIO };
+    let min = if mime.contains("wav") {
+        MIN_LIVE_WAV
+    } else {
+        MIN_LIVE_AUDIO
+    };
     if bytes.len() < min || bytes.len() > 5_000_000 {
         return None;
     }
@@ -268,9 +288,15 @@ fn choose_transcript(stt: &str, live_text: Option<&str>) -> String {
         return stt.to_string();
     };
     if stt.is_empty() || is_placeholder_transcript(stt) {
-        if live.split_whitespace().count() >= 3 || live.len() > stt.len() {
-            return live.to_string();
-        }
+        return live.to_string();
+    }
+    let stt_words = stt.split_whitespace().count();
+    let live_words = live.split_whitespace().count();
+    if live_words > stt_words {
+        return live.to_string();
+    }
+    if live_words == stt_words && live.len() > stt.len() {
+        return live.to_string();
     }
     stt.to_string()
 }
@@ -298,6 +324,53 @@ fn is_placeholder_transcript(text: &str) -> bool {
             | "the"
             | "a"
     )
+}
+
+struct KeytermCache {
+    at: Instant,
+    account_id: u64,
+    terms: Vec<String>,
+}
+
+static KEYTERM_CACHE: Mutex<Option<KeytermCache>> = Mutex::new(None);
+
+fn peek_keyterm_cache(account_id: u64) -> Option<Vec<String>> {
+    let Ok(guard) = KEYTERM_CACHE.lock() else {
+        return None;
+    };
+    let cache = guard.as_ref()?;
+    if cache.account_id == account_id && cache.at.elapsed() < CATALOG_TTL {
+        Some(cache.terms.clone())
+    } else {
+        None
+    }
+}
+
+pub(crate) fn voice_keyterms_for(account_id: u64) -> Vec<String> {
+    if let Some(terms) = peek_keyterm_cache(account_id) {
+        return terms;
+    }
+    let extra = seed_keyterms(account_id);
+    let terms = BrainClient::with_timeout(8)
+        .voice_keyterms(account_id, &extra)
+        .unwrap_or(extra);
+    if let Ok(mut guard) = KEYTERM_CACHE.lock() {
+        *guard = Some(KeytermCache {
+            at: Instant::now(),
+            account_id,
+            terms: terms.clone(),
+        });
+    }
+    terms
+}
+
+/// Live captions cannot wait on brain or portfolio RPC. Use a warm cache, else
+/// the compiled ontology seed (buy/sell/ETH/…) with no network.
+pub(crate) fn voice_stream_keyterms_fast(account_id: u64) -> Vec<String> {
+    if let Some(terms) = peek_keyterm_cache(account_id) {
+        return terms;
+    }
+    speech_ontology::seed_keyterms(&[], &[])
 }
 
 fn seed_keyterms(account_id: u64) -> Vec<String> {
@@ -394,8 +467,29 @@ mod tests {
     }
 
     #[test]
+    fn longer_live_wins_over_short_stt() {
+        assert_eq!(
+            choose_transcript("buy 51", Some("buy fifty dollars of ether")),
+            "buy fifty dollars of ether"
+        );
+    }
+
+    #[test]
     fn empty_stt_uses_live_words() {
         assert_eq!(choose_transcript("", Some("sell all sol")), "sell all sol");
+    }
+
+    #[test]
+    fn finalized_live_text_is_speech_and_skips_stt() {
+        let src = include_str!("voice.rs");
+        let start = src.find("pub fn ingest_voice").expect("ingest_voice");
+        let rest = &src[start..];
+        let end = rest.find("\nconst MIN_LIVE_AUDIO").unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(body.contains("finalized"));
+        assert!(body.contains("deepgram:nova-3:stream"));
+        assert!(body.contains("Channel::Speech"));
+        assert!(body.contains("transcribe_ingest_audio"));
     }
 
     #[test]
@@ -421,6 +515,16 @@ mod tests {
         assert!(!body.contains("submit_heard"));
         assert!(!body.contains("ingest_voice"));
         assert!(body.contains("transcribe_partial"));
+        assert!(body.contains("voice_stream_keyterms_fast"));
+    }
+
+    #[test]
+    fn stream_keyterms_fast_are_local_ontology() {
+        let terms = voice_stream_keyterms_fast(1);
+        let lower: Vec<String> = terms.iter().map(|t| t.to_ascii_lowercase()).collect();
+        assert!(lower.iter().any(|t| t == "buy"), "{lower:?}");
+        assert!(lower.iter().any(|t| t == "eth"), "{lower:?}");
+        assert!(lower.iter().any(|t| t == "sell"), "{lower:?}");
     }
 
     #[test]
@@ -429,7 +533,7 @@ mod tests {
         assert_eq!(repair.text, "buy fifty dollars worth of beef");
         assert!(repair.hits.is_empty());
         assert_eq!(repair.proposed_confusables.len(), 1);
-        assert_eq!(repair.proposed_confusables[0].target, "ETH");
+        assert_eq!(repair.proposed_confusables[0].target, "WETH");
         let typed = speech_ontology::normalize_utterance(
             "buy fifty dollars worth of beef",
             speech_ontology::Channel::Text,

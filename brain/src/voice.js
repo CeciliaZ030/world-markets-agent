@@ -59,7 +59,6 @@ export function keyterms(accountId, extra = []) {
     out.push(term);
   };
   for (const row of extra) push(row);
-  for (const term of ontologyKeyterms()) push(term);
   const ranked = [...data.lexicon].sort((a, b) => {
     const d = kindRank(a.kind) - kindRank(b.kind);
     if (d !== 0) return d;
@@ -69,6 +68,7 @@ export function keyterms(accountId, extra = []) {
     if (row.kind === "confusable") continue;
     push(row.surface_form);
   }
+  for (const term of ontologyKeyterms()) push(term);
   return out.slice(0, MAX_KEYTERMS);
 }
 

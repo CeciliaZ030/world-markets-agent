@@ -872,6 +872,7 @@ function micSvg() {
 function voiceStatusText() {
   const phase = state.voice.phase;
   if (phase === "listening") {
+    if (voiceFinalizing) return C.voice.finalizing || C.voice.processing;
     if (!voiceReady) return C.voice.starting;
     const s = Math.floor((state.voice.heldMs || 0) / 1000);
     const m = Math.floor(s / 60);
@@ -902,11 +903,13 @@ function voiceDockHtml() {
     ledgerZonesHtml() +
     `</div>` +
     `<div class="listen-scrim${phase === "listening" ? " on" : ""}" id="listenScrim">` +
-    `<div class="listen-lab">${escapeHtml(C.listening.label)}</div>` +
+    `<div class="listen-lab">${escapeHtml(
+      voiceFinalizing ? C.listening.finalizing || C.listening.label : C.listening.label,
+    )}</div>` +
     words +
     `</div>` +
     `</div>` +
-    `<div class="voice-dock ${phase}${phase === "listening" && !voiceReady ? " arming" : ""}" id="voiceDock">` +
+    `<div class="voice-dock ${phase}${phase === "listening" && (!voiceReady || voiceFinalizing) ? " arming" : ""}" id="voiceDock">` +
     nudge +
     `<div class="voice-hero-wrap">` +
     voiceLevelHtml() +
@@ -2254,7 +2257,6 @@ let voiceStartedAt = 0;
 let voiceTick = null;
 let voiceNudgeTimer = null;
 let voiceDraftTimer = null;
-let liveRec = null;
 let livePollTimer = null;
 let livePollInFlight = false;
 let livePollSeq = 0;
@@ -2270,6 +2272,12 @@ let voiceLevelRaf = 0;
 let voiceLevelSmoothed = 0;
 let voiceLevelEls = [];
 let voiceWaveBars = [];
+let voiceFinalizing = false;
+let voiceStreamSock = null;
+let voiceStreamReady = false;
+let voiceStreamQueue = [];
+let voiceStreamOnFinal = null;
+let voiceStreamFallbackTimer = null;
 
 function bindVoice() {
   const btn = document.getElementById("voiceBtn");
@@ -2288,6 +2296,7 @@ function bindVoice() {
   });
   btn.addEventListener("pointermove", (ev) => {
     if (voiceMode() !== "hold") return;
+    if (voiceFinalizing) return;
     if (state.voice.phase !== "listening") return;
     if (!pointInCircle(btn, ev.clientX, ev.clientY)) {
       ev.preventDefault();
@@ -2301,6 +2310,7 @@ function bindVoice() {
   });
   btn.addEventListener("pointercancel", (ev) => {
     ev.preventDefault();
+    if (voiceFinalizing) return;
     if (voiceMode() === "hold" && state.voice.phase === "listening") cancelVoice("slide");
   });
 }
@@ -2335,12 +2345,13 @@ function onVoiceDown(btn) {
 
 function onVoiceUp() {
   if (voiceMode() === "tap") return;
+  if (voiceFinalizing) return;
   if (state.voice.phase !== "listening") return;
   if (!voiceReady) {
     cancelVoice("short");
     return;
   }
-  const held = Date.now() - (voiceStartedAt || 0);
+  const held = voiceStartedAt ? Date.now() - voiceStartedAt : 0;
   if (held < 600) {
     cancelVoice("short");
     return;
@@ -2382,7 +2393,7 @@ function syncVoiceDom() {
   const status = document.getElementById("voiceStatus");
   const btn = document.getElementById("voiceBtn");
   const listening = state.voice.phase === "listening";
-  const arming = listening && !voiceReady;
+  const arming = listening && (!voiceReady || voiceFinalizing);
   if (dock) {
     dock.className =
       "voice-dock " +
@@ -2392,6 +2403,12 @@ function syncVoiceDom() {
   }
   if (ledger) ledger.classList.toggle("dim", listening);
   if (scrim) scrim.classList.toggle("on", listening);
+  const lab = scrim && scrim.querySelector(".listen-lab");
+  if (lab) {
+    lab.textContent = voiceFinalizing
+      ? C.listening.finalizing || C.listening.label
+      : C.listening.label;
+  }
   if (status) status.textContent = voiceStatusText();
   if (btn) {
     btn.classList.toggle("hot", listening && !arming);
@@ -2409,6 +2426,11 @@ function startVoiceTick() {
   clearInterval(voiceTick);
   voiceTick = setInterval(() => {
     if (state.voice.phase !== "listening") return;
+    if (voiceFinalizing) {
+      const status = document.getElementById("voiceStatus");
+      if (status) status.textContent = voiceStatusText();
+      return;
+    }
     if (!voiceReady) {
       const status = document.getElementById("voiceStatus");
       if (status) status.textContent = voiceStatusText();
@@ -2590,12 +2612,14 @@ function startAnalyser(stream) {
     livePcmChunks = [];
     livePcmSamples = 0;
     livePcmRate = ctx.sampleRate || 48000;
+    openVoiceStream();
     proc.onaudioprocess = (ev) => {
       if (!voiceWanted) return;
       const input = ev.inputBuffer.getChannelData(0);
       livePcmChunks.push(new Float32Array(input));
       livePcmSamples += input.length;
       markVoiceReady();
+      sendPcmToStream(input);
     };
     liveCapture = { proc, sink, mute };
   } catch (_) {
@@ -2605,6 +2629,20 @@ function startAnalyser(stream) {
 
 function stopAnalyser() {
   disconnectAnalyserNodes();
+}
+
+function snapshotLivePcm() {
+  const snap =
+    typeof window.snapshotPcm === "function"
+      ? window.snapshotPcm(livePcmChunks, livePcmSamples, livePcmRate)
+      : { chunks: livePcmChunks.slice(), samples: livePcmSamples, rate: livePcmRate };
+  return snap;
+}
+
+function wavFromPcm(chunks, sampleRate) {
+  return typeof window.encodeWavFromPcm === "function"
+    ? window.encodeWavFromPcm(chunks, sampleRate)
+    : null;
 }
 
 function liveWordsInnerHtml() {
@@ -2635,55 +2673,192 @@ function paintLiveWords() {
   if (show) words.innerHTML = liveWordsInnerHtml();
 }
 
-function applyLiveTranscript(text) {
+function applyLiveTranscript(text, isFinal) {
   const raw = String(text || "").trim();
+  const paint =
+    typeof window.shouldPaintInterim === "function"
+      ? window.shouldPaintInterim(raw, state.voice.transcriptRaw, isFinal)
+      : Boolean(raw);
+  if (!paint) return;
   const correct = typeof window.correctLiveTranscript === "function" ? window.correctLiveTranscript : null;
   state.voice.transcriptRaw = raw;
   state.voice.transcript = correct ? correct(raw) : raw;
   paintLiveWords();
 }
 
-function startLiveWords() {
-  stopLiveWords();
-  if (!liveWordsOn()) return;
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) return;
-  try {
-    const rec = new SR();
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.onresult = (ev) => {
-      if (liveFromServer) return;
-      let t = "";
-      for (let i = 0; i < ev.results.length; i++) t += ev.results[i][0].transcript;
-      applyLiveTranscript(t);
-    };
-    rec.start();
-    liveRec = rec;
-  } catch (_) {
-    liveRec = null;
+function voiceStreamUrl(sampleRate) {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const token = encodeURIComponent(sessionToken || "");
+  const rate = Number(sampleRate) || livePcmRate || 48000;
+  return `${proto}//${location.host}/api/v1/mini-app/voice/stream?sample_rate=${rate}&access_token=${token}`;
+}
+
+function sendPcmToStream(input) {
+  const toInt16 = window.floatToInt16;
+  const toBytes = window.int16Bytes;
+  if (typeof toInt16 !== "function" || typeof toBytes !== "function") return;
+  const bytes = toBytes(toInt16(input));
+  if (voiceStreamSock && voiceStreamSock.readyState === 1) {
+    try {
+      voiceStreamSock.send(bytes);
+    } catch (_) {
+      /* keep recording */
+    }
+    return;
+  }
+  // Keep the start of the hold (usually "buy"/"sell") until Deepgram is ready.
+  // Do not buffer seconds of audio — a burst dump is heard as noise.
+  if (voiceWanted && typeof window.enqueueStreamPcm === "function") {
+    window.enqueueStreamPcm(voiceStreamQueue, bytes);
+  } else if (voiceWanted && voiceStreamQueue.length < 10) {
+    voiceStreamQueue.push(bytes);
   }
 }
 
-function stopLiveWords() {
-  if (liveRec) {
+function flushVoiceStreamQueue() {
+  if (!voiceStreamSock || voiceStreamSock.readyState !== 1) return;
+  while (voiceStreamQueue.length) {
     try {
-      liveRec.onresult = null;
-      liveRec.stop();
+      voiceStreamSock.send(voiceStreamQueue.shift());
     } catch (_) {
-      /* ignore */
+      break;
     }
   }
-  liveRec = null;
+}
+
+function closeVoiceStream(opts) {
+  voiceStreamOnFinal = null;
+  voiceStreamReady = false;
+  if (!opts || !opts.keepQueue) voiceStreamQueue = [];
+  if (voiceStreamFallbackTimer) {
+    clearTimeout(voiceStreamFallbackTimer);
+    voiceStreamFallbackTimer = null;
+  }
+  const sock = voiceStreamSock;
+  voiceStreamSock = null;
+  if (!sock) return;
+  try {
+    sock.close();
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function openVoiceStream() {
+  if (
+    voiceStreamSock &&
+    (voiceStreamSock.readyState === 0 || voiceStreamSock.readyState === 1)
+  ) {
+    return;
+  }
+  closeVoiceStream({ keepQueue: true });
+  if (!liveWordsOn() || !sessionToken) {
+    startLivePoll();
+    return;
+  }
+  let sock;
+  try {
+    sock = new WebSocket(voiceStreamUrl(livePcmRate));
+  } catch (_) {
+    startLivePoll();
+    return;
+  }
+  voiceStreamSock = sock;
+  sock.onopen = () => {
+    if (voiceStreamSock !== sock) return;
+    stopLivePoll();
+  };
+  sock.onmessage = (ev) => {
+    if (voiceStreamSock !== sock) return;
+    let msg;
+    try {
+      msg = JSON.parse(ev.data);
+    } catch (_) {
+      return;
+    }
+    if (msg && msg.type === "ready") {
+      voiceStreamReady = true;
+      stopLivePoll();
+      flushVoiceStreamQueue();
+      return;
+    }
+    if (msg && msg.type === "transcript" && msg.text) {
+      liveFromServer = true;
+      applyLiveTranscript(msg.text, Boolean(msg.is_final));
+      if (msg.is_final && voiceStreamOnFinal) {
+        const done = voiceStreamOnFinal;
+        voiceStreamOnFinal = null;
+        done(String(msg.text || "").trim());
+      }
+    }
+    if (msg && msg.type === "error" && !voiceFinalizing) {
+      voiceStreamReady = false;
+      startLivePoll();
+    }
+  };
+  sock.onerror = () => {
+    if (voiceStreamSock !== sock || voiceFinalizing) return;
+    voiceStreamReady = false;
+    startLivePoll();
+  };
+  sock.onclose = () => {
+    if (voiceStreamSock === sock) {
+      voiceStreamSock = null;
+      voiceStreamReady = false;
+    }
+    if (voiceStreamOnFinal) {
+      const done = voiceStreamOnFinal;
+      voiceStreamOnFinal = null;
+      done(state.voice.transcriptRaw || "");
+    }
+  };
+  voiceStreamFallbackTimer = setTimeout(() => {
+    voiceStreamFallbackTimer = null;
+    if (voiceStreamReady || !voiceWanted || voiceFinalizing) return;
+    if (voiceStreamSock && (voiceStreamSock.readyState === 0 || voiceStreamSock.readyState === 1)) {
+      return;
+    }
+    startLivePoll();
+  }, 1500);
+}
+
+function finalizeVoiceStream(timeoutMs) {
+  return new Promise((resolve) => {
+    if (!voiceStreamSock || voiceStreamSock.readyState !== 1) {
+      resolve(state.voice.transcriptRaw || "");
+      return;
+    }
+    let done = false;
+    const finish = (text) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      voiceStreamOnFinal = null;
+      resolve(String(text || "").trim());
+    };
+    voiceStreamOnFinal = finish;
+    try {
+      voiceStreamSock.send(JSON.stringify({ type: "close" }));
+    } catch (_) {
+      finish(state.voice.transcriptRaw || "");
+      return;
+    }
+    const timer = setTimeout(() => finish(state.voice.transcriptRaw || ""), timeoutMs || 2000);
+  });
 }
 
 function shouldLivePoll() {
-  return liveWordsOn() && voiceWanted && state.voice.phase === "listening";
+  return (
+    liveWordsOn() &&
+    voiceWanted &&
+    !voiceStreamReady &&
+    !voiceFinalizing &&
+    state.voice.phase === "listening"
+  );
 }
 
 function stopLivePoll() {
   livePollInFlight = false;
-  liveFromServer = false;
   livePollSeq = 0;
   liveAppliedSeq = 0;
   if (livePollTimer) {
@@ -2694,7 +2869,7 @@ function stopLivePoll() {
 
 function startLivePoll() {
   stopLivePoll();
-  if (!liveWordsOn()) return;
+  if (!liveWordsOn() || voiceStreamReady) return;
   scheduleLivePoll(160);
 }
 
@@ -2703,45 +2878,9 @@ function scheduleLivePoll(delay) {
   livePollTimer = setTimeout(tickLivePoll, delay);
 }
 
-function encodeWavFromPcm(chunks, sampleRate) {
-  let count = 0;
-  for (let i = 0; i < chunks.length; i++) count += chunks[i].length;
-  if (!count) return null;
-  const pcm = new Int16Array(count);
-  let o = 0;
-  for (let c = 0; c < chunks.length; c++) {
-    const src = chunks[c];
-    for (let i = 0; i < src.length; i++) {
-      const s = Math.max(-1, Math.min(1, src[i]));
-      pcm[o++] = s < 0 ? s * 0x8000 : s * 0x7fff;
-    }
-  }
-  const bytes = pcm.byteLength;
-  const buf = new ArrayBuffer(44 + bytes);
-  const view = new DataView(buf);
-  const writeStr = (off, str) => {
-    for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i));
-  };
-  writeStr(0, "RIFF");
-  view.setUint32(4, 36 + bytes, true);
-  writeStr(8, "WAVE");
-  writeStr(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true);
-  view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true);
-  writeStr(36, "data");
-  view.setUint32(40, bytes, true);
-  new Uint8Array(buf, 44).set(new Uint8Array(pcm.buffer));
-  return new Blob([buf], { type: "audio/wav" });
-}
-
 function liveCaptionBlob() {
   if (livePcmSamples >= livePcmRate * 0.18) {
-    const wav = encodeWavFromPcm(livePcmChunks.slice(), livePcmRate);
+    const wav = wavFromPcm(livePcmChunks.slice(), livePcmRate);
     if (wav && wav.size >= 4000) return wav;
   }
   if (voiceRecorder && typeof voiceRecorder.requestData === "function" && voiceRecorder.state === "recording") {
@@ -2783,7 +2922,7 @@ async function tickLivePoll() {
     const text = String((out && out.text) || "").trim();
     if (text) {
       liveFromServer = true;
-      applyLiveTranscript(text);
+      applyLiveTranscript(text, false);
     }
   } catch (_) {
     /* keep last caption */
@@ -2793,6 +2932,20 @@ async function tickLivePoll() {
   }
 }
 
+function waitLivePollIdle(ms) {
+  const start = Date.now();
+  return new Promise((resolve) => {
+    const tick = () => {
+      if (!livePollInFlight || Date.now() - start >= ms) {
+        resolve();
+        return;
+      }
+      setTimeout(tick, 40);
+    };
+    tick();
+  });
+}
+
 function markVoiceReady() {
   if (voiceReady || !voiceWanted || state.voice.phase !== "listening") return;
   if (!voiceCaptureArmed) return;
@@ -2800,7 +2953,7 @@ function markVoiceReady() {
   voiceReadyTimer = null;
   voiceReady = true;
   voiceStartedAt = Date.now();
-  startLivePoll();
+  openVoiceStream();
   haptic("impact", "light");
   const btn = document.getElementById("voiceBtn");
   if (btn) btn.classList.add("hot");
@@ -2816,6 +2969,9 @@ function beginListening(btn) {
   voiceWanted = true;
   voiceReady = false;
   voiceCaptureArmed = false;
+  voiceFinalizing = false;
+  voiceStreamReady = false;
+  voiceStreamQueue = [];
   clearTimeout(voiceReadyTimer);
   voiceReadyTimer = null;
   voiceChunks = [];
@@ -2836,9 +2992,6 @@ function beginListening(btn) {
     .getUserMedia({
       audio: {
         channelCount: 1,
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
       },
     })
     .catch(() => navigator.mediaDevices.getUserMedia({ audio: true }))
@@ -2897,12 +3050,14 @@ function closeCaptureImmediate() {
   voiceWanted = false;
   voiceReady = false;
   voiceCaptureArmed = false;
+  voiceFinalizing = false;
+  voiceStartedAt = 0;
   clearTimeout(voiceReadyTimer);
   voiceReadyTimer = null;
   clearInterval(voiceTick);
   voiceTick = null;
   stopLivePoll();
-  stopLiveWords();
+  closeVoiceStream();
   stopAnalyser();
   if (voiceStream) {
     voiceStream.getTracks().forEach((t) => t.stop());
@@ -2924,6 +3079,7 @@ function teardownVoice() {
 }
 
 function cancelVoice(reason) {
+  if (voiceFinalizing) return;
   teardownVoice();
   state.voice.phase = "idle";
   state.voice.transcript = "";
@@ -2933,41 +3089,56 @@ function cancelVoice(reason) {
   else if (reason === "short") showNudge(C.voice.shortTap);
 }
 
-function closeRecordingUi(phase, correlation_id, liveText) {
-  closeCaptureImmediate();
-  if (liveText) {
-    landVoiceDraft(liveText, correlation_id);
-  } else {
-    state.voice.phase = phase || "sending";
-    syncVoiceDom();
-  }
+function stopRecorderBlob(recorder, mime, chunks) {
+  return new Promise((resolve) => {
+    if (!recorder || recorder.state === "inactive") {
+      resolve(chunks && chunks.length ? new Blob(chunks.slice(), { type: mime }) : null);
+      return;
+    }
+    recorder.onstop = () => {
+      resolve(new Blob(voiceChunks.slice(), { type: mime }));
+    };
+    try {
+      if (typeof recorder.requestData === "function" && recorder.state === "recording") {
+        recorder.requestData();
+      }
+      recorder.stop();
+    } catch (_) {
+      resolve(chunks && chunks.length ? new Blob(chunks.slice(), { type: mime }) : null);
+    }
+  });
 }
 
-async function submitVoiceBlob(blob, mime, started, liveText, correlation_id) {
-  if (!blob || !blob.size) {
-    if (!liveText) {
-      state.voice.phase = "idle";
-      syncVoiceDom();
-      showToast(C.toasts.voiceEmpty);
-    }
+function preferTranscript(stt, live) {
+  return typeof window.preferHeardTranscript === "function"
+    ? window.preferHeardTranscript(stt, live)
+    : String((stt || live || "")).trim();
+}
+
+async function submitVoiceBlob(blob, mime, started, liveText, correlation_id, extras) {
+  const finalized = Boolean(extras && extras.finalized);
+  if ((!blob || !blob.size) && !liveText) {
+    state.voice.phase = "idle";
+    syncVoiceDom();
+    showToast(C.toasts.voiceEmpty);
     return;
   }
   try {
-    const audio_base64 = await blobToBase64(blob);
+    const audio_base64 = blob && blob.size ? await blobToBase64(blob) : undefined;
     const duration_secs = started ? (Date.now() - started) / 1000 : undefined;
     const out = await api("/api/v1/mini-app/voice", {
       method: "POST",
       body: {
         audio_base64,
-        mime: blob.type || mime,
+        mime: (blob && blob.type) || mime,
         duration_secs,
         live_text: liveText || undefined,
+        finalized: finalized || undefined,
       },
     });
-    const heard = preferTranscript(
-      (out && (out.transcript || out.heard_echo)) || "",
-      liveText,
-    );
+    const heard = String(
+      (out && (out.transcript || out.heard_echo)) || liveText || "",
+    ).trim();
     if (heard) {
       const payload =
         (out && out.send_payload) || {
@@ -2996,28 +3167,25 @@ async function submitVoiceBlob(blob, mime, started, liveText, correlation_id) {
         landVoiceDraft(heard, cid, out && out.instruction_id);
         burstPoll();
       }
-    } else if (!liveText) {
+    } else {
       state.voice.phase = "idle";
       syncVoiceDom();
       showToast((out && out.speech) || C.toasts.voiceEmpty);
     }
   } catch (_) {
-    if (!liveText) {
-      state.voice.phase = "idle";
-      syncVoiceDom();
-      showToast(C.toasts.voiceFailed);
-    } else {
-      showToast(C.toasts.voiceFailed);
-    }
+    state.voice.phase = "idle";
+    syncVoiceDom();
+    showToast(C.toasts.voiceFailed);
   }
 }
 
-function commitVoice() {
+async function commitVoice() {
+  if (voiceFinalizing) return;
   if (!voiceWanted || !voiceReady) {
     cancelVoice("short");
     return;
   }
-  const held = Date.now() - (voiceStartedAt || 0);
+  const held = voiceStartedAt ? Date.now() - voiceStartedAt : 0;
   if (voiceMode() === "hold" && held < 600) {
     cancelVoice("short");
     return;
@@ -3025,42 +3193,43 @@ function commitVoice() {
   const recorder = voiceRecorder;
   const mime = (recorder && recorder.mimeType) || "audio/webm";
   const started = voiceStartedAt;
-  const liveText = state.voice.transcript || "";
   const correlation_id = newId();
-  const chunks = voiceChunks;
+  const webmChunks = voiceChunks.slice();
   haptic("notify", "success");
-  closeRecordingUi("sending", correlation_id, liveText);
-  if (!recorder) {
-    if (liveText) submitVoiceBlob(new Blob(chunks.slice(), { type: mime }), mime, started, liveText, correlation_id);
-    return;
+  voiceFinalizing = true;
+  stopLivePoll();
+  const pcm = snapshotLivePcm();
+  voiceWanted = false;
+  syncVoiceDom();
+  let streamText = "";
+  let usedStream = false;
+  if (voiceStreamSock && voiceStreamSock.readyState === 1) {
+    streamText = await finalizeVoiceStream(2000);
+    usedStream = Boolean(streamText);
+    if (streamText) applyLiveTranscript(streamText, true);
+  } else {
+    await waitLivePollIdle(800);
   }
-  const finish = (blob) => {
-    voiceRecorder = null;
-    voiceChunks = [];
-    submitVoiceBlob(blob, mime, started, liveText, correlation_id);
-  };
-  recorder.onstop = () => {
-    finish(new Blob(voiceChunks.slice(), { type: mime }));
-  };
-  try {
-    if (typeof recorder.requestData === "function" && recorder.state === "recording") {
-      recorder.requestData();
+  const liveText = streamText || state.voice.transcriptRaw || state.voice.transcript || "";
+  const wav = wavFromPcm(pcm.chunks, pcm.rate);
+  let blob = wav;
+  if (!blob || !blob.size) {
+    blob = await stopRecorderBlob(recorder, mime, webmChunks);
+  } else if (recorder && recorder.state !== "inactive") {
+    try {
+      recorder.stop();
+    } catch (_) {
+      /* archive optional */
     }
-    recorder.stop();
-  } catch (_) {
-    finish(new Blob(chunks.slice(), { type: mime }));
   }
-}
-
-function preferTranscript(stt, live) {
-  const heard = String(stt || "").trim();
-  const liveText = String(live || "").trim();
-  if (!liveText) return heard;
-  const stub = /^(hi|hello|hey|thanks|thank you|thanks for watching|you|hmm|um|uh|yes|yeah|ok|okay|the|a)[.!?]?$/i;
-  if (!heard || stub.test(heard)) {
-    if (liveText.split(/\s+/).length >= 3 || liveText.length > heard.length) return liveText;
-  }
-  return heard;
+  closeCaptureImmediate();
+  voiceRecorder = null;
+  voiceChunks = [];
+  state.voice.phase = "sending";
+  syncVoiceDom();
+  await submitVoiceBlob(blob, (blob && blob.type) || mime, started, liveText, correlation_id, {
+    finalized: usedStream,
+  });
 }
 
 function landVoiceDraft(text, correlation_id, instruction_id) {
@@ -3694,13 +3863,7 @@ async function loadChartView(params) {
 function warmMic() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
   navigator.mediaDevices
-    .getUserMedia({
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-      },
-    })
+    .getUserMedia({ audio: true })
     .then((stream) => stream.getTracks().forEach((t) => t.stop()))
     .catch(() => {
       /* permission prompt happens on first hold */
