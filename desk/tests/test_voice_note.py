@@ -3,7 +3,7 @@ from fastapi.testclient import TestClient
 from desk.config import DeskConfig
 from desk.persist import Store
 from desk.server import create_app
-from desk.stt import SttError, transcribe
+from desk.stt import SttError, transcribe, _content_type
 from stub_broker import StubBroker
 
 
@@ -45,3 +45,10 @@ def test_transcribe_without_keys(monkeypatch):
         raise AssertionError
     except SttError as exc:
         assert "not configured" in str(exc)
+
+
+def test_content_type_sniffs_wav_over_a_webm_label():
+    wav = b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 8
+    assert _content_type(wav, "audio/webm") == "audio/wav"
+    assert _content_type(b"OggS....", None) == "audio/ogg"
+    assert _content_type(b"???", "audio/mp4") == "audio/mp4"

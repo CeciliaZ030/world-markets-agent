@@ -78,7 +78,12 @@ async fn proxy_inner(
                                 .map_err(|err| err.to_string())?;
                         }
                         Some(Ok(Message::Text(text))) => {
-                            if wants_close(text.as_str()) {
+                            if wants_finalize(text.as_str()) {
+                                deepgram
+                                    .send(DgMessage::Text(r#"{"type":"Finalize"}"#.into()))
+                                    .await
+                                    .map_err(|err| err.to_string())?;
+                            } else if wants_close(text.as_str()) {
                                 deepgram
                                     .send(DgMessage::Text(r#"{"type":"CloseStream"}"#.into()))
                                     .await
@@ -148,13 +153,19 @@ async fn proxy_inner(
 }
 
 fn wants_close(text: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<Value>(text) else {
-        return false;
-    };
-    value
+    command_type(text).is_some_and(|kind| kind.eq_ignore_ascii_case("close"))
+}
+
+fn wants_finalize(text: &str) -> bool {
+    command_type(text).is_some_and(|kind| kind.eq_ignore_ascii_case("finalize"))
+}
+
+fn command_type(text: &str) -> Option<String> {
+    serde_json::from_str::<Value>(text)
+        .ok()?
         .get("type")
         .and_then(Value::as_str)
-        .is_some_and(|kind| kind.eq_ignore_ascii_case("close"))
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -165,6 +176,8 @@ mod tests {
     fn close_message_is_detected() {
         assert!(wants_close(r#"{"type":"close"}"#));
         assert!(wants_close(r#"{"type":"Close"}"#));
+        assert!(wants_finalize(r#"{"type":"finalize"}"#));
+        assert!(!wants_finalize(r#"{"type":"close"}"#));
         assert!(!wants_close(r#"{"type":"keepalive"}"#));
         assert!(!wants_close("nope"));
     }
@@ -175,8 +188,13 @@ mod tests {
         assert!(url.starts_with("wss://api.deepgram.com/v1/listen?"));
         assert!(url.contains("model=nova-3"));
         assert!(url.contains("interim_results=true"));
+        assert!(url.contains("endpointing=false"));
         assert!(url.contains("encoding=linear16"));
         assert!(url.contains("sample_rate=48000"));
+        assert!(url.contains("channels=1"));
+        let native = listen_url(44_100, &[]);
+        assert!(native.contains("sample_rate=44100"));
+        assert!(!native.contains("sample_rate=48000"));
         assert!(url.contains("keyterm="));
         assert!(url.contains("replace="));
         assert!(!url.contains("keywords="));

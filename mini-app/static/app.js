@@ -110,6 +110,15 @@ function liveWordsOn() {
   return state.flags.live_words !== false;
 }
 
+function showLiveWords() {
+  if (!liveWordsOn()) return false;
+  if (state.voice.phase === "listening" || voiceFinalizing) return true;
+  return (
+    state.voice.phase === "sending" &&
+    Boolean(state.voice.transcriptRaw || state.voice.transcript)
+  );
+}
+
 function isVoiceHome() {
   return voiceHomeOn() && state.view === "main" && state.tab === "ledger" && !state.compact;
 }
@@ -780,7 +789,14 @@ function syncTgBackButton() {
 }
 
 function paint() {
-  if (state.voice && state.voice.phase === "listening") return;
+  if (
+    state.voice &&
+    (state.voice.phase === "listening" ||
+      state.voice.phase === "sending" ||
+      voiceFinalizing)
+  ) {
+    return;
+  }
   if (state.view === "chart") return;
   if (state.view === "compose") return renderCompose();
   if (state.view === "sent") return renderSent();
@@ -894,15 +910,15 @@ function voiceDockHtml() {
     ? `<div class="voice-nudge" id="voiceNudge">${escapeHtml(state.voice.nudge)}</div>`
     : `<div class="voice-nudge" id="voiceNudge" hidden></div>`;
   const words = `<div class="listen-words" id="liveWords"${
-    liveWordsOn() && phase === "listening" ? "" : " hidden"
+    showLiveWords() ? "" : " hidden"
   }>${liveWordsInnerHtml()}</div>`;
   const typePulse = state.voice.typePulse ? " type-pulse" : "";
   return (
     `<div class="home-ledger-wrap">` +
-    `<div class="home-ledger${phase === "listening" ? " dim" : ""}" id="homeLedger">` +
+    `<div class="home-ledger${phase === "listening" || voiceFinalizing || phase === "sending" ? " dim" : ""}" id="homeLedger">` +
     ledgerZonesHtml() +
     `</div>` +
-    `<div class="listen-scrim${phase === "listening" ? " on" : ""}" id="listenScrim">` +
+    `<div class="listen-scrim${phase === "listening" || voiceFinalizing || phase === "sending" ? " on" : ""}" id="listenScrim">` +
     `<div class="listen-lab">${escapeHtml(
       voiceFinalizing ? C.listening.finalizing || C.listening.label : C.listening.label,
     )}</div>` +
@@ -2265,6 +2281,7 @@ let liveFromServer = false;
 let livePcmChunks = [];
 let livePcmSamples = 0;
 let livePcmRate = 48000;
+let liveStreamRate = 48000;
 let liveCapture = null;
 let voiceAnalyser = null;
 let voiceAudioCtx = null;
@@ -2273,11 +2290,14 @@ let voiceLevelSmoothed = 0;
 let voiceLevelEls = [];
 let voiceWaveBars = [];
 let voiceFinalizing = false;
+let voiceFlushing = false;
+let voiceFlushWait = null;
 let voiceStreamSock = null;
 let voiceStreamReady = false;
 let voiceStreamQueue = [];
 let voiceStreamOnFinal = null;
 let voiceStreamFallbackTimer = null;
+let voiceHeardCommitted = "";
 
 function bindVoice() {
   const btn = document.getElementById("voiceBtn");
@@ -2298,7 +2318,7 @@ function bindVoice() {
     if (voiceMode() !== "hold") return;
     if (voiceFinalizing) return;
     if (state.voice.phase !== "listening") return;
-    if (!pointInCircle(btn, ev.clientX, ev.clientY)) {
+    if (!pointInVoiceControl(btn, ev.clientX, ev.clientY, slideCancelPad())) {
       ev.preventDefault();
       cancelVoice("slide");
     }
@@ -2311,18 +2331,31 @@ function bindVoice() {
   btn.addEventListener("pointercancel", (ev) => {
     ev.preventDefault();
     if (voiceFinalizing) return;
-    if (voiceMode() === "hold" && state.voice.phase === "listening") cancelVoice("slide");
+    if (voiceMode() !== "hold" || state.voice.phase !== "listening") return;
+    const held = voiceStartedAt ? Date.now() - voiceStartedAt : 0;
+    if (voiceReady && held >= 600) {
+      commitVoice();
+      return;
+    }
+    cancelVoice("slide");
   });
 }
 
+function slideCancelPad() {
+  const pad = Number(window.SLIDE_CANCEL_PAD_PX);
+  return Number.isFinite(pad) ? pad : 48;
+}
+
+function pointInVoiceControl(btn, x, y, extra) {
+  if (typeof window.pointInVoiceHit === "function") {
+    const r = btn.getBoundingClientRect();
+    return window.pointInVoiceHit(r.width, r.height, x, y, r.left, r.top, extra);
+  }
+  return pointInCircle(btn, x, y);
+}
+
 function pointInCircle(btn, x, y) {
-  const r = btn.getBoundingClientRect();
-  const cx = r.left + r.width / 2;
-  const cy = r.top + r.height / 2;
-  const rad = Math.min(r.width, r.height) / 2;
-  const dx = x - cx;
-  const dy = y - cy;
-  return dx * dx + dy * dy <= rad * rad;
+  return pointInVoiceControl(btn, x, y, 0);
 }
 
 function onVoiceDown(btn) {
@@ -2393,6 +2426,7 @@ function syncVoiceDom() {
   const status = document.getElementById("voiceStatus");
   const btn = document.getElementById("voiceBtn");
   const listening = state.voice.phase === "listening";
+  const overlay = listening || voiceFinalizing || state.voice.phase === "sending";
   const arming = listening && (!voiceReady || voiceFinalizing);
   if (dock) {
     dock.className =
@@ -2401,8 +2435,8 @@ function syncVoiceDom() {
       (arming ? " arming" : "") +
       (voiceAnalyser && !arming ? " live-level" : "");
   }
-  if (ledger) ledger.classList.toggle("dim", listening);
-  if (scrim) scrim.classList.toggle("on", listening);
+  if (ledger) ledger.classList.toggle("dim", overlay);
+  if (scrim) scrim.classList.toggle("on", overlay);
   const lab = scrim && scrim.querySelector(".listen-lab");
   if (lab) {
     lab.textContent = voiceFinalizing
@@ -2416,7 +2450,7 @@ function syncVoiceDom() {
   }
   const words = document.getElementById("liveWords");
   if (words) {
-    const show = liveWordsOn() && listening;
+    const show = showLiveWords();
     words.hidden = !show;
     if (show) words.innerHTML = liveWordsInnerHtml();
   }
@@ -2447,13 +2481,17 @@ function ensureAudioCtx() {
   if (!AC) return null;
   if (!voiceAudioCtx || voiceAudioCtx.state === "closed") {
     try {
-      voiceAudioCtx = new AC({ latencyHint: "interactive" });
+      voiceAudioCtx = new AC({ latencyHint: "interactive", sampleRate: 48000 });
     } catch (_) {
       try {
-        voiceAudioCtx = new AC();
+        voiceAudioCtx = new AC({ latencyHint: "interactive" });
       } catch (__) {
-        voiceAudioCtx = null;
-        return null;
+        try {
+          voiceAudioCtx = new AC();
+        } catch (___) {
+          voiceAudioCtx = null;
+          return null;
+        }
       }
     }
   }
@@ -2611,15 +2649,20 @@ function startAnalyser(stream) {
     mute.connect(ctx.destination);
     livePcmChunks = [];
     livePcmSamples = 0;
-    livePcmRate = ctx.sampleRate || 48000;
+    livePcmRate = Math.round(ctx.sampleRate || 48000);
+    liveStreamRate =
+      typeof window.declaredStreamRate === "function"
+        ? window.declaredStreamRate(livePcmRate)
+        : livePcmRate;
     openVoiceStream();
     proc.onaudioprocess = (ev) => {
-      if (!voiceWanted) return;
+      if (!voiceWanted && !voiceFlushing) return;
       const input = ev.inputBuffer.getChannelData(0);
       livePcmChunks.push(new Float32Array(input));
       livePcmSamples += input.length;
       markVoiceReady();
       sendPcmToStream(input);
+      if (typeof voiceFlushWait === "function") voiceFlushWait();
     };
     liveCapture = { proc, sink, mute };
   } catch (_) {
@@ -2647,57 +2690,81 @@ function wavFromPcm(chunks, sampleRate) {
 
 function liveWordsInnerHtml() {
   const caret = `<span class="listen-caret">${escapeHtml(C.listening.caret)}</span>`;
-  if (state.voice.phase !== "listening") return caret;
   const raw = state.voice.transcriptRaw || "";
-  if (!raw) return caret;
+  if (!raw) return state.voice.phase === "sending" ? "" : caret;
   const annotate =
     typeof window.annotateLiveTranscript === "function" ? window.annotateLiveTranscript : null;
-  if (!annotate) {
-    return escapeHtml(state.voice.transcript || raw) + caret;
-  }
-  const html = annotate(raw)
-    .map((span) => {
-      const display = escapeHtml(span.display);
-      if (!span.rewritten) return display;
-      return `<s class="listen-from">${escapeHtml(span.surface)}</s> <span class="listen-to">${display}</span>`;
-    })
-    .join(" ");
-  return html + caret;
+  const body = !annotate
+    ? escapeHtml(state.voice.transcript || raw)
+    : annotate(raw)
+        .map((span) => {
+          const display = escapeHtml(span.display);
+          if (!span.rewritten) return display;
+          return `<s class="listen-from">${escapeHtml(span.surface)}</s> <span class="listen-to">${display}</span>`;
+        })
+        .join(" ");
+  if (state.voice.phase === "sending" || voiceFinalizing) return body;
+  return body + caret;
 }
 
 function paintLiveWords() {
   const words = document.getElementById("liveWords");
   if (!words) return;
-  const show = liveWordsOn() && state.voice.phase === "listening";
+  const show = showLiveWords();
   words.hidden = !show;
   if (show) words.innerHTML = liveWordsInnerHtml();
 }
 
-function applyLiveTranscript(text, isFinal) {
+function applyLiveTranscript(text, isFinal, replace) {
   const raw = String(text || "").trim();
-  const paint =
-    typeof window.shouldPaintInterim === "function"
-      ? window.shouldPaintInterim(raw, state.voice.transcriptRaw, isFinal)
-      : Boolean(raw);
-  if (!paint) return;
+  const paintFn =
+    typeof window.shouldPaintInterim === "function" ? window.shouldPaintInterim : null;
   const correct = typeof window.correctLiveTranscript === "function" ? window.correctLiveTranscript : null;
-  state.voice.transcriptRaw = raw;
-  state.voice.transcript = correct ? correct(raw) : raw;
+  let display = raw;
+  if (replace) {
+    if (paintFn && !paintFn(raw, state.voice.transcriptRaw, false)) return;
+    voiceHeardCommitted = "";
+  } else if (typeof window.foldStreamTranscript === "function") {
+    const folded = window.foldStreamTranscript(
+      voiceHeardCommitted,
+      raw,
+      isFinal,
+      state.voice.transcriptRaw,
+    );
+    if (paintFn && !paintFn(folded.display, state.voice.transcriptRaw, isFinal)) return;
+    voiceHeardCommitted = folded.committed;
+    display = folded.display;
+  } else if (paintFn && !paintFn(raw, state.voice.transcriptRaw, isFinal)) {
+    return;
+  }
+  if (!display) return;
+  state.voice.transcriptRaw = display;
+  state.voice.transcript = correct ? correct(display) : display;
   paintLiveWords();
 }
 
 function voiceStreamUrl(sampleRate) {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const token = encodeURIComponent(sessionToken || "");
-  const rate = Number(sampleRate) || livePcmRate || 48000;
+  const rate = Math.round(Number(sampleRate) || liveStreamRate || livePcmRate || 48000);
   return `${proto}//${location.host}/api/v1/mini-app/voice/stream?sample_rate=${rate}&access_token=${token}`;
 }
 
 function sendPcmToStream(input) {
+  if (voiceFinalizing && !voiceFlushing) return;
   const toInt16 = window.floatToInt16;
   const toBytes = window.int16Bytes;
   if (typeof toInt16 !== "function" || typeof toBytes !== "function") return;
-  const bytes = toBytes(toInt16(input));
+  let samples = input;
+  if (
+    typeof window.resampleForStream === "function" &&
+    liveStreamRate &&
+    livePcmRate &&
+    liveStreamRate !== livePcmRate
+  ) {
+    samples = window.resampleForStream(input, livePcmRate, liveStreamRate);
+  }
+  const bytes = toBytes(toInt16(samples));
   if (voiceStreamSock && voiceStreamSock.readyState === 1) {
     try {
       voiceStreamSock.send(bytes);
@@ -2758,7 +2825,7 @@ function openVoiceStream() {
   }
   let sock;
   try {
-    sock = new WebSocket(voiceStreamUrl(livePcmRate));
+    sock = new WebSocket(voiceStreamUrl(liveStreamRate));
   } catch (_) {
     startLivePoll();
     return;
@@ -2785,11 +2852,6 @@ function openVoiceStream() {
     if (msg && msg.type === "transcript" && msg.text) {
       liveFromServer = true;
       applyLiveTranscript(msg.text, Boolean(msg.is_final));
-      if (msg.is_final && voiceStreamOnFinal) {
-        const done = voiceStreamOnFinal;
-        voiceStreamOnFinal = null;
-        done(String(msg.text || "").trim());
-      }
     }
     if (msg && msg.type === "error" && !voiceFinalizing) {
       voiceStreamReady = false;
@@ -2822,29 +2884,43 @@ function openVoiceStream() {
   }, 1500);
 }
 
-function finalizeVoiceStream(timeoutMs) {
+function waitPcmFlushFrames() {
+  const need = Math.max(
+    1,
+    Math.round(Number(window.PCM_FLUSH_FRAMES) || 2),
+  );
+  const limit = Math.max(
+    40,
+    Math.round(Number(window.PCM_FLUSH_MS) || 150),
+  );
   return new Promise((resolve) => {
-    if (!voiceStreamSock || voiceStreamSock.readyState !== 1) {
-      resolve(state.voice.transcriptRaw || "");
-      return;
-    }
+    let got = 0;
     let done = false;
-    const finish = (text) => {
+    const finish = () => {
       if (done) return;
       done = true;
+      voiceFlushWait = null;
       clearTimeout(timer);
-      voiceStreamOnFinal = null;
-      resolve(String(text || "").trim());
+      resolve();
     };
-    voiceStreamOnFinal = finish;
+    voiceFlushWait = () => {
+      got += 1;
+      if (got >= need) finish();
+    };
+    const timer = setTimeout(finish, limit);
+  });
+}
+
+function discardVoiceStream() {
+  voiceStreamOnFinal = null;
+  if (voiceStreamSock && voiceStreamSock.readyState === 1) {
     try {
       voiceStreamSock.send(JSON.stringify({ type: "close" }));
     } catch (_) {
-      finish(state.voice.transcriptRaw || "");
-      return;
+      /* captions are overlay-only */
     }
-    const timer = setTimeout(() => finish(state.voice.transcriptRaw || ""), timeoutMs || 2000);
-  });
+  }
+  closeVoiceStream();
 }
 
 function shouldLivePoll() {
@@ -2922,7 +2998,7 @@ async function tickLivePoll() {
     const text = String((out && out.text) || "").trim();
     if (text) {
       liveFromServer = true;
-      applyLiveTranscript(text, false);
+      applyLiveTranscript(text, false, true);
     }
   } catch (_) {
     /* keep last caption */
@@ -2930,20 +3006,6 @@ async function tickLivePoll() {
     livePollInFlight = false;
     if (shouldLivePoll()) scheduleLivePoll(120);
   }
-}
-
-function waitLivePollIdle(ms) {
-  const start = Date.now();
-  return new Promise((resolve) => {
-    const tick = () => {
-      if (!livePollInFlight || Date.now() - start >= ms) {
-        resolve();
-        return;
-      }
-      setTimeout(tick, 40);
-    };
-    tick();
-  });
 }
 
 function markVoiceReady() {
@@ -2970,8 +3032,11 @@ function beginListening(btn) {
   voiceReady = false;
   voiceCaptureArmed = false;
   voiceFinalizing = false;
+  voiceFlushing = false;
+  voiceFlushWait = null;
   voiceStreamReady = false;
   voiceStreamQueue = [];
+  voiceHeardCommitted = "";
   clearTimeout(voiceReadyTimer);
   voiceReadyTimer = null;
   voiceChunks = [];
@@ -3051,6 +3116,8 @@ function closeCaptureImmediate() {
   voiceReady = false;
   voiceCaptureArmed = false;
   voiceFinalizing = false;
+  voiceFlushing = false;
+  voiceFlushWait = null;
   voiceStartedAt = 0;
   clearTimeout(voiceReadyTimer);
   voiceReadyTimer = null;
@@ -3084,6 +3151,7 @@ function cancelVoice(reason) {
   state.voice.phase = "idle";
   state.voice.transcript = "";
   state.voice.transcriptRaw = "";
+  voiceHeardCommitted = "";
   syncVoiceDom();
   if (reason === "slide") showNudge(C.voice.slideOff);
   else if (reason === "short") showNudge(C.voice.shortTap);
@@ -3109,36 +3177,25 @@ function stopRecorderBlob(recorder, mime, chunks) {
   });
 }
 
-function preferTranscript(stt, live) {
-  return typeof window.preferHeardTranscript === "function"
-    ? window.preferHeardTranscript(stt, live)
-    : String((stt || live || "")).trim();
-}
-
-async function submitVoiceBlob(blob, mime, started, liveText, correlation_id, extras) {
-  const finalized = Boolean(extras && extras.finalized);
-  if ((!blob || !blob.size) && !liveText) {
+async function submitVoiceBlob(blob, mime, started, correlation_id) {
+  if (!blob || !blob.size) {
     state.voice.phase = "idle";
     syncVoiceDom();
     showToast(C.toasts.voiceEmpty);
     return;
   }
   try {
-    const audio_base64 = blob && blob.size ? await blobToBase64(blob) : undefined;
+    const audio_base64 = await blobToBase64(blob);
     const duration_secs = started ? (Date.now() - started) / 1000 : undefined;
     const out = await api("/api/v1/mini-app/voice", {
       method: "POST",
       body: {
         audio_base64,
-        mime: (blob && blob.type) || mime,
+        mime: blob.type || mime,
         duration_secs,
-        live_text: liveText || undefined,
-        finalized: finalized || undefined,
       },
     });
-    const heard = String(
-      (out && (out.transcript || out.heard_echo)) || liveText || "",
-    ).trim();
+    const heard = String((out && (out.transcript || out.heard_echo)) || "").trim();
     if (heard) {
       const payload =
         (out && out.send_payload) || {
@@ -3197,20 +3254,14 @@ async function commitVoice() {
   const webmChunks = voiceChunks.slice();
   haptic("notify", "success");
   voiceFinalizing = true;
+  voiceFlushing = true;
   stopLivePoll();
-  const pcm = snapshotLivePcm();
-  voiceWanted = false;
   syncVoiceDom();
-  let streamText = "";
-  let usedStream = false;
-  if (voiceStreamSock && voiceStreamSock.readyState === 1) {
-    streamText = await finalizeVoiceStream(2000);
-    usedStream = Boolean(streamText);
-    if (streamText) applyLiveTranscript(streamText, true);
-  } else {
-    await waitLivePollIdle(800);
-  }
-  const liveText = streamText || state.voice.transcriptRaw || state.voice.transcript || "";
+  await waitPcmFlushFrames();
+  const pcm = snapshotLivePcm();
+  voiceFlushing = false;
+  voiceWanted = false;
+  discardVoiceStream();
   const wav = wavFromPcm(pcm.chunks, pcm.rate);
   let blob = wav;
   if (!blob || !blob.size) {
@@ -3227,9 +3278,7 @@ async function commitVoice() {
   voiceChunks = [];
   state.voice.phase = "sending";
   syncVoiceDom();
-  await submitVoiceBlob(blob, (blob && blob.type) || mime, started, liveText, correlation_id, {
-    finalized: usedStream,
-  });
+  await submitVoiceBlob(blob, (blob && blob.type) || mime, started, correlation_id);
 }
 
 function landVoiceDraft(text, correlation_id, instruction_id) {
@@ -3434,20 +3483,42 @@ async function refreshLedger() {
         if (row.status === "done") showToast(C.toasts.executed);
       }
     }
-    if ((state.view === "main" || state.view === "sent") && state.voice.phase !== "listening") paint();
+    if (
+      (state.view === "main" || state.view === "sent") &&
+      state.voice.phase !== "listening" &&
+      state.voice.phase !== "sending" &&
+      !voiceFinalizing
+    ) {
+      paint();
+    }
     maybeFlushDue();
     tunePoll();
   } catch (err) {
     if (err.message === "unauthorized") return renderUnauthorized();
     if (!state.ledger.length) state.ledgerStatus = "error";
     else state.ledgerStatus = "stale";
-    if (state.view === "main" && state.voice.phase !== "listening") paint();
+    if (
+      state.view === "main" &&
+      state.voice.phase !== "listening" &&
+      state.voice.phase !== "sending" &&
+      !voiceFinalizing
+    ) {
+      paint();
+    }
   }
 }
 
 function patchLiveClock() {
   maybeFlushDue();
-  if (state.view !== "main" || state.searchOpen || state.voice.phase === "listening") return;
+  if (
+    state.view !== "main" ||
+    state.searchOpen ||
+    state.voice.phase === "listening" ||
+    state.voice.phase === "sending" ||
+    voiceFinalizing
+  ) {
+    return;
+  }
   const hb = isVoiceHome() ? homeHeartbeatText() : heartbeatText();
   document.querySelectorAll(".heartbeat").forEach((el) => {
     el.innerHTML = `<span class="dot ${hb.dot}"></span>${escapeHtml(hb.text)}`;

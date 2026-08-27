@@ -91,7 +91,7 @@ fn transcribe_with(
     if audio.is_empty() {
         return Err(SttError::empty());
     }
-    let content_type = if mime.is_empty() { "audio/webm" } else { mime };
+    let content_type = content_type_for(audio, mime);
     if deepgram_configured() {
         let key = std::env::var("DEEPGRAM_API_KEY")
             .unwrap_or_default()
@@ -156,8 +156,9 @@ fn deepgram(
 }
 
 fn deepgram_query(partial: bool) -> Vec<(&'static str, &'static str)> {
-    // Match the Deepgram playground: nova-3 + smart_format. Partial only skips
-    // punctuation so live HTTP fallback stays a bit faster.
+    // Containerized audio (WAV / WebM / Ogg). Omit encoding, sample_rate, and
+    // channels — Deepgram reads those from the container. Declaring linear16
+    // at 16 kHz on 8 kHz mu-law (or the reverse) yields fluent-but-wrong text.
     if partial {
         vec![
             ("model", "nova-3"),
@@ -175,16 +176,26 @@ fn deepgram_query(partial: bool) -> Vec<(&'static str, &'static str)> {
     }
 }
 
+pub(crate) fn stream_sample_rate_ok(sample_rate: u32) -> bool {
+    (8_000..=48_000).contains(&sample_rate)
+}
+
+/// Raw headerless PCM. `encoding` / `sample_rate` / `channels` must match the
+/// bytes on the wire exactly — never clamp or guess a different rate.
 pub(crate) fn deepgram_stream_query(sample_rate: u32) -> Vec<(&'static str, String)> {
-    let rate = sample_rate.clamp(8_000, 48_000).to_string();
     vec![
         ("model", "nova-3".into()),
         ("encoding", "linear16".into()),
-        ("sample_rate", rate),
+        ("sample_rate", sample_rate.to_string()),
         ("channels", "1".into()),
         ("interim_results", "true".into()),
         ("smart_format", "true".into()),
         ("language", "en".into()),
+        // Hold-to-talk already has an endpoint (pointer up). Default 10ms
+        // silence splits a sentence into spans; the client concatenates
+        // `is_final` results, but disabling endpointing keeps the caption
+        // growing as one utterance until CloseStream.
+        ("endpointing", "false".into()),
     ]
 }
 
@@ -349,6 +360,30 @@ fn whisper(audio: &[u8], content_type: &str, key: &str) -> Result<Transcript, St
     })
 }
 
+fn sniff_audio_type(audio: &[u8]) -> Option<&'static str> {
+    if audio.len() >= 12 && audio.starts_with(b"RIFF") && &audio[8..12] == b"WAVE" {
+        return Some("audio/wav");
+    }
+    if audio.starts_with(b"OggS") {
+        return Some("audio/ogg");
+    }
+    if audio.len() >= 4 && audio[..4] == [0x1a, 0x45, 0xdf, 0xa3] {
+        return Some("audio/webm");
+    }
+    None
+}
+
+fn content_type_for<'a>(audio: &[u8], mime: &'a str) -> &'a str {
+    if let Some(sniffed) = sniff_audio_type(audio) {
+        return sniffed;
+    }
+    if mime.is_empty() {
+        "audio/webm"
+    } else {
+        mime
+    }
+}
+
 fn extension_for(content_type: &str) -> &'static str {
     if content_type.contains("ogg") {
         "ogg"
@@ -431,11 +466,63 @@ mod tests {
         assert!(q.iter().any(|(k, v)| *k == "model" && v == "nova-3"));
         assert!(q.iter().any(|(k, v)| *k == "encoding" && v == "linear16"));
         assert!(q.iter().any(|(k, v)| *k == "sample_rate" && v == "48000"));
+        assert!(q.iter().any(|(k, v)| *k == "channels" && v == "1"));
         assert!(q.iter().any(|(k, v)| *k == "smart_format" && v == "true"));
+        assert!(q.iter().any(|(k, v)| *k == "endpointing" && v == "false"));
         assert!(!q.iter().any(|(k, _)| *k == "keywords"));
         assert!(deepgram_replace_pairs().iter().any(|(from, to)| {
             *from == "five five eight" && *to == "buy 5 ETH"
         }));
+    }
+
+    #[test]
+    fn stream_query_keeps_the_capture_rate() {
+        let q = deepgram_stream_query(44_100);
+        assert_eq!(
+            q.iter()
+                .find(|(k, _)| *k == "sample_rate")
+                .map(|(_, v)| v.as_str()),
+            Some("44100")
+        );
+        assert!(stream_sample_rate_ok(44_100));
+        assert!(stream_sample_rate_ok(16_000));
+        assert!(!stream_sample_rate_ok(0));
+        assert!(!stream_sample_rate_ok(8_000 - 1));
+        assert!(!stream_sample_rate_ok(96_000));
+        let high = deepgram_stream_query(96_000);
+        assert_eq!(
+            high.iter()
+                .find(|(k, _)| *k == "sample_rate")
+                .map(|(_, v)| v.as_str()),
+            Some("96000"),
+            "never advertise 48 kHz for 96 kHz PCM"
+        );
+    }
+
+    #[test]
+    fn prerecorded_query_omits_raw_pcm_hints() {
+        for partial in [false, true] {
+            let q = deepgram_query(partial);
+            assert!(!q.iter().any(|(k, _)| *k == "encoding"));
+            assert!(!q.iter().any(|(k, _)| *k == "sample_rate"));
+            assert!(!q.iter().any(|(k, _)| *k == "channels"));
+        }
+    }
+
+    #[test]
+    fn content_type_sniffs_wav_over_a_webm_label() {
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&[0, 0, 0, 0]);
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(&[0; 8]);
+        assert_eq!(content_type_for(&wav, "audio/webm"), "audio/wav");
+        assert_eq!(content_type_for(b"OggS....", ""), "audio/ogg");
+        assert_eq!(
+            content_type_for(&[0x1a, 0x45, 0xdf, 0xa3, 0, 0], "audio/wav"),
+            "audio/webm"
+        );
+        assert_eq!(content_type_for(b"???", ""), "audio/webm");
+        assert_eq!(content_type_for(b"???", "audio/mp4"), "audio/mp4");
     }
 
     #[test]

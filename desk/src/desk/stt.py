@@ -15,7 +15,7 @@ class SttError(RuntimeError):
 def transcribe(audio: bytes, mime: str | None = None) -> str:
     if not audio:
         raise SttError("empty audio")
-    content_type = mime or "audio/webm"
+    content_type = _content_type(audio, mime)
     deepgram = os.getenv("DEEPGRAM_API_KEY", "").strip()
     if deepgram:
         return _deepgram(audio, content_type, deepgram)
@@ -51,6 +51,16 @@ def _deepgram(audio: bytes, content_type: str, key: str) -> str:
     if not text:
         raise SttError("deepgram returned an empty transcript")
     return text
+
+
+def _content_type(audio: bytes, mime: str | None) -> str:
+    if len(audio) >= 12 and audio.startswith(b"RIFF") and audio[8:12] == b"WAVE":
+        return "audio/wav"
+    if audio.startswith(b"OggS"):
+        return "audio/ogg"
+    if len(audio) >= 4 and audio[:4] == b"\x1a\x45\xdf\xa3":
+        return "audio/webm"
+    return mime or "audio/webm"
 
 
 def _whisper(audio: bytes, content_type: str, key: str) -> str:

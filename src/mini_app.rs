@@ -808,6 +808,10 @@ pub fn deepgram_stream_query(sample_rate: u32) -> Vec<(&'static str, String)> {
     crate::stt::deepgram_stream_query(sample_rate)
 }
 
+pub fn deepgram_stream_sample_rate_ok(sample_rate: u32) -> bool {
+    crate::stt::stream_sample_rate_ok(sample_rate)
+}
+
 pub fn deepgram_replace_pairs() -> &'static [(&'static str, &'static str)] {
     crate::stt::deepgram_replace_pairs()
 }

@@ -908,6 +908,10 @@ async fn voice_stream_handler(
         return json_error(StatusCode::SERVICE_UNAVAILABLE, "stt_unconfigured");
     }
     let sample_rate = q.sample_rate.unwrap_or(48_000);
+    if !world_markets::mini_app::deepgram_stream_sample_rate_ok(sample_rate) {
+        // Do not clamp to a different rate — Deepgram would decode the PCM wrong.
+        return json_error(StatusCode::BAD_REQUEST, "unsupported_sample_rate");
+    }
     // Do not wait on brain/portfolio here — that delayed the upgrade by seconds
     // and the browser then dumped buffered PCM, which Deepgram heard as noise.
     let keyterms = world_markets::mini_app::voice_stream_keyterms_fast(account_id);
