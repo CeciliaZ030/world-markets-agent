@@ -58,7 +58,8 @@ const COPY = {
   },
   zones: {
     needsYou: "NEEDS YOU",
-    inMotion: "IN MOTION",
+    queued: "QUEUED",
+    inMotion: "QUEUED",
     watching: "WATCHING",
     watchingCount: "{w} · {p} paused",
     doneToday: "DONE TODAY",
@@ -77,7 +78,8 @@ const COPY = {
     paused: "paused · resumes only on your word",
     executing: "{type} · slice {i} of {n} · avg {price}",
     executingMarket: "filling · slice {i} of {n} · avg {price}",
-    pendingExecute: "executes in {n}s · × if that's wrong",
+    pendingExecute: "queued · {n}s to cancel if that's wrong",
+    completing: "completing",
     countdown: "{n}",
     pendingPause: "pause sent to thread",
     pendingResume: "resume sent to thread",
@@ -227,7 +229,7 @@ const COPY = {
   launch: {
     label: "SINCE YOU LOOKED",
     needs: "{n} needs you — {what} · confirm waiting in the thread",
-    motion: "{n} in motion — {what}, {pct}% filled",
+    motion: "{n} queued — {what}",
     watching: "{n} watching · {p} paused — {list}",
     done: "{n} done today — {receipts}",
     cant: "{n} can't — {what}",

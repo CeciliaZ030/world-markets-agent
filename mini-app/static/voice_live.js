@@ -94,11 +94,38 @@ function snapshotPcm(chunks, samples, sampleRate) {
   };
 }
 
+/** PCM16 mono WAV header + samples for a hold of `durationSecs`. */
+function expectedPcmWavBytes(sampleRate, durationSecs) {
+  const rate = Math.round(Number(sampleRate) || 48000);
+  const secs = Math.max(0, Number(durationSecs) || 0);
+  return 44 + rate * 2 * secs;
+}
+
+/**
+ * Ledger STT uses the complete click-to-release recording.
+ * Prefer lossless PCM when it covers the hold; otherwise the MediaRecorder blob.
+ */
+function pickHoldAudio(wav, webm, sampleRate, durationSecs) {
+  const wavSize = wav && wav.size ? wav.size : 0;
+  const webmSize = webm && webm.size ? webm.size : 0;
+  const expect = expectedPcmWavBytes(sampleRate, durationSecs);
+  // 90%: a 60% clip can still look "long enough" while missing the last word.
+  if (wavSize >= expect * 0.9) return wav;
+  if (webmSize > 0) return webm;
+  return wavSize ? wav : webm || null;
+}
+
 /** ~400ms at ScriptProcessor 2048 / 48kHz. Keep the start of the hold, drop new. */
 const MAX_STREAM_QUEUE = 10;
-/** ScriptProcessor 2048 @ 48kHz ≈ 43ms. Drain buffers already filled during the hold. */
-const PCM_FLUSH_FRAMES = 2;
-const PCM_FLUSH_MS = 150;
+/**
+ * ScriptProcessor 2048 @ 48kHz ≈ 43ms. Keep capturing after pointer-up so the
+ * last syllable is not still sitting in the current buffer, and so the clip
+ * has a short room-tone tail. Digital silence is then appended for STT.
+ */
+const PCM_FLUSH_FRAMES = 8;
+const PCM_FLUSH_MS = 400;
+/** Trailing zeros so Nova-3 can finalize the last word without the user holding. */
+const HOLD_TAIL_SILENCE_MS = 400;
 /** Slide-off must leave the button by this many CSS pixels — a lift is not a send. */
 const SLIDE_CANCEL_PAD_PX = 48;
 
@@ -217,6 +244,15 @@ function silencePcmChunks(sampleRate, ms, frame) {
   return chunks;
 }
 
+/** Copy hold PCM and append trailing silence. Empty holds stay empty. */
+function padHoldPcm(chunks, sampleRate, ms) {
+  const rows = Array.isArray(chunks) ? chunks.slice() : [];
+  if (!rows.length) return rows;
+  const padMs = ms == null ? HOLD_TAIL_SILENCE_MS : Math.max(0, Number(ms) || 0);
+  if (!padMs) return rows;
+  return rows.concat(silencePcmChunks(sampleRate, padMs, 2048));
+}
+
 function preferHeardTranscript(stt, live) {
   const heard = String(stt || "").trim();
   const liveText = String(live || "").trim();
@@ -234,6 +270,8 @@ if (typeof window !== "undefined") {
   window.int16Bytes = int16Bytes;
   window.encodeWavFromPcm = encodeWavFromPcm;
   window.snapshotPcm = snapshotPcm;
+  window.pickHoldAudio = pickHoldAudio;
+  window.expectedPcmWavBytes = expectedPcmWavBytes;
   window.declaredStreamRate = declaredStreamRate;
   window.resampleForStream = resampleForStream;
   window.shouldPaintInterim = shouldPaintInterim;
@@ -243,10 +281,12 @@ if (typeof window !== "undefined") {
   window.enqueueStreamPcm = enqueueStreamPcm;
   window.pointInVoiceHit = pointInVoiceHit;
   window.silencePcmChunks = silencePcmChunks;
+  window.padHoldPcm = padHoldPcm;
   window.isPlaceholderTranscript = isPlaceholderTranscript;
   window.MAX_STREAM_QUEUE = MAX_STREAM_QUEUE;
   window.PCM_FLUSH_FRAMES = PCM_FLUSH_FRAMES;
   window.PCM_FLUSH_MS = PCM_FLUSH_MS;
+  window.HOLD_TAIL_SILENCE_MS = HOLD_TAIL_SILENCE_MS;
   window.SLIDE_CANCEL_PAD_PX = SLIDE_CANCEL_PAD_PX;
 }
 if (typeof module !== "undefined" && module.exports) {
@@ -255,6 +295,8 @@ if (typeof module !== "undefined" && module.exports) {
     int16Bytes,
     encodeWavFromPcm,
     snapshotPcm,
+    pickHoldAudio,
+    expectedPcmWavBytes,
     declaredStreamRate,
     resampleForStream,
     STREAM_RATE_MAX,
@@ -267,9 +309,11 @@ if (typeof module !== "undefined" && module.exports) {
     enqueueStreamPcm,
     pointInVoiceHit,
     silencePcmChunks,
+    padHoldPcm,
     MAX_STREAM_QUEUE,
     PCM_FLUSH_FRAMES,
     PCM_FLUSH_MS,
+    HOLD_TAIL_SILENCE_MS,
     SLIDE_CANCEL_PAD_PX,
   };
 }

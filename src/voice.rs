@@ -25,10 +25,6 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let finalized = body
-        .get("finalized")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let channel = if typed.is_some() {
         Channel::Text
     } else {
@@ -41,18 +37,6 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
             lang: "en".to_string(),
             stt_version: String::new(),
             keyterm_applied: false,
-        }
-    } else if finalized {
-        if let Some(live) = live_text {
-            Transcript {
-                text: live.to_string(),
-                words: Vec::new(),
-                lang: "en".to_string(),
-                stt_version: "deepgram:nova-3:stream".to_string(),
-                keyterm_applied: true,
-            }
-        } else {
-            transcribe_ingest_audio(account_id, body, &brain, None)?
         }
     } else {
         transcribe_ingest_audio(account_id, body, &brain, live_text)?
@@ -225,26 +209,24 @@ fn transcribe_ingest_audio(
         .get("mime")
         .and_then(Value::as_str)
         .unwrap_or("audio/webm");
-    let mut transcript = match stt::transcribe(&audio, mime, &keyterms) {
-        Ok(transcript) => transcript,
-        Err(err) => {
-            if let Some(live) = live_text {
-                Transcript {
-                    text: live.to_string(),
-                    words: Vec::new(),
-                    lang: "en".to_string(),
-                    stt_version: String::new(),
-                    keyterm_applied: false,
-                }
-            } else {
-                return Err(stt_message(err));
-            }
-        }
-    };
-    if let Some(live) = live_text {
-        transcript.text = choose_transcript(&transcript.text, Some(live));
+    match stt::transcribe(&audio, mime, &keyterms) {
+        Ok(transcript) if !transcript.text.trim().is_empty() => Ok(transcript),
+        Ok(_) => live_fallback_or_err(live_text, "didn't catch any speech"),
+        Err(err) => live_fallback_or_err(live_text, &stt_message(err)),
     }
-    Ok(transcript)
+}
+
+fn live_fallback_or_err(live_text: Option<&str>, err: &str) -> Result<Transcript, String> {
+    if let Some(live) = live_text.filter(|value| !value.is_empty()) {
+        return Ok(Transcript {
+            text: live.to_string(),
+            words: Vec::new(),
+            lang: "en".to_string(),
+            stt_version: String::new(),
+            keyterm_applied: false,
+        });
+    }
+    Err(err.to_string())
 }
 
 fn decode_live_audio(body: &Value) -> Option<Vec<u8>> {
@@ -281,49 +263,17 @@ fn decode_audio(body: &Value) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn choose_transcript(stt: &str, live_text: Option<&str>) -> String {
     let stt = stt.trim();
-    let live = live_text.map(str::trim).filter(|value| !value.is_empty());
-    let Some(live) = live else {
+    if !stt.is_empty() {
         return stt.to_string();
-    };
-    if stt.is_empty() || is_placeholder_transcript(stt) {
-        return live.to_string();
     }
-    let stt_words = stt.split_whitespace().count();
-    let live_words = live.split_whitespace().count();
-    if live_words > stt_words {
-        return live.to_string();
-    }
-    if live_words == stt_words && live.len() > stt.len() {
-        return live.to_string();
-    }
-    stt.to_string()
-}
-
-fn is_placeholder_transcript(text: &str) -> bool {
-    let normalized = text
-        .trim()
-        .trim_end_matches(|c: char| c.is_ascii_punctuation())
-        .to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "hi" | "hello"
-            | "hey"
-            | "thanks"
-            | "thank you"
-            | "thanks for watching"
-            | "you"
-            | "hmm"
-            | "um"
-            | "uh"
-            | "yes"
-            | "yeah"
-            | "ok"
-            | "okay"
-            | "the"
-            | "a"
-    )
+    live_text
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(stt)
+        .to_string()
 }
 
 struct KeytermCache {
@@ -447,30 +397,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn placeholder_stt_yields_to_live_words() {
+    fn full_audio_stt_is_not_replaced_by_live_captions() {
         assert_eq!(
             choose_transcript("Hi", Some("buy fifty dollars of eth")),
-            "buy fifty dollars of eth"
+            "Hi"
         );
         assert_eq!(
-            choose_transcript("Thank you.", Some("buy 50 dollars of ether")),
-            "buy 50 dollars of ether"
+            choose_transcript("buy 51", Some("buy fifty dollars of ether")),
+            "buy 51"
         );
-    }
-
-    #[test]
-    fn real_stt_wins_over_live_words() {
         assert_eq!(
             choose_transcript("buy fifty dollars of ETH", Some("by 15 of it")),
             "buy fifty dollars of ETH"
-        );
-    }
-
-    #[test]
-    fn longer_live_wins_over_short_stt() {
-        assert_eq!(
-            choose_transcript("buy 51", Some("buy fifty dollars of ether")),
-            "buy fifty dollars of ether"
         );
     }
 
@@ -480,16 +418,22 @@ mod tests {
     }
 
     #[test]
-    fn finalized_live_text_is_speech_and_skips_stt() {
+    fn ingest_transcribes_hold_audio_not_live_captions() {
         let src = include_str!("voice.rs");
         let start = src.find("pub fn ingest_voice").expect("ingest_voice");
         let rest = &src[start..];
         let end = rest.find("\nconst MIN_LIVE_AUDIO").unwrap_or(rest.len());
         let body = &rest[..end];
-        assert!(body.contains("finalized"));
-        assert!(body.contains("deepgram:nova-3:stream"));
-        assert!(body.contains("Channel::Speech"));
         assert!(body.contains("transcribe_ingest_audio"));
+        assert!(body.contains("Channel::Speech"));
+        assert!(!body.contains("deepgram:nova-3:stream"));
+        assert!(!body.contains("finalized"));
+        let transcribe = src
+            .find("fn transcribe_ingest_audio")
+            .expect("transcribe_ingest_audio");
+        let transcribe_body = &src[transcribe..];
+        assert!(transcribe_body.contains("stt::transcribe"));
+        assert!(transcribe_body.contains("live_fallback_or_err"));
     }
 
     #[test]

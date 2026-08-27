@@ -316,6 +316,13 @@ body.locked { overflow: hidden; }
   height: 100%;
   border-radius: 2px;
   background: var(--accent);
+  transition: width 80ms linear;
+}
+.meter.queue-fill {
+  height: 3px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .meter > span { transition: none; }
 }
 .meter.warn > span { background: var(--warn); }
 .grip {

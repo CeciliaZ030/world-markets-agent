@@ -36,6 +36,7 @@ let chartHandle = null;
 let candleSeries = null;
 let pollTimer = null;
 let ageTimer = null;
+let ageTimerMs = 250;
 let toastTimer = null;
 let burstTimer = null;
 let suppressClickUntil = 0;
@@ -73,6 +74,7 @@ const state = {
   ledgerStatus: "loading",
   pending: {},
   optimistic: [],
+  fillUx: {},
   dismissed: new Set(),
   voice: {
     phase: "idle",
@@ -211,15 +213,15 @@ function instructionStart(raw) {
 }
 
 function remainingSecs(row) {
-  if (!row || row.status !== "pending_execute") return null;
-  const delay = Number(row.delay_secs) || 3;
-  if (row.execute_at) {
-    const rem = (Number(row.execute_at) * 1000 - Date.now()) / 1000;
-    if (!Number.isFinite(rem)) return null;
-    return Math.max(0, Math.min(delay, Math.ceil(rem)));
-  }
-  if (row.remaining_secs != null) return Math.max(0, Number(row.remaining_secs));
-  return null;
+  return remainingDisplaySecs(row, Date.now());
+}
+
+function queueView(row, nowMs) {
+  if (!isQueueRow(row)) return null;
+  const now = nowMs != null ? nowMs : Date.now();
+  const ux = touchFillUx(row, state.fillUx[row.instruction_id], now, { reduceMotion });
+  state.fillUx[row.instruction_id] = ux;
+  return presentQueue(row, ux, now, { reduceMotion });
 }
 
 function loadDismissed() {
@@ -245,18 +247,16 @@ loadDismissed();
 
 function clientProgress(row) {
   if (!row) return null;
-  if (row.status === "pending_execute") {
-    const delay = Number(row.delay_secs) || 3;
-    const rem = remainingSecs(row);
-    if (rem == null) return row.progress_pct != null ? Number(row.progress_pct) : null;
-    return Math.max(0, Math.min(100, Math.round(((delay - rem) / delay) * 100)));
-  }
+  const view = queueView(row);
+  if (view) return view.showMeter ? view.fillPct : null;
   return row.progress_pct != null ? Number(row.progress_pct) : null;
 }
 
 function heldCount() {
-  return instructions().filter((row) =>
-    [
+  return instructions().filter((row) => {
+    const view = queueView(row);
+    if (view && view.zone === "queued") return true;
+    return [
       "with_aomi",
       "watching",
       "triggered",
@@ -264,8 +264,8 @@ function heldCount() {
       "pending_execute",
       "executing",
       "paused",
-    ].includes(row.status),
-  ).length;
+    ].includes(row.status);
+  }).length;
 }
 
 function instructions() {
@@ -281,10 +281,12 @@ function instructions() {
 }
 
 function zoneOf(row) {
+  const view = queueView(row);
+  if (view && view.zone === "queued") return "queued";
   if (row.status === "awaiting_confirm" || row.status === "triggered" || row.status === "with_aomi") {
     return "needs";
   }
-  if (row.status === "pending_execute" || row.status === "executing") return "motion";
+  if (row.status === "pending_execute" || row.status === "executing") return "queued";
   if (row.status === "watching" || row.status === "paused") return "watch";
   if (row.status === "cant") return "cant";
   const today = new Date().toISOString().slice(0, 10);
@@ -297,6 +299,13 @@ function zoneOf(row) {
 
 function glyph(row) {
   if (row.voice_draft) return { g: "›", cls: "warn" };
+  const view = queueView(row);
+  if (view && view.phase === "wait") {
+    return { g: view.remainingDisplay == null ? "·" : String(view.remainingDisplay), cls: "count" };
+  }
+  if (view && (view.phase === "fill" || view.phase === "sliced")) {
+    return { g: "", spin: true };
+  }
   if (row.status === "awaiting_confirm" || row.status === "triggered") return { g: "!", cls: "" };
   if (row.status === "with_aomi") return { g: "›", cls: "" };
   if (row.status === "executing") return { g: "", spin: true };
@@ -343,6 +352,7 @@ async function cancelInPlace(row) {
   const message = fillCopy(C.drafts.cancel, { id });
   haptic("impact", "light");
   state.pending[row.instruction_id] = "cancel";
+  delete state.fillUx[row.instruction_id];
   state.ledger = state.ledger.filter((r) => r.instruction_id !== row.instruction_id);
   state.optimistic = state.optimistic.filter((r) => r.instruction_id !== row.instruction_id);
   if (state.insId === row.instruction_id) {
@@ -413,6 +423,11 @@ function subLine(row) {
   if (state.pending[row.instruction_id] === "pause") return C.sub.pendingPause;
   if (state.pending[row.instruction_id] === "resume") return C.sub.pendingResume;
   if (row.voice_draft) return C.draftRow.sub;
+  const view = queueView(row);
+  if (view && view.phase === "wait") {
+    return fillCopy(C.sub.pendingExecute, { n: view.remainingDisplay == null ? "—" : view.remainingDisplay });
+  }
+  if (view && view.phase === "fill") return C.sub.completing;
   if (row.status === "with_aomi") return C.sub.withAomi;
   if (row.status === "paused") return C.sub.paused;
   if (row.status === "awaiting_confirm" || row.status === "triggered") {
@@ -1003,7 +1018,7 @@ function bindHomeActs() {
 function ledgerZonesHtml() {
   const rows = instructions();
   const needs = rows.filter((r) => zoneOf(r) === "needs");
-  const motion = rows.filter((r) => zoneOf(r) === "motion");
+  const queued = rows.filter((r) => zoneOf(r) === "queued");
   const watch = rows.filter((r) => zoneOf(r) === "watch");
   const cant = rows.filter((r) => zoneOf(r) === "cant");
   const done = rows.filter((r) => zoneOf(r) === "done");
@@ -1022,7 +1037,7 @@ function ledgerZonesHtml() {
   }
   return (
     zoneBlock("needs", C.zones.needsYou, "lab-accent", needs.length, needs) +
-    zoneBlock("motion", C.zones.inMotion, "lab-accent", motion.length, motion) +
+    zoneBlock("queued", C.zones.queued, "lab-accent", queued.length, queued) +
     zoneBlock("watch", C.zones.watching, "lab-faint", fillCopy(C.zones.watchingCount, { w: watchingN, p: paused }), watch) +
     zoneBlock("cant", C.zones.cant, "lab-faint", cant.length, cant) +
     zoneBlock("done", C.zones.doneToday, "lab-pos", done.length, done) +
@@ -1047,7 +1062,7 @@ function ledgerHtml(hb, compact) {
     : "";
   const rows = instructions();
   const needs = rows.filter((r) => zoneOf(r) === "needs");
-  const motion = rows.filter((r) => zoneOf(r) === "motion");
+  const queued = rows.filter((r) => zoneOf(r) === "queued");
   const watch = rows.filter((r) => zoneOf(r) === "watch");
   const cant = rows.filter((r) => zoneOf(r) === "cant");
   const done = rows.filter((r) => zoneOf(r) === "done");
@@ -1058,7 +1073,7 @@ function ledgerHtml(hb, compact) {
     return (
       `<div class="launch-label"><span>${escapeHtml(C.launch.label)}</span><span class="num">${new Date().toISOString().slice(11, 16)} UTC</span></div>` +
       reportLine("!", C.launch.needs, needs) +
-      reportLine("⚙", C.launch.motion, motion) +
+      reportLine("⚙", C.launch.motion, queued) +
       `<div class="report"><span class="g">◎</span><span>${escapeHtml(
         fillCopy(C.launch.watching, {
           n: watchingN,
@@ -1107,30 +1122,34 @@ function zoneRows(rows) {
   return rows
     .map((row, i) => {
       const g = glyph(row);
-      const archiveSwipe = archivable(row) && !state.pending[row.instruction_id];
+      const view = queueView(row);
+      const queued = view && view.zone === "queued";
+      const archiveSwipe =
+        archivable(row) && !state.pending[row.instruction_id] && !queued;
       const actionSwipe =
         (row.status === "watching" || row.status === "paused") &&
         !state.pending[row.instruction_id];
       const swipable = archiveSwipe || actionSwipe;
-      const pct = clientProgress(row);
-      const inMotion = row.status === "pending_execute" || row.status === "executing";
-      const rem = remainingSecs(row);
+      const pct = view && view.showMeter ? view.fillPct : clientProgress(row);
+      const rem = view && view.showCountdown ? view.remainingDisplay : remainingSecs(row);
       const meter =
-        inMotion && pct != null
-          ? `<div class="meter"><span style="width:${Number(pct)}%"></span></div>`
+        queued && view.showMeter && pct != null
+          ? `<div class="meter queue-fill"><span style="width:${Number(pct)}%"></span></div>`
           : row.status === "watching" && row.distance && state.ledgerStatus !== "stale"
             ? `<div class="meter ${row.distance.near ? "warn" : ""}"><span style="width:${row.distance.pct}%"></span></div>`
             : "";
       const value =
-        row.status === "pending_execute" && rem != null
+        queued && view.phase === "wait" && rem != null
           ? `<span class="count-chip num">${escapeHtml(String(rem))}</span>`
-          : inMotion && pct != null
+          : queued && view.phase === "sliced" && pct != null
             ? `<span class="pct-slot num">${escapeHtml(String(pct))}%</span>`
-            : row.display_status
-              ? `<span class="chip ${row.voice_draft ? "warn" : chipClass(row.status)}">${escapeHtml(row.display_status)}</span>`
-              : "";
+            : queued
+              ? ""
+              : row.display_status
+                ? `<span class="chip ${row.voice_draft ? "warn" : chipClass(row.status)}">${escapeHtml(row.display_status)}</span>`
+                : "";
       const open = state.openSwipe === row.instruction_id;
-      const canCancel = cancellable(row);
+      const canCancel = view && view.zone === "queued" ? view.cancellable : cancellable(row);
       const chips = archiveSwipe
         ? `<div class="swipe-under"><button type="button" class="swipe-chip archive" data-act="archive" data-id="${escapeHtml(row.instruction_id)}">${escapeHtml(C.instruction.archive)}</button></div>`
         : actionSwipe
@@ -1138,7 +1157,8 @@ function zoneRows(rows) {
           : "";
       const rowCls = [
         i === rows.length - 1 ? "last" : "",
-        row.status === "done" ? "is-done" : "",
+        queued && view.phase === "fill" ? "is-queued" : "",
+        row.status === "done" && !queued ? "is-done" : "",
         row.status === "cant" ? "is-cant" : "",
         row.voice_draft ? "voice-draft" : "",
         row.voice_draft && Date.now() - (row.voice_landed_at || 0) < 500 ? "fresh" : "",
@@ -1146,7 +1166,7 @@ function zoneRows(rows) {
         .filter(Boolean)
         .join(" ");
       const swipeKind = archiveSwipe ? "archive" : actionSwipe ? "1" : "0";
-      return `<div class="row ${rowCls}" data-row="${escapeHtml(row.instruction_id)}" data-swipe="${swipeKind}">
+      return `<div class="row ${rowCls}" data-row="${escapeHtml(row.instruction_id)}" data-swipe="${swipeKind}" data-phase="${escapeHtml((view && view.phase) || row.status)}">
         ${chips}
         <div class="row-front" style="${open ? `transform:translateX(-${archiveSwipe ? 88 : 140}px)` : ""}">
           <div class="glyph ${g.cls}">${g.spin ? '<div class="spin"></div>' : escapeHtml(g.g)}</div>
@@ -2887,11 +2907,11 @@ function openVoiceStream() {
 function waitPcmFlushFrames() {
   const need = Math.max(
     1,
-    Math.round(Number(window.PCM_FLUSH_FRAMES) || 2),
+    Math.round(Number(window.PCM_FLUSH_FRAMES) || 8),
   );
   const limit = Math.max(
     40,
-    Math.round(Number(window.PCM_FLUSH_MS) || 150),
+    Math.round(Number(window.PCM_FLUSH_MS) || 400),
   );
   return new Promise((resolve) => {
     let got = 0;
@@ -3115,7 +3135,6 @@ function closeCaptureImmediate() {
   voiceWanted = false;
   voiceReady = false;
   voiceCaptureArmed = false;
-  voiceFinalizing = false;
   voiceFlushing = false;
   voiceFlushWait = null;
   voiceStartedAt = 0;
@@ -3136,6 +3155,7 @@ function closeCaptureImmediate() {
 
 function teardownVoice() {
   closeCaptureImmediate();
+  voiceFinalizing = false;
   try {
     if (voiceRecorder && voiceRecorder.state !== "inactive") voiceRecorder.stop();
   } catch (_) {
@@ -3177,7 +3197,7 @@ function stopRecorderBlob(recorder, mime, chunks) {
   });
 }
 
-async function submitVoiceBlob(blob, mime, started, correlation_id) {
+async function submitVoiceBlob(blob, mime, started, correlation_id, liveCaption) {
   if (!blob || !blob.size) {
     state.voice.phase = "idle";
     syncVoiceDom();
@@ -3187,12 +3207,19 @@ async function submitVoiceBlob(blob, mime, started, correlation_id) {
   try {
     const audio_base64 = await blobToBase64(blob);
     const duration_secs = started ? (Date.now() - started) / 1000 : undefined;
+    const liveRaw = String(liveCaption || "").trim();
+    const live_text =
+      liveRaw &&
+      !(typeof window.isPlaceholderTranscript === "function" && window.isPlaceholderTranscript(liveRaw))
+        ? liveRaw
+        : undefined;
     const out = await api("/api/v1/mini-app/voice", {
       method: "POST",
       body: {
         audio_base64,
         mime: blob.type || mime,
         duration_secs,
+        live_text,
       },
     });
     const heard = String((out && (out.transcript || out.heard_echo)) || "").trim();
@@ -3257,28 +3284,35 @@ async function commitVoice() {
   voiceFlushing = true;
   stopLivePoll();
   syncVoiceDom();
-  await waitPcmFlushFrames();
-  const pcm = snapshotLivePcm();
-  voiceFlushing = false;
-  voiceWanted = false;
-  discardVoiceStream();
-  const wav = wavFromPcm(pcm.chunks, pcm.rate);
-  let blob = wav;
-  if (!blob || !blob.size) {
-    blob = await stopRecorderBlob(recorder, mime, webmChunks);
-  } else if (recorder && recorder.state !== "inactive") {
-    try {
-      recorder.stop();
-    } catch (_) {
-      /* archive optional */
-    }
+  try {
+    await waitPcmFlushFrames();
+    const pcm = snapshotLivePcm();
+    const liveCaption = String(state.voice.transcript || state.voice.transcriptRaw || "").trim();
+    const rawWav = wavFromPcm(pcm.chunks, pcm.rate);
+    const webm = await stopRecorderBlob(recorder, mime, webmChunks);
+    const heldSec = started ? (Date.now() - started) / 1000 : 0;
+    const picked =
+      typeof window.pickHoldAudio === "function"
+        ? window.pickHoldAudio(rawWav, webm, pcm.rate, heldSec)
+        : rawWav && rawWav.size
+          ? rawWav
+          : webm;
+    const blob =
+      picked === rawWav && rawWav && typeof window.padHoldPcm === "function"
+        ? wavFromPcm(window.padHoldPcm(pcm.chunks, pcm.rate), pcm.rate) || rawWav
+        : picked;
+    voiceFlushing = false;
+    voiceWanted = false;
+    discardVoiceStream();
+    closeCaptureImmediate();
+    voiceRecorder = null;
+    voiceChunks = [];
+    state.voice.phase = "sending";
+    syncVoiceDom();
+    await submitVoiceBlob(blob, (blob && blob.type) || mime, started, correlation_id, liveCaption);
+  } finally {
+    voiceFinalizing = false;
   }
-  closeCaptureImmediate();
-  voiceRecorder = null;
-  voiceChunks = [];
-  state.voice.phase = "sending";
-  syncVoiceDom();
-  await submitVoiceBlob(blob, (blob && blob.type) || mime, started, correlation_id);
 }
 
 function landVoiceDraft(text, correlation_id, instruction_id) {
@@ -3480,8 +3514,15 @@ async function refreshLedger() {
         if (row.status === "watching") showToast(fillCopy(C.toasts.watching, { date: fmtDate(row.expires_at) }));
       } else if (prev[row.instruction_id] && prev[row.instruction_id] !== row.status) {
         if (row.status === "awaiting_confirm") showToast(fillCopy(C.toasts.trigger, { detail: row.sentence }));
-        if (row.status === "done") showToast(C.toasts.executed);
+        if (row.status === "done") {
+          const view = queueView(row);
+          if (!view || view.zone !== "queued") showToast(C.toasts.executed);
+        }
       }
+    }
+    const liveIds = new Set(instructions().map((r) => r.instruction_id));
+    for (const id of Object.keys(state.fillUx)) {
+      if (!liveIds.has(id)) delete state.fillUx[id];
     }
     if (
       (state.view === "main" || state.view === "sent") &&
@@ -3517,8 +3558,11 @@ function patchLiveClock() {
     state.voice.phase === "sending" ||
     voiceFinalizing
   ) {
+    tuneAgeClock();
     return;
   }
+  const now = Date.now();
+  let needsPaint = false;
   const hb = isVoiceHome() ? homeHeartbeatText() : heartbeatText();
   document.querySelectorAll(".heartbeat").forEach((el) => {
     el.innerHTML = `<span class="dot ${hb.dot}"></span>${escapeHtml(hb.text)}`;
@@ -3526,32 +3570,87 @@ function patchLiveClock() {
   document.querySelectorAll("[data-row]").forEach((el) => {
     const id = el.getAttribute("data-row");
     const row = instructions().find((r) => r.instruction_id === id);
-    if (!row || row.status !== "pending_execute") return;
-    const n = remainingSecs(row);
-    const glyph = el.querySelector(".glyph");
-    if (glyph) glyph.textContent = n == null ? "·" : String(n);
-    const sub = el.querySelector(".sub");
-    if (sub) sub.textContent = fillCopy(C.sub.pendingExecute, { n: n == null ? "—" : n });
-    const pct = clientProgress(row);
-    const meter = el.querySelector(".meter span");
-    if (meter && pct != null) meter.style.width = Number(pct) + "%";
-    const count = el.querySelector(".count-chip");
-    if (count && n != null) count.textContent = String(n);
-    const slot = el.querySelector(".pct-slot");
-    if (slot && pct != null) slot.textContent = String(pct) + "%";
+    if (!row) return;
+    const prevPhase = el.getAttribute("data-phase");
+    const view = queueView(row, now);
+    const preview = previewState();
+    if (
+      preview &&
+      preview !== "dev" &&
+      row.status === "pending_execute" &&
+      view &&
+      view.phase === "fill" &&
+      view.fillPct >= 100
+    ) {
+      row.status = "done";
+      row.display_status = "done";
+      row.receipt = row.receipt || "filled";
+      row.status_changed_at = Math.floor(now / 1000);
+    }
+    const shown = queueView(row, now);
+    const ux = state.fillUx[id];
+    if (ux && ux.revealed && !ux.toasted && ux.fillStartedAt && row.status === "done") {
+      ux.toasted = true;
+      showToast(C.toasts.executed);
+    }
+    if (!shown) return;
+    if (shown.phase !== prevPhase) needsPaint = true;
+    if (shown.phase === "wait") {
+      const n = shown.remainingDisplay;
+      const glyphEl = el.querySelector(".glyph");
+      if (glyphEl) glyphEl.textContent = n == null ? "·" : String(n);
+      const sub = el.querySelector(".sub");
+      if (sub) sub.textContent = fillCopy(C.sub.pendingExecute, { n: n == null ? "—" : n });
+      const count = el.querySelector(".count-chip");
+      if (count && n != null) count.textContent = String(n);
+      const meter = el.querySelector(".meter span");
+      if (meter) meter.style.width = "0%";
+    } else if (shown.phase === "fill" || shown.phase === "sliced") {
+      const meter = el.querySelector(".meter span");
+      if (meter && shown.fillPct != null) meter.style.width = Number(shown.fillPct) + "%";
+      const slot = el.querySelector(".pct-slot");
+      if (slot && shown.fillPct != null) slot.textContent = String(shown.fillPct) + "%";
+      if (shown.phase === "fill") {
+        const sub = el.querySelector(".sub");
+        if (sub) sub.textContent = C.sub.completing;
+      }
+    }
   });
+  tuneAgeClock();
+  if (needsPaint) paint();
 }
 
 function startPoll() {
   clearInterval(pollTimer);
   clearInterval(ageTimer);
+  ageTimerMs = 0;
   pollTimer = setInterval(refreshLedger, 2000);
-  ageTimer = setInterval(patchLiveClock, 250);
+  tuneAgeClock();
+}
+
+function tuneAgeClock() {
+  const filling =
+    !reduceMotion &&
+    instructions().some((row) => {
+      const view = presentQueue(row, state.fillUx[row.instruction_id], Date.now(), {
+        reduceMotion,
+      });
+      return view && view.phase === "fill";
+    });
+  const ms = filling ? 50 : 250;
+  if (ageTimer && ageTimerMs === ms) return;
+  ageTimerMs = ms;
+  clearInterval(ageTimer);
+  ageTimer = setInterval(patchLiveClock, ms);
 }
 
 function tunePoll() {
+  const now = Date.now();
   const hot = instructions().some(
-    (row) => row.status === "pending_execute" || row.status === "executing",
+    (row) =>
+      row.status === "pending_execute" ||
+      row.status === "executing" ||
+      isQueueHot(row, state.fillUx[row.instruction_id], now, { reduceMotion }),
   );
   clearInterval(pollTimer);
   pollTimer = setInterval(refreshLedger, hot ? 500 : 2000);
@@ -3588,7 +3687,7 @@ function maybeFlushDue() {
 function isFlushDue(row) {
   if (!row) return false;
   if (row.status === "pending_execute") {
-    const rem = remainingSecs(row);
+    const rem = remainingQueueSecs(row, Date.now());
     return rem != null && rem <= 0;
   }
   if (row.status === "executing") {
@@ -3770,8 +3869,8 @@ function previewBoot() {
   state.compact = pv !== "loaded";
   loadSpeechOntology();
   paint();
-  clearInterval(ageTimer);
-  ageTimer = setInterval(patchLiveClock, 250);
+  ageTimerMs = 0;
+  tuneAgeClock();
 }
 
 function chartParams() {

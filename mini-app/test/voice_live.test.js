@@ -12,6 +12,8 @@ const {
   preferHeardTranscript,
   snapshotPcm,
   encodeWavFromPcm,
+  pickHoldAudio,
+  expectedPcmWavBytes,
   floatToInt16,
   declaredStreamRate,
   resampleForStream,
@@ -21,6 +23,8 @@ const {
   SLIDE_CANCEL_PAD_PX,
   PCM_FLUSH_FRAMES,
   PCM_FLUSH_MS,
+  HOLD_TAIL_SILENCE_MS,
+  padHoldPcm,
 } = require("../static/voice_live.js");
 
 test("does not paint empty or tiny interims", () => {
@@ -99,12 +103,28 @@ test("hold-to-talk posts the full press-to-release recording, not the live capti
   assert.match(src, /waitPcmFlushFrames/);
   assert.match(src, /snapshotLivePcm/);
   assert.match(src, /discardVoiceStream/);
+  assert.match(src, /pickHoldAudio/);
+  assert.match(src, /padHoldPcm/);
+  assert.match(src, /stopRecorderBlob/);
   assert.match(src, /PCM_FLUSH_FRAMES/);
+  assert.match(src, /live_text/);
   assert.doesNotMatch(src, /releaseHeard/);
   assert.doesNotMatch(src, /finalized:\s*usedStream/);
-  assert.doesNotMatch(src, /live_text:/);
   assert.doesNotMatch(src, /msg\.is_final && voiceStreamOnFinal/);
   assert.doesNotMatch(src, /done\(String\(msg\.text/);
+});
+
+test("pickHoldAudio uses the complete MediaRecorder blob when PCM is truncated", () => {
+  const wav = { size: 1000, type: "audio/wav" };
+  const webm = { size: 8000, type: "audio/webm" };
+  const expect = expectedPcmWavBytes(48000, 2);
+  assert.ok(expect > 100000);
+  assert.equal(pickHoldAudio(wav, webm, 48000, 2), webm);
+  const seventy = { size: Math.floor(expect * 0.7), type: "audio/wav" };
+  assert.equal(pickHoldAudio(seventy, webm, 48000, 2), webm);
+  const full = { size: expect, type: "audio/wav" };
+  assert.equal(pickHoldAudio(full, webm, 48000, 2), full);
+  assert.equal(pickHoldAudio(full, null, 48000, 2), full);
 });
 
 test("slide-off requires leaving the button, not a lift inside it", () => {
@@ -114,9 +134,22 @@ test("slide-off requires leaving the button, not a lift inside it", () => {
   assert.equal(pointInVoiceHit(150, 150, 230, 75, 0, 0, SLIDE_CANCEL_PAD_PX), false);
 });
 
-test("release drains a couple of already-filled PCM frames, not seconds of padding", () => {
-  assert.equal(PCM_FLUSH_FRAMES, 2);
-  assert.ok(PCM_FLUSH_MS <= 200);
+test("release keeps a short tail so the last word is in the clip without extra hold", () => {
+  assert.ok(PCM_FLUSH_FRAMES >= 6);
+  assert.ok(PCM_FLUSH_MS >= 300 && PCM_FLUSH_MS <= 500);
+  assert.ok(HOLD_TAIL_SILENCE_MS >= 300 && HOLD_TAIL_SILENCE_MS <= 500);
+});
+
+test("padHoldPcm appends trailing silence without mutating the hold", () => {
+  const src = [new Float32Array([0.5, -0.25])];
+  const padded = padHoldPcm(src, 8000, 100);
+  assert.equal(src.length, 1);
+  assert.equal(src[0][0], 0.5);
+  const samples = padded.reduce((n, row) => n + row.length, 0);
+  assert.equal(samples, 2 + 800);
+  assert.equal(padded[0][0], 0.5);
+  assert.equal(padded[padded.length - 1][0], 0);
+  assert.equal(padHoldPcm([], 48000, 400).length, 0);
 });
 
 test("preferHeardTranscript keeps a longer finalized live sentence", () => {
