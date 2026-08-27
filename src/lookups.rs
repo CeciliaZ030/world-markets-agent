@@ -432,6 +432,14 @@ fn perp_exposure_label(symbol: &str, side: &str) -> String {
     format!("{symbol} {side}")
 }
 
+/// Mark / price for read-back: thousands separators, no currency prefix.
+/// Whole numbers when the mark is ≥ 100 (exemplar `~2,500`); otherwise 2 dp.
+pub(crate) fn format_mark_human(mark: Decimal) -> String {
+    let abs = mark.abs();
+    let dp = if abs >= Decimal::from(100) { 0 } else { 2 };
+    format_with_commas(abs, dp)
+}
+
 /// Format a USDT notional: exactly 2 dp, thousands separators, optional ≈ for estimates.
 pub(crate) fn format_money(value: Decimal, is_estimate: bool) -> String {
     let rounded = if is_estimate {
@@ -751,7 +759,8 @@ pub(crate) fn rewrite_engine_numbers(detail: &str) -> String {
         } else {
             if !cur.is_empty() {
                 if let Ok(v) = parse_decimal(&cur, "n") {
-                    if cur.contains('.') && cur.split('.').nth(1).map(|f| f.len()).unwrap_or(0) > 2 {
+                    if cur.contains('.') && cur.split('.').nth(1).map(|f| f.len()).unwrap_or(0) > 2
+                    {
                         out.push_str(&format!("`{}`", format_money(v, false)));
                     } else {
                         out.push_str(&cur);
@@ -788,9 +797,11 @@ pub(crate) struct ShareAsk {
 /// "what's 20% of my portfolio" / "half of my SOL" / "10% of my SOL position"
 pub(crate) fn parse_share_ask(raw: &str) -> Option<ShareAsk> {
     let lower = raw.trim().to_ascii_lowercase();
-    if ["buy ", "sell ", "short ", "long ", "put ", "spend ", "invest ", "deploy "]
-        .iter()
-        .any(|verb| lower.contains(verb))
+    if [
+        "buy ", "sell ", "short ", "long ", "put ", "spend ", "invest ", "deploy ",
+    ]
+    .iter()
+    .any(|verb| lower.contains(verb))
     {
         return None;
     }
@@ -931,6 +942,13 @@ mod tests {
         assert_eq!(format_money(d("691.1479"), false), "$691.15");
         assert_eq!(format_money(d("1000"), false), "$1,000.00");
         assert_eq!(format_money(d("2707.71"), false), "$2,707.71");
+    }
+
+    #[test]
+    fn format_mark_human_uses_thousands_separators() {
+        assert_eq!(format_mark_human(d("2500")), "2,500");
+        assert_eq!(format_mark_human(d("2465.71")), "2,466");
+        assert_eq!(format_mark_human(d("1.23")), "1.23");
     }
 
     #[test]

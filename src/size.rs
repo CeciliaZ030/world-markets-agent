@@ -35,11 +35,21 @@ pub(crate) struct ResolvedSize {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SizeError {
-    Ambiguous { span: SizeSpan, mark: Option<Decimal> },
+    Ambiguous {
+        span: SizeSpan,
+        mark: Option<Decimal>,
+    },
     Missing,
-    Mismatch { sentence: String, size_usd: String },
+    Mismatch {
+        sentence: String,
+        size_usd: String,
+    },
     Invalid(String),
-    Drift { expected: Decimal, actual: Decimal, bps: Decimal },
+    Drift {
+        expected: Decimal,
+        actual: Decimal,
+        bps: Decimal,
+    },
 }
 
 impl SizeError {
@@ -76,7 +86,11 @@ impl SizeError {
                 "detail": detail,
                 "executable": false,
             }),
-            SizeError::Drift { expected, actual, bps } => json!({
+            SizeError::Drift {
+                expected,
+                actual,
+                bps,
+            } => json!({
                 "error": "size_mark_drift",
                 "detail": format!(
                     "re-resolved base qty {actual} drifted {bps} bps from preview {expected}; re-preview"
@@ -268,8 +282,15 @@ pub(crate) fn parse_amount(raw: &str) -> Option<Decimal> {
     speech_ontology::parse_amount_token(raw).and_then(|s| Decimal::from_str(&s).ok())
 }
 
-fn format_base_qty(qty: Decimal) -> String {
+pub(crate) fn format_base_qty(qty: Decimal) -> String {
     qty.round_dp_with_strategy(6, RoundingStrategy::MidpointAwayFromZero)
+        .normalize()
+        .to_string()
+}
+
+/// Receipt-facing base quantity: ≤4 decimal places, trailing zeros stripped.
+pub(crate) fn format_qty_human(qty: Decimal) -> String {
+    qty.round_dp_with_strategy(4, RoundingStrategy::MidpointAwayFromZero)
         .normalize()
         .to_string()
 }
@@ -293,9 +314,9 @@ fn ambiguous_ask(
     as_base: Option<&str>,
 ) -> String {
     match (as_quote, as_base) {
-        (Some(q), Some(b)) => format!(
-            "Did you mean `{q}` of it, or `{amount}` units (about `{b}` at the mark)?"
-        ),
+        (Some(q), Some(b)) => {
+            format!("Did you mean `{q}` of it, or `{amount}` units (about `{b}` at the mark)?")
+        }
         _ => format!("Did you mean `${amount}` worth, or `{amount}` units?"),
     }
 }
@@ -392,7 +413,12 @@ mod tests {
         assert_eq!(resolved.denomination, "quote");
         let expected = Decimal::from(200) / mark();
         assert!((resolved.base_qty - expected).abs() < Decimal::new(1, 8));
-        assert!(resolved.to_json()["notional_rendered"].as_str().unwrap().contains("$"));
+        assert!(
+            resolved.to_json()["notional_rendered"]
+                .as_str()
+                .unwrap()
+                .contains("$")
+        );
     }
 
     #[test]
@@ -419,5 +445,26 @@ mod tests {
         let qty = Decimal::from_str("0.081102").unwrap();
         let live = qty * Decimal::from_str("1.01").unwrap();
         assert!(reject_drift(qty, live).is_err());
+    }
+
+    #[test]
+    fn format_qty_human_caps_at_four_decimals() {
+        let raw = Decimal::from_str("0.0799427609831360745706074451").unwrap();
+        let rendered = format_qty_human(raw);
+        let frac = rendered.split('.').nth(1).unwrap_or("");
+        assert!(frac.len() <= 4, "{rendered}");
+        assert_eq!(rendered, "0.0799");
+        assert_eq!(
+            format_qty_human(Decimal::from_str("0.0800").unwrap()),
+            "0.08"
+        );
+    }
+
+    #[test]
+    fn format_base_qty_allows_six_decimals_for_readback() {
+        let raw = Decimal::from_str("0.0799427609831360745706074451").unwrap();
+        let rendered = format_base_qty(raw);
+        let frac = rendered.split('.').nth(1).unwrap_or("");
+        assert!(frac.len() <= 6, "{rendered}");
     }
 }

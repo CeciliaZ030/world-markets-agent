@@ -98,6 +98,12 @@ test("cant copy register has no bangs and 160-char blocks", () => {
   }
 });
 
+test("unclear is the non-trade register", () => {
+  assert.match(CANT.unclear, /I trade crypto spot, perps, and lending/);
+  assert.match(CANT.unclear, /\/p/);
+  assert.equal(/say buy/i.test(CANT.unclear), false);
+});
+
 test("fire, expire, and bundle copy use record fields only", () => {
   const fire = {
     created_at: 1_700_000_000,

@@ -25,6 +25,7 @@ import os
 import pty
 import re
 import select
+import signal
 import subprocess
 import sys
 import time
@@ -163,6 +164,10 @@ class ReplSession:
         self.session = session
         pid, fd = pty.fork()
         if pid == 0:
+            try:
+                os.setsid()
+            except OSError:
+                pass
             os.chdir(ROOT)
             os.execvpe("aomi-run", aomi_cmd(plugin, session, max_turns, None), env)
         self.pid = pid
@@ -231,13 +236,38 @@ class ReplSession:
             os.write(self.fd, b"/quit\n")
         except OSError:
             pass
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            try:
+                waited, _ = os.waitpid(self.pid, os.WNOHANG)
+                if waited:
+                    break
+            except ChildProcessError:
+                break
+            time.sleep(0.05)
+        else:
+            try:
+                os.killpg(os.getpgid(self.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    os.kill(self.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            time.sleep(0.4)
+            try:
+                os.killpg(os.getpgid(self.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    os.kill(self.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            try:
+                os.waitpid(self.pid, 0)
+            except ChildProcessError:
+                pass
         try:
             os.close(self.fd)
         except OSError:
-            pass
-        try:
-            os.waitpid(self.pid, 0)
-        except ChildProcessError:
             pass
 
 
@@ -283,10 +313,21 @@ def final_message(stdout: str) -> str:
     return "\n".join(text).strip()
 
 
+def is_tool_output_line(line: str) -> bool:
+    stripped = line.strip()
+    if is_tool_call(stripped) or stripped.startswith("🔧"):
+        return True
+    return "[world-markets] tool_result " in stripped
+
+
 def tool_blob(stdout: str, stderr: str = "") -> str:
-    blob = "\n".join(line for line in bot_lines(stdout) if is_tool_call(line))
-    extra = "\n".join(line for line in bot_lines(stderr) if is_tool_call(line))
-    return blob + "\n" + extra + "\n" + (stderr or "")
+    """Tool-call lines and structured tool JSON only — never the user-facing reply."""
+    parts = []
+    for src in (stdout, stderr):
+        for raw in (src or "").splitlines():
+            if is_tool_output_line(raw):
+                parts.append(raw.strip())
+    return "\n".join(parts)
 
 
 def numeric_literals(text: str) -> list[str]:
@@ -316,7 +357,7 @@ def check_first_output_is_tool_call(stdout: str, stderr: str = "") -> tuple[bool
 
 def check_no_foreign_digits(stdout: str, stderr: str = "") -> tuple[bool, str]:
     message = final_message(stdout)
-    tools = tool_blob(stdout, stderr) + stdout
+    tools = tool_blob(stdout, stderr)
     foreign = []
     for token in numeric_literals(message):
         bare = token.lstrip("$").rstrip("%")
@@ -326,6 +367,25 @@ def check_no_foreign_digits(stdout: str, stderr: str = "") -> tuple[bool, str]:
     if foreign:
         return False, f"foreign digits {foreign} in {message[:240]!r}"
     return True, "ok"
+
+
+def self_test_foreign_digits() -> None:
+    fabricated_stdout = "bot ▸ Based on `$1643.63`, 20% is `$328.73`."
+    fabricated_stderr = (
+        "🔧 get_world_account({})\n"
+        '[world-markets] tool_result get_world_account {"metrics":{"net_asset_value":"1643.63"}}\n'
+    )
+    ok, detail = check_no_foreign_digits(fabricated_stdout, fabricated_stderr)
+    if ok:
+        raise SystemExit(f"H1 self-test: fabricated $328.73 must fail ({detail})")
+    honest_stdout = "bot ▸ 20% of the portfolio is `$328.73`."
+    honest_stderr = (
+        '🔧 get_world_account({"share":"20"})\n'
+        '[world-markets] tool_result get_world_account {"share":{"amount":"$328.73"}}\n'
+    )
+    ok, detail = check_no_foreign_digits(honest_stdout, honest_stderr)
+    if not ok:
+        raise SystemExit(f"H1 self-test: tool-computed share must pass ({detail})")
 
 
 def maybe_tiktoken_check() -> dict | None:
@@ -588,23 +648,26 @@ def main() -> int:
         help="persistent PTY REPL (≥2-turn memory + probes in one session)",
     )
     args = parser.parse_args()
+    self_test_foreign_digits()
     require_stack()
     plugin = plugin_path()
     env = env_for_eval()
     (SUITE / "logs").mkdir(exist_ok=True)
-    outputs = {}
-    if args.command in ("eval", "all"):
-        outputs["eval"] = run_eval(plugin, env)
-        print(json.dumps(outputs["eval"], indent=2))
-    if args.command in ("probes", "all"):
-        outputs["probes"] = run_probes(plugin, env, long_session=args.long)
-        print(json.dumps(outputs["probes"], indent=2))
-        if args.command == "all" and not args.long:
-            outputs["probes_long"] = run_probes(plugin, env, long_session=True)
-            print(json.dumps(outputs["probes_long"], indent=2))
-    (SUITE / "results.json").write_text(json.dumps(outputs, indent=2) + "\n")
-    failed = sum(block.get("failed", 0) for block in outputs.values())
-    return 0 if failed == 0 else 1
+    outputs: dict = {}
+    try:
+        if args.command in ("eval", "all"):
+            outputs["eval"] = run_eval(plugin, env)
+            print(json.dumps(outputs["eval"], indent=2))
+        if args.command in ("probes", "all"):
+            outputs["probes"] = run_probes(plugin, env, long_session=args.long)
+            print(json.dumps(outputs["probes"], indent=2))
+            if args.command == "all" and not args.long:
+                outputs["probes_long"] = run_probes(plugin, env, long_session=True)
+                print(json.dumps(outputs["probes_long"], indent=2))
+        failed = sum(block.get("failed", 0) for block in outputs.values())
+        return 0 if failed == 0 else 1
+    finally:
+        (SUITE / "results.json").write_text(json.dumps(outputs, indent=2) + "\n")
 
 
 if __name__ == "__main__":

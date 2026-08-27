@@ -22,6 +22,7 @@ pub fn stage_and_schedule(
     sentence: &str,
     mandate: Option<&Value>,
     plan: &ExecutionPlan,
+    extra: Option<&Value>,
 ) -> Result<Value, String> {
     let mut params = json!({
         "product": args.product,
@@ -34,10 +35,18 @@ pub fn stage_and_schedule(
         "slippage": args.slippage,
         "account_id": account_id,
         "wallet_address": args.wallet_address,
+        "sentence": sentence,
         "schedule": plan.to_schedule_json(&args.quantity),
     });
     if let Some(mandate) = mandate {
         params["handover_mandate"] = mandate.clone();
+    }
+    if let Some(obj) = extra.and_then(Value::as_object) {
+        if let Some(params_obj) = params.as_object_mut() {
+            for (k, v) in obj {
+                params_obj.insert(k.clone(), v.clone());
+            }
+        }
     }
     let staged = brain.stage_trade(&json!({
         "account_id": account_id,
@@ -165,12 +174,22 @@ pub fn flush_staged_trade(account_id: u64, instruction_id: &str) -> Result<Value
                     },
                 }),
             )?;
+            let graduating = graduate_kind(&brain, account_id, &params);
+            let avg_s = value_as_price(&avg);
+            let fill_message =
+                fill_receipt_message(&params, &fill_qty, avg_s.as_deref(), graduating);
+            if let Some(message) = fill_message.as_ref() {
+                deliver_fill_receipt(&params, instruction_id, message);
+            }
             if last || progress.get("more") != Some(&Value::Bool(true)) {
+                let stored = fill_message
+                    .clone()
+                    .unwrap_or_else(|| receipt_line(&value, &receipt));
                 let _ = brain.complete_execute(
                     account_id,
                     instruction_id,
                     &json!({
-                        "receipt": receipt_line(&value, &receipt),
+                        "receipt": stored,
                         "avg_price": avg,
                         "result_ref": receipt.get("transaction_hash"),
                         "filled_quantity": filled,
@@ -180,6 +199,7 @@ pub fn flush_staged_trade(account_id: u64, instruction_id: &str) -> Result<Value
                     "ok": true,
                     "more_slices": false,
                     "receipt": receipt,
+                    "graduating": graduating,
                 }));
             }
             Ok(json!({
@@ -238,6 +258,117 @@ fn skippable_claim(err: &str) -> bool {
         || err.contains("not_pending")
         || err.contains("in_flight")
         || err.contains("not_executing")
+}
+
+/// Kind graduates only after a successful send, never on stage or cancel.
+fn graduate_kind(brain: &BrainClient, account_id: u64, params: &Value) -> bool {
+    let Some(kind) = params
+        .get("action_kind")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    match brain.confirm_action_kind(account_id, kind) {
+        Ok(value) => value
+            .get("graduating")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+fn value_as_price(avg: &Value) -> Option<String> {
+    avg.as_str()
+        .map(str::to_string)
+        .or_else(|| avg.as_number().map(|n| n.to_string()))
+        .filter(|s| !s.is_empty() && s != "null")
+}
+
+fn fill_receipt_message(
+    params: &Value,
+    fill_qty: &str,
+    avg: Option<&str>,
+    graduating: bool,
+) -> Option<String> {
+    if !graduating {
+        return None;
+    }
+    let asset = params
+        .get("base_symbol")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let product = params
+        .get("product")
+        .and_then(Value::as_str)
+        .unwrap_or("spot");
+    let sentence = params.get("sentence").and_then(Value::as_str).unwrap_or("");
+    let mark = params
+        .get("mark")
+        .and_then(Value::as_str)
+        .and_then(|s| parse_decimal(s, "mark").ok())
+        .unwrap_or(Decimal::ZERO);
+    let qty = parse_decimal(fill_qty, "qty")
+        .ok()
+        .or_else(|| {
+            params
+                .get("quantity")
+                .and_then(Value::as_str)
+                .and_then(|s| parse_decimal(s, "quantity").ok())
+        })
+        .unwrap_or(Decimal::ZERO);
+    let notional = params
+        .get("notional")
+        .and_then(Value::as_str)
+        .and_then(|s| parse_decimal(s, "notional").ok())
+        .unwrap_or_else(|| {
+            if mark > Decimal::ZERO {
+                qty * mark
+            } else {
+                Decimal::ZERO
+            }
+        });
+    let resolved = crate::size::ResolvedSize {
+        input: String::new(),
+        denomination: "quote",
+        mark,
+        base_qty: qty,
+        notional,
+        size: crate::size::Size::Quote(notional),
+    };
+    let happened = crate::reporting::render_size_happened(&resolved, asset, product, avg, false);
+    Some(crate::reporting::render_receipt(
+        &happened,
+        &format!("You asked to {sentence}."),
+        None,
+        avg,
+        None,
+        "within limits.",
+        "Nothing to watch. I'll only message you if it moves enough to change your risk band.",
+        Some(crate::reporting::GRADUATION_NOTICE),
+        true,
+    ))
+}
+
+fn deliver_fill_receipt(params: &Value, instruction_id: &str, message: &str) {
+    eprintln!("[world-markets] thread_message");
+    for line in message.lines() {
+        eprintln!("bot ▸ {line}");
+    }
+    let brain = BrainClient::from_env();
+    let _ = brain.enqueue_outbound(&json!({
+        "kind": "receipt",
+        "message": message,
+        "account_id": params.get("account_id"),
+        "instruction_id": instruction_id,
+    }));
+    if let Some(chat_id) = params.get("telegram_chat_id").and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    }) {
+        let token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
+        let _ = crate::mini_app::post_chat_lines(&token, chat_id, &[message.to_string()]);
+    }
 }
 
 fn child_quantity(params: &Value, slice_i: u32, slice_n: u32) -> Result<String, String> {
@@ -339,8 +470,14 @@ fn args_from_params(params: &Value, account_id: u64) -> ExecuteWorldOrderArgs {
             .map(str::to_string),
         sentence: None,
         instruction_id: None,
-        size_usd: params.get("size_usd").and_then(Value::as_str).map(str::to_string),
-        size_base: params.get("size_base").and_then(Value::as_str).map(str::to_string),
+        size_usd: params
+            .get("size_usd")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        size_base: params
+            .get("size_base")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     }
 }
 
@@ -426,5 +563,35 @@ mod tests {
                 .normalize()
                 .to_string()
         );
+    }
+
+    #[test]
+    fn fill_receipt_only_when_graduating_and_never_asks_yes() {
+        let params = json!({
+            "product": "spot",
+            "base_symbol": "WETH",
+            "notional": "200",
+            "mark": "2500",
+            "quantity": "0.08",
+            "sentence": "buy $200 of WETH",
+        });
+        assert!(fill_receipt_message(&params, "0.08", Some("2500"), false).is_none());
+        let message = fill_receipt_message(&params, "0.08", Some("2500"), true).unwrap();
+        assert!(message.contains(crate::reporting::GRADUATION_NOTICE));
+        assert!(message.contains("$200"), "{message}");
+        assert!(!message.to_ascii_lowercase().contains("yes, send"));
+        let qty = message
+            .split('`')
+            .find(|t| t.starts_with("0."))
+            .unwrap_or("");
+        let frac = qty.split('.').nth(1).unwrap_or("");
+        assert!(frac.len() <= 4, "{qty}");
+    }
+
+    #[test]
+    fn skippable_claim_does_not_count_as_send() {
+        assert!(skippable_claim("cancelled"));
+        assert!(skippable_claim("too_soon"));
+        assert!(!skippable_claim("filled"));
     }
 }

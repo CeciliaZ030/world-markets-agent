@@ -279,8 +279,12 @@ pub(crate) struct ExecuteWorldOrderArgs {
     /// The user's whole utterance. Shown on the ledger during the cancel window.
     #[serde(default)]
     pub(crate) sentence: Option<String>,
-    /// Ledger instruction id when confirming a first-of-kind order (yes-binding).
+    /// Per-order ledger binding for the staged/cancel/flush row of *this* order.
+    /// Not a per-kind authorization token. A model-supplied value must not skip
+    /// the 3s read-back; staging always keys cancel/flush to the instruction
+    /// `stage_trade` returns for this call.
     #[serde(default)]
+    #[allow(dead_code)]
     pub(crate) instruction_id: Option<String>,
 }
 
@@ -1033,8 +1037,13 @@ impl DynAomiTool for RenderLookup {
         }
         if let Some(text) = args.text.as_deref() {
             if let Some(ask) = crate::lookups::parse_share_ask(text) {
-                if let Some(value) = render_percent_of(app, &ask, args.account_id, args.wallet_address.as_deref(), &ctx)
-                {
+                if let Some(value) = render_percent_of(
+                    app,
+                    &ask,
+                    args.account_id,
+                    args.wallet_address.as_deref(),
+                    &ctx,
+                ) {
                     return Ok(value);
                 }
             }
@@ -1056,6 +1065,13 @@ impl DynAomiTool for RenderLookup {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
+                if let Some(wall) = crate::cant::cant_wall_for(text) {
+                    return Ok(crate::tasks::attach_open_instructions(
+                        &app.brain,
+                        WorldMarketsApp::account_id(&ctx, args.account_id),
+                        wall,
+                    ));
+                }
                 if let Some(account_id) = WorldMarketsApp::account_id(&ctx, args.account_id) {
                     let extra = match (&args.utterance_ref, &args.slots) {
                         (None, None) => None,
@@ -1069,7 +1085,7 @@ impl DynAomiTool for RenderLookup {
                         return Ok(crate::tasks::attach_open_instructions(
                             &app.brain,
                             Some(account_id),
-                            value,
+                            crate::cant::apply_unclear_copy(value),
                         ));
                     }
                 }
@@ -1312,11 +1328,7 @@ impl DynAomiTool for GetHealthSnapshot {
             .and_then(Value::as_u64)
             .unwrap_or(0);
         let open = crate::tasks::load_open_instructions(&app.brain, Some(access.account_id));
-        let needs_attention = if needs_you == 0 {
-            json!([])
-        } else {
-            open
-        };
+        let needs_attention = if needs_you == 0 { json!([]) } else { open };
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("pnl".to_string(), json!(pnl));
             obj.insert(
@@ -1336,10 +1348,7 @@ impl DynAomiTool for GetHealthSnapshot {
                 ]),
             );
             if needs_you == 0 {
-                obj.insert(
-                    "attention_message".to_string(),
-                    json!("Nothing needs you."),
-                );
+                obj.insert("attention_message".to_string(), json!("Nothing needs you."));
             }
         }
         attach_rpc_trace(&app.client, before, &mut payload);
@@ -1472,9 +1481,13 @@ impl DynAomiTool for ExecuteWorldOrder {
     type App = WorldMarketsApp;
     type Args = ExecuteWorldOrderArgs;
     const NAME: &'static str = "execute_world_order";
-    const DESCRIPTION: &'static str = "Stage a World spot, perp, or lend/borrow order on the ledger for a 3s cancel window, then fill through the local execution sidecar after the mandate allows. Pass the user's whole sentence. Pass size_usd when they named dollars; size_base when they named the asset. Order type is inferred when omitted. First instance of an action kind returns needs_confirm — bind yes to the instruction_id. Never withdraws.";
+    const DESCRIPTION: &'static str = "Stage a World spot, perp, or lend/borrow order on the ledger for a 3s cancel window, then fill through the local execution sidecar after the mandate allows. Pass the user's whole sentence. Pass size_usd when they named dollars; size_base when they named the asset. Order type is inferred when omitted. First instance of an action kind stages with a CONFIRM-ONCE read-back (Cancel only; sends if uncancelled). Never withdraws.";
 
-    fn run(app: &WorldMarketsApp, mut args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+    fn run(
+        app: &WorldMarketsApp,
+        mut args: Self::Args,
+        ctx: DynToolCallCtx,
+    ) -> Result<Value, String> {
         let product = normalize_execute_product(&args.product)?;
         let sentence = trade_sentence(&args);
         let side = infer_execute_side(product, &args.side, Some(&sentence))?;
@@ -1490,9 +1503,12 @@ impl DynAomiTool for ExecuteWorldOrder {
         let mark_price = if product == "lend" {
             Decimal::ONE
         } else {
-            let market = app.client.market(product, base.clone(), Some(quote.clone()))?;
-            parse_decimal(&market.mark_price, "mark_price")
-                .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?
+            let market = app
+                .client
+                .market(product, base.clone(), Some(quote.clone()))?;
+            parse_decimal(&market.mark_price, "mark_price").map_err(|verdict| {
+                format!("[world-markets] {}: {}", verdict.rule, verdict.detail)
+            })?
         };
         let resolved = match resolve_size(
             Some(&sentence),
@@ -1522,13 +1538,15 @@ impl DynAomiTool for ExecuteWorldOrder {
             &ctx,
         )?;
         if !verdict.is_allow() {
-            return Ok(execution_blocked(&access, &verdict, Some(&base.symbol), Some(resolved.notional)));
+            return Ok(execution_blocked(
+                &access,
+                &verdict,
+                Some(&base.symbol),
+                Some(resolved.notional),
+            ));
         }
         let kind = action_kind(product, &side);
-        if let Some(gate) = confirm_once_gate(app, access.account_id, &kind, &args, &sentence, &resolved)?
-        {
-            return Ok(gate);
-        }
+        let first_instance = !kind_is_confirmed(app, access.account_id, &kind);
         let opposite_depth = if product == "lend" {
             None
         } else {
@@ -1551,6 +1569,14 @@ impl DynAomiTool for ExecuteWorldOrder {
         let mut staged = args.clone();
         staged.order_type = Some(plan.order_type.clone());
         let mandate = ctx.attribute_path(&["handover_mandate"]).cloned();
+        let extra = json!({
+            "action_kind": kind,
+            "notional": resolved.notional.normalize().to_string(),
+            "mark": resolved.mark.normalize().to_string(),
+            "telegram_chat_id": telegram_chat_id(&ctx),
+            "size_usd": args.size_usd,
+            "size_base": args.size_base,
+        });
         let result = crate::staged::stage_and_schedule(
             &app.brain,
             access.account_id,
@@ -1558,47 +1584,52 @@ impl DynAomiTool for ExecuteWorldOrder {
             &sentence,
             mandate.as_ref(),
             &plan,
+            Some(&extra),
         )?;
-        let graduating = mark_kind_confirmed(app, access.account_id, &kind);
+        let instruction_id = result
+            .pointer("/instruction/instruction_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let effect = preview_effect_for_receipt(app, &staged, &ctx, quantity).ok();
-        let message = crate::reporting::render_receipt(
-            &format!(
-                "Staged `{}` {} {} {} — 3s to fill.",
-                resolved.base_qty.normalize(),
-                base.symbol,
-                product,
-                plan.order_type
-            ),
-            &format!("You asked to {sentence}."),
-            effect.as_ref(),
-            None,
-            None,
-            "within limits.",
-            "Watching the fill. I'll only message you if it fails.",
-            graduating.then_some(crate::reporting::GRADUATION_NOTICE),
-            graduating,
-        );
+        let happened =
+            crate::reporting::render_size_happened(&resolved, &base.symbol, product, None, true);
+        let message = if first_instance {
+            crate::reporting::render_confirm_once_readback(&resolved, &base.symbol, product)
+        } else {
+            crate::reporting::render_receipt(
+                &happened,
+                &format!("You asked to {sentence}."),
+                effect.as_ref(),
+                None,
+                None,
+                "within limits.",
+                "Watching the fill. I'll only message you if it fails.",
+                None,
+                false,
+            )
+        };
+        let controls = if first_instance {
+            json!([
+                { "label": "Cancel", "action": "cancel", "instruction_id": instruction_id }
+            ])
+        } else {
+            json!([
+                { "label": "View on World ↗", "action": "view" },
+                { "label": "Explain", "action": "explain" },
+                { "label": "Preview exit", "action": "preview_exit" }
+            ])
+        };
         let mut payload = result;
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("resolved_size".into(), resolved.to_json());
             obj.insert("message".into(), json!(message));
             obj.insert("reply_verbatim".into(), json!(true));
-            obj.insert(
-                "controls".into(),
-                json!([
-                    { "label": "View on World ↗", "action": "view" },
-                    { "label": "Explain", "action": "explain" },
-                    { "label": "Preview exit", "action": "preview_exit" }
-                ]),
-            );
+            obj.insert("controls".into(), controls);
+            obj.insert("needs_confirm".into(), json!(first_instance));
+            obj.insert("action_kind".into(), json!(kind));
             if let Some(effect) = effect {
                 obj.insert("account_effect".into(), json!(effect));
-            }
-            if graduating {
-                obj.insert(
-                    "graduation_notice".into(),
-                    json!(crate::reporting::GRADUATION_NOTICE),
-                );
             }
         }
         log_tool_bytes("execute_world_order", &payload);
@@ -1608,7 +1639,13 @@ impl DynAomiTool for ExecuteWorldOrder {
 
 fn log_tool_bytes(name: &str, value: &Value) {
     if let Ok(raw) = serde_json::to_vec(value) {
-        eprintln!("[world-markets] tool_result_bytes name={name} bytes={}", raw.len());
+        eprintln!(
+            "[world-markets] tool_result_bytes name={name} bytes={}",
+            raw.len()
+        );
+    }
+    if let Ok(json) = serde_json::to_string(value) {
+        eprintln!("[world-markets] tool_result {name} {json}");
     }
 }
 
@@ -1693,7 +1730,10 @@ fn infer_trade_side(side: &str, sentence: Option<&str>) -> Result<String, String
     if let Some(inferred) = sentence.and_then(speech_ontology::infer_side) {
         return Ok(inferred);
     }
-    Err("[world-markets] side must be buy or sell (short→sell, long→buy). Resend with side set.".into())
+    Err(
+        "[world-markets] side must be buy or sell (short→sell, long→buy). Resend with side set."
+            .into(),
+    )
 }
 
 fn infer_execute_side(product: &str, side: &str, sentence: Option<&str>) -> Result<String, String> {
@@ -1759,82 +1799,22 @@ fn action_kind(product: &str, side: &str) -> String {
     format!("{product}_{side}")
 }
 
-fn confirm_once_gate(
-    app: &WorldMarketsApp,
-    account_id: u64,
-    kind: &str,
-    args: &ExecuteWorldOrderArgs,
-    sentence: &str,
-    resolved: &crate::size::ResolvedSize,
-) -> Result<Option<Value>, String> {
-    if args
-        .instruction_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .is_some()
-    {
-        return Ok(None);
-    }
-    match app.brain.action_kind_status(account_id, kind) {
-        Ok(status) if status.get("confirmed").and_then(Value::as_bool) == Some(true) => {
-            Ok(None)
-        }
-        Ok(_) | Err(_) => {
-            let drafted = app.brain.compose(&json!({
-                "account_id": account_id,
-                "kind": "trade_confirm",
-                "sentence": sentence,
-                "params": {
-                    "action_kind": kind,
-                    "product": args.product,
-                    "side": args.side,
-                    "base_symbol": args.base_symbol,
-                    "quote_symbol": args.quote_symbol,
-                    "quantity": args.quantity,
-                    "size_usd": args.size_usd,
-                    "size_base": args.size_base,
-                },
-            }));
-            let instruction_id = drafted
-                .as_ref()
-                .ok()
-                .and_then(|v| v.pointer("/instruction/instruction_id"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            if instruction_id.is_empty() {
-                return Ok(None);
-            }
-            Ok(Some(json!({
-                "source": "world-markets-execution",
-                "needs_confirm": true,
-                "executable": false,
-                "action_kind": kind,
-                "instruction_id": instruction_id,
-                "resolved_size": resolved.to_json(),
-                "message": crate::reporting::CONFIRM_ONCE_MESSAGE,
-                "reply_verbatim": true,
-                "controls": [
-                    { "label": "Yes, send it", "action": "confirm", "instruction_id": instruction_id },
-                    { "label": "Keep as is", "action": "keep" }
-                ],
-                "open_instructions": [{
-                    "instruction_id": instruction_id,
-                    "sentence": sentence,
-                    "kind": "trade_confirm",
-                    "status": "awaiting_confirm",
-                }],
-            })))
-        }
-    }
+fn kind_is_confirmed(app: &WorldMarketsApp, account_id: u64, kind: &str) -> bool {
+    kind_confirmed_from_status(
+        &app.brain
+            .action_kind_status(account_id, kind)
+            .unwrap_or(json!({})),
+    )
 }
 
-fn mark_kind_confirmed(app: &WorldMarketsApp, account_id: u64, kind: &str) -> bool {
-    match app.brain.confirm_action_kind(account_id, kind) {
-        Ok(value) => value.get("graduating").and_then(Value::as_bool).unwrap_or(false),
-        Err(_) => false,
-    }
+fn kind_confirmed_from_status(status: &Value) -> bool {
+    status.get("confirmed").and_then(Value::as_bool) == Some(true)
+}
+
+fn telegram_chat_id(ctx: &DynToolCallCtx) -> Option<u64> {
+    ctx.attribute_u64(&["telegram", "chat", "id"])
+        .or_else(|| ctx.attribute_u64(&["telegram", "user", "id"]))
+        .or_else(|| ctx.attribute_u64(&["chat", "id"]))
 }
 
 fn preview_effect_for_receipt(
@@ -1904,7 +1884,9 @@ pub(crate) fn place_world_order(
     let mark_price = if product == "lend" {
         Decimal::ONE
     } else {
-        let market = app.client.market(product, base.clone(), Some(quote.clone()))?;
+        let market = app
+            .client
+            .market(product, base.clone(), Some(quote.clone()))?;
         parse_decimal(&market.mark_price, "mark_price")
             .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?
     };
@@ -2921,12 +2903,7 @@ impl DynAomiTool for GetWorldTasks {
         let account_id = WorldMarketsApp::account_id(&ctx, args.account_id);
         let mandate = Mandate::bound(ctx.attribute_path(&["handover_mandate"]));
         let brief = WorldMarketsApp::brief(&ctx);
-        let mut value = crate::tasks::compose(
-            &app.brain,
-            account_id,
-            mandate,
-            brief.as_ref(),
-        );
+        let mut value = crate::tasks::compose(&app.brain, account_id, mandate, brief.as_ref());
         if args.detail.as_deref() != Some("full") {
             if let Some(obj) = value.as_object_mut() {
                 obj.remove("voice");
@@ -3112,9 +3089,8 @@ impl DynAomiTool for CancelWorldTask {
                     let matched = app.brain.match_watches(account_id, &args.id)?;
                     if matched.get("ambiguous").and_then(Value::as_bool) == Some(true) {
                         matched
-                    } else if let Some(id) = matched
-                        .pointer("/matches/0/id")
-                        .and_then(Value::as_str)
+                    } else if let Some(id) =
+                        matched.pointer("/matches/0/id").and_then(Value::as_str)
                     {
                         app.brain.cancel_watch(account_id, id)?
                     } else {
@@ -3284,7 +3260,12 @@ impl DynAomiTool for RecordWorldCorrection {
                 let phrase = args
                     .accepted_readback
                     .clone()
-                    .or_else(|| intent.get("phrase").and_then(Value::as_str).map(str::to_string))
+                    .or_else(|| {
+                        intent
+                            .get("phrase")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
                     .unwrap_or_default();
                 if let Ok(superseded) = app.brain.supersede_watch(&json!({
                     "account_id": account_id,
@@ -3440,14 +3421,8 @@ fn execution_blocked(
     symbol: Option<&str>,
     projected: Option<Decimal>,
 ) -> Value {
-    let rendered = crate::reporting::render_deny(
-        verdict.rule,
-        &verdict.detail,
-        symbol,
-        projected,
-        None,
-        None,
-    );
+    let rendered =
+        crate::reporting::render_deny(verdict.rule, &verdict.detail, symbol, projected, None, None);
     json!({
         "source": "world-markets-execution",
         "executable": false,
@@ -3871,6 +3846,41 @@ mod tests {
             app.warmer.never_refreshed(),
             "unit tests must not block on a live prefetch"
         );
+    }
+
+    #[test]
+    fn render_lookup_beef_is_cant_wall_not_unclear() {
+        let app = WorldMarketsApp::default();
+        let value = RenderLookup::run(
+            &app,
+            lookup_args("buy me $50 of beef", None),
+            empty_ctx("render_lookup"),
+        )
+        .unwrap();
+        assert_eq!(value["kind"], "cant");
+        assert_eq!(value["skip_llm"], true);
+        assert_eq!(value["executable"], false);
+        let message = value["message"].as_str().unwrap();
+        assert!(message.contains("I heard"), "{message}");
+        assert!(message.contains("World doesn't trade"), "{message}");
+        assert!(
+            message.contains("crypto spot, perps, and lending"),
+            "{message}"
+        );
+        assert!(!message.to_ascii_lowercase().contains("say buy"));
+    }
+
+    #[test]
+    fn kind_status_seen_but_not_confirmed_is_still_first_instance() {
+        assert!(!kind_confirmed_from_status(&json!({})));
+        assert!(!kind_confirmed_from_status(
+            &json!({ "ok": true, "kind": "spot_buy", "confirmed": false })
+        ));
+        assert!(kind_confirmed_from_status(&json!({ "confirmed": true })));
+        let controls = json!([{ "label": "Cancel", "action": "cancel", "instruction_id": "abc" }]);
+        assert_eq!(controls.as_array().unwrap().len(), 1);
+        assert_eq!(controls[0]["label"], "Cancel");
+        assert_ne!(controls[0]["action"], "confirm");
     }
 
     #[test]

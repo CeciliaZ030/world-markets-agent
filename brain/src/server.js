@@ -58,7 +58,7 @@ import {
   recordSlice,
   completeExecute,
 } from "./instructions.js";
-import { drain, peek } from "./outbound.js";
+import { drain, peek, enqueue } from "./outbound.js";
 import { resolvePredicate } from "./resolve.js";
 import { dataDir } from "./store.js";
 import {
@@ -385,6 +385,9 @@ async function handle(req, res) {
       return;
     case "/v1/outbound/drain":
       send(res, 200, { ok: true, items: drain(Number(body.limit) || 50) });
+      return;
+    case "/v1/outbound/enqueue":
+      send(res, 200, { ok: true, item: enqueue(body) });
       return;
     case "/v1/voice/utterance":
       send(res, 200, ingestUtterance(accountIdOf(body), body));

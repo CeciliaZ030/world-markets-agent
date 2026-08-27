@@ -125,7 +125,7 @@
     "G3_talkdown": ["isn't in your signed markets list", "View mandate on World"],
     "G4": ["Working, not stuck"],
     "G5": ["I didn't catch that — try `/p` for positions, or say what you'd like to do."],
-    "G5_conditional": ["I can watch", "I cannot place"],
+    "G5_conditional": ["I can watch", "has to be signed on World"],
     "G6": ["No"],
     "B1": ["$"],
     "B5": ["guardian", "mandate"],

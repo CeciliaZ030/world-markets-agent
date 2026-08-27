@@ -21,6 +21,8 @@
 use rust_decimal::Decimal;
 use serde::Serialize;
 
+use crate::size::ResolvedSize;
+
 /// A single figure paired with the metadata the copy layer needs to render it
 /// honestly: whether it is an estimate (vs an exact contract value) and the
 /// baseline any counterfactual is measured against (§4.1).
@@ -107,7 +109,11 @@ impl Transition {
                 crate::lookups::format_money_str(&self.after, false)
             )
         } else if self.unit.is_empty() {
-            format!("`{}` → `{}`", trim_risk(&self.before), trim_risk(&self.after))
+            format!(
+                "`{}` → `{}`",
+                trim_risk(&self.before),
+                trim_risk(&self.after)
+            )
         } else {
             format!("`{}` → `{}`", self.before, self.after)
         }
@@ -489,8 +495,7 @@ pub(crate) fn render_deny(
 }
 
 fn extract_money(detail: &str) -> String {
-    crate::lookups::first_money_token(detail)
-        .unwrap_or_else(|| format!("`{detail}`"))
+    crate::lookups::first_money_token(detail).unwrap_or_else(|| format!("`{detail}`"))
 }
 
 fn extract_last_money(detail: &str) -> String {
@@ -545,13 +550,18 @@ pub(crate) fn render_receipt(
         }
         lines.push(format!("Account effect · {}", bits.join(" · ")));
     } else if let Some(price) = fill_price {
-        lines.push(format!("Account effect · fill `{price}` · cost `{cost}`", cost = cost.unwrap_or("—")));
+        lines.push(format!(
+            "Account effect · fill `{price}` · cost `{cost}`",
+            cost = cost.unwrap_or("—")
+        ));
     } else {
         lines.push("Account effect · staged — fill pending the cancel window.".to_string());
     }
     if let Some(price) = fill_price {
         let cost_bit = cost.unwrap_or("—");
-        lines.push(format!("Execution quality · fill `{price}` · cost `{cost_bit}`."));
+        lines.push(format!(
+            "Execution quality · fill `{price}` · cost `{cost_bit}`."
+        ));
     } else {
         lines.push("Execution quality · staged, not yet filled.".to_string());
     }
@@ -576,8 +586,55 @@ pub(crate) fn render_receipt(
 pub(crate) const GRADUATION_NOTICE: &str =
     "Orders like this now execute automatically. Say `always ask` to keep confirmations.";
 
-pub(crate) const CONFIRM_ONCE_MESSAGE: &str =
-    "First time for this kind of order — confirm to send it. Say yes to place it, or change the size.";
+/// UNCLEAR (§6.21a) — non-trade register. Never assumes the user tried to buy.
+pub(crate) const UNCLEAR_MESSAGE: &str = "I didn't catch that — I trade crypto spot, perps, and lending on World. Say what you'd like to do, or `/p` for positions.";
+
+/// CONFIRM-ONCE (§6.4a) opt-out read-back. Live figures; not a request for yes.
+pub(crate) fn render_confirm_once_readback(
+    resolved: &ResolvedSize,
+    asset: &str,
+    product: &str,
+) -> String {
+    let dollars = crate::lookups::format_money(resolved.notional, false);
+    let qty = crate::size::format_base_qty(resolved.base_qty);
+    let mark = crate::lookups::format_mark_human(resolved.mark);
+    format!(
+        "Staging `{dollars}` of {asset} {product} — `~{qty}` {asset} at `~{mark}`.\nSends in 3s if you don't cancel.\n[Cancel]"
+    )
+}
+
+/// RECEIPT / staged "What happened" — dollar size primary, ≤4-dp base qty parenthetical.
+pub(crate) fn render_size_happened(
+    resolved: &ResolvedSize,
+    asset: &str,
+    product: &str,
+    fill_price: Option<&str>,
+    staged: bool,
+) -> String {
+    let dollars = crate::lookups::format_money(resolved.notional, false);
+    let qty = crate::size::format_qty_human(resolved.base_qty);
+    let core = format!("`{dollars}` of {asset} {product} (~`{qty}` {asset})");
+    if let Some(price) = fill_price.map(str::trim).filter(|p| !p.is_empty()) {
+        format!("Sent {core}, filled at `{price}`.")
+    } else if staged {
+        format!("Staged {core} — 3s to fill.")
+    } else {
+        format!("Sent {core}.")
+    }
+}
+
+/// CANT (§6.21) three-line wall. Category-level; never a trade clarification.
+pub(crate) fn render_cant_wall(heard: &str, category: &str) -> String {
+    let quoted = heard.trim().trim_end_matches('.');
+    let display = match category {
+        "food" => "meat or commodities",
+        "that" => "that",
+        other => other,
+    };
+    format!(
+        "I heard \"{quoted}.\"\nWorld doesn't trade {display}.\nWorld trades crypto spot, perps, and lending."
+    )
+}
 
 /// Dollarpower PASTE sentence. Operands: separate-venue (effective) ÷ World (committed).
 pub(crate) fn render_dollarpower_message(dp: &Dollarpower) -> String {
@@ -1162,5 +1219,86 @@ mod tests {
         assert!(veto.contains("guardian may sell"));
         assert!(veto.contains("View mandate on World"));
         assert!(!veto.to_lowercase().contains("i won't sell your sol"));
+    }
+
+    fn resolved_200_weth() -> ResolvedSize {
+        use std::str::FromStr;
+        ResolvedSize {
+            input: "$200".into(),
+            denomination: "quote",
+            mark: Decimal::from_str("2500").unwrap(),
+            base_qty: Decimal::from_str("0.0799427609831360745706074451").unwrap(),
+            notional: Decimal::from(200),
+            size: crate::size::Size::Quote(Decimal::from(200)),
+        }
+    }
+
+    #[test]
+    fn confirm_once_readback_has_live_figures_and_no_yes() {
+        let message = render_confirm_once_readback(&resolved_200_weth(), "WETH", "spot");
+        assert!(message.contains("$200"), "{message}");
+        assert!(message.contains("WETH"));
+        assert!(message.contains("spot"));
+        assert!(message.contains("~"));
+        assert!(message.contains("Sends in 3s if you don't cancel."));
+        assert!(message.contains("[Cancel]"));
+        let lower = message.to_ascii_lowercase();
+        assert!(!lower.contains("yes"));
+        assert!(!lower.contains("confirm to send"));
+        assert!(!lower.contains("say yes"));
+        let qty = message
+            .split('`')
+            .find(|t| t.starts_with('~') && t.chars().any(|c| c.is_ascii_digit()))
+            .unwrap_or("");
+        let frac = qty.trim_start_matches('~').split('.').nth(1).unwrap_or("");
+        assert!(frac.len() <= 6, "{qty}");
+    }
+
+    #[test]
+    fn size_happened_keeps_quantity_at_most_four_dp_and_shows_dollars() {
+        let staged = render_size_happened(&resolved_200_weth(), "WETH", "spot", None, true);
+        assert!(staged.contains("$200"), "{staged}");
+        assert!(staged.contains("WETH"));
+        let qty = staged
+            .split('`')
+            .find(|t| t.starts_with("0.") || t.parse::<f64>().is_ok() && t.contains('.'))
+            .unwrap_or("");
+        let frac = qty.split('.').nth(1).unwrap_or("");
+        assert!(frac.len() <= 4, "qty token {qty} in {staged}");
+        let filled =
+            render_size_happened(&resolved_200_weth(), "WETH", "spot", Some("2465.71"), false);
+        assert!(filled.contains("Sent"));
+        assert!(filled.contains("filled at `2465.71`"));
+        let receipt = render_receipt(
+            &filled,
+            "You asked to buy $200 of WETH.",
+            None,
+            Some("2465.71"),
+            None,
+            "within limits.",
+            "Watching the fill.",
+            Some(GRADUATION_NOTICE),
+            true,
+        );
+        assert!(receipt.contains("$200"));
+        assert!(receipt.contains(GRADUATION_NOTICE));
+        let qty_in_receipt = receipt
+            .split('`')
+            .find(|t| *t == "0.0799" || t.starts_with("0.07"))
+            .unwrap_or("");
+        let frac = qty_in_receipt.split('.').nth(1).unwrap_or("");
+        assert!(frac.len() <= 4, "{qty_in_receipt}");
+    }
+
+    #[test]
+    fn cant_wall_is_three_lines_and_unclear_is_non_trade() {
+        let wall = render_cant_wall("buy me $50 of beef", "food");
+        assert!(wall.contains("I heard \"buy me $50 of beef.\""));
+        assert!(wall.contains("World doesn't trade"));
+        assert!(wall.contains("World trades crypto spot, perps, and lending."));
+        assert!(!wall.to_ascii_lowercase().contains("say buy"));
+        assert!(UNCLEAR_MESSAGE.contains("I trade crypto spot, perps, and lending"));
+        assert!(UNCLEAR_MESSAGE.contains("/p"));
+        assert!(!UNCLEAR_MESSAGE.to_ascii_lowercase().contains("say buy"));
     }
 }

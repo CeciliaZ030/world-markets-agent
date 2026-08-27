@@ -17,7 +17,9 @@ fn skill(path: &str) -> String {
 
 /// Slice a workflows.md flow by its `## SLUG (§6.x)` header.
 fn flow<'a>(wf: &'a str, header: &str) -> &'a str {
-    let start = wf.find(header).unwrap_or_else(|| panic!("{header} present"));
+    let start = wf
+        .find(header)
+        .unwrap_or_else(|| panic!("{header} present"));
     let rest = &wf[start + header.len()..];
     let end = rest
         .find("\n## ")
@@ -125,6 +127,15 @@ fn workflows_contain_no_bare_response_numbers() {
         let mut prose = prose_only(&skill(file));
         if file == "workflows.md" {
             if let Some(start) = prose.find("## CORRECTION") {
+                let end = prose[start + 2..]
+                    .find("\n## ")
+                    .map(|o| start + 2 + o)
+                    .unwrap_or(prose.len());
+                prose.replace_range(start..end, "");
+            }
+            // CONFIRM-ONCE names the 3s cancel window in the template (engine constant,
+            // not a model-invented figure).
+            if let Some(start) = prose.find("## CONFIRM-ONCE") {
                 let end = prose[start + 2..]
                     .find("\n## ")
                     .map(|o| start + 2 + o)
@@ -298,7 +309,10 @@ fn research_watch_task_workflows_present() {
 #[test]
 fn unfulfillable_cant_is_distinct_from_block() {
     let wf = skill("workflows.md");
-    assert!(wf.contains("## CANT (§6.21)"), "missing unfulfillable section");
+    assert!(
+        wf.contains("## CANT (§6.21)"),
+        "missing unfulfillable section"
+    );
     assert!(
         wf.contains("not §6.6") || wf.contains("not a block") || wf.contains("Not a BLOCK"),
         "must distinguish can't from blocked"

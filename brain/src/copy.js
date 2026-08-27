@@ -147,7 +147,7 @@ export const CANT = {
   nearmatch_frame: 'Nothing called "{word}" trades on World. Close matches:',
   nearmatch_escape: "No — I meant {word}",
   unclear:
-    "I didn't catch an instrument in that. Say buy, a size, and the name.",
+    "I didn't catch that — I trade crypto spot, perps, and lending on World. Say what you'd like to do, or `/p` for positions.",
 };
 
 export function fillCant(key, vars = {}) {

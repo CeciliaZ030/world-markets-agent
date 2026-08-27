@@ -7,6 +7,23 @@ number in a real turn from that turn's tool result, never from here.
 
 ---
 
+## ACTION, first instance of a kind (CONFIRM-ONCE read-back, opt-out)
+
+user ▸ buy $200 of WETH   (first spot buy this account)
+
+    → get_world_tasks({})
+    → preview_account_effect({"base_symbol":"WETH","product":"spot",…})
+    → execute_world_order({"base_symbol":"WETH","product":"spot","size_usd":"200"})  → needs_confirm
+
+bot ▸ Staging `$200` of WETH spot — `~0.08` WETH at `~2,500`.
+      Sends in 3s if you don't cancel.
+      [Cancel]
+
+(No "yes" is asked for. The order sends when the 3s window closes uncancelled;
+the GRADUATION notice then rides the RECEIPT that reports the fill.)
+
+---
+
 ## ACTION, happy path (RECEIPT)
 
 user ▸ buy $200 of WETH

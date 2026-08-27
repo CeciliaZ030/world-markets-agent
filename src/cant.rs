@@ -36,7 +36,32 @@ pub(crate) fn try_heard(account_id: u64, text: &str, extra: Option<&Value>) -> O
     }
 }
 
-/// Backstop for when a trade-shaped ask was parsed against an asset that is not
+/// Local CANT classifier. Does not need the brain sidecar.
+pub(crate) fn cant_wall_for(text: &str) -> Option<Value> {
+    let (category, noun) = speech_ontology::unfulfillable_kind(text, &[])?;
+    Some(wrap(json!({
+        "kind": "cant",
+        "skip_llm": true,
+        "reply_verbatim": true,
+        "matched": true,
+        "message": crate::reporting::render_cant_wall(text, category),
+        "asked_entity": noun,
+        "cant_kind": category,
+        "voice_kind": "cant",
+    })))
+}
+
+/// Heard-path UNCLEAR must use the non-trade register, never a buy-clarification.
+pub(crate) fn apply_unclear_copy(mut value: Value) -> Value {
+    if value.get("kind").and_then(Value::as_str) == Some("unclear") {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("message".into(), json!(crate::reporting::UNCLEAR_MESSAGE));
+            obj.insert("skip_llm".into(), json!(true));
+            obj.insert("reply_verbatim".into(), json!(true));
+        }
+    }
+    value
+}
 /// in the universe. Primary route is model-side (`render_lookup`); this fires
 /// when the model wrongly calls preview/check instead.
 pub(crate) fn heard_unknown_trade_asset(
@@ -56,9 +81,17 @@ pub(crate) fn heard_unknown_trade_asset(
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string())
         .unwrap_or_else(|| format!("{} {} of {}", side.trim(), quantity.trim(), symbol.trim()));
-    let value = try_heard(account_id, &heard_text, None)?;
-    let kind = value.get("kind").and_then(Value::as_str).unwrap_or("");
-    matches!(kind, "cant" | "near_match" | "unclear").then_some(value)
+    if let Some(value) = try_heard(account_id, &heard_text, None) {
+        let kind = value.get("kind").and_then(Value::as_str).unwrap_or("");
+        if kind == "unclear" {
+            if let Some(wall) = cant_wall_for(&heard_text) {
+                return Some(wall);
+            }
+            return Some(apply_unclear_copy(value));
+        }
+        return matches!(kind, "cant" | "near_match").then_some(value);
+    }
+    cant_wall_for(&heard_text)
 }
 
 fn attach_normalized(account_id: u64, text: &str, obj: &mut serde_json::Map<String, Value>) {
@@ -213,19 +246,51 @@ mod tests {
             risk_price_percent: 5,
             risk_slippage_percent: 0.5,
         }];
-        assert!(heard_unknown_trade_asset(
-            Some(17),
-            Some("buy me $50 of WETH"),
-            "buy",
-            "50",
-            "WETH",
-            &assets,
-        )
-        .is_none());
+        assert!(
+            heard_unknown_trade_asset(
+                Some(17),
+                Some("buy me $50 of WETH"),
+                "buy",
+                "50",
+                "WETH",
+                &assets,
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn unknown_symbol_without_account_falls_through() {
-        assert!(heard_unknown_trade_asset(None, Some("buy me $50 of beef"), "buy", "50", "beef", &[]).is_none());
+        assert!(
+            heard_unknown_trade_asset(None, Some("buy me $50 of beef"), "buy", "50", "beef", &[])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cant_wall_for_beef_uses_unfulfillable_kind() {
+        let value = cant_wall_for("buy me $50 of beef").expect("cant");
+        assert_eq!(value["kind"], "cant");
+        assert_eq!(value["skip_llm"], true);
+        let message = value["message"].as_str().unwrap();
+        assert!(message.contains("I heard"));
+        assert!(message.contains("World doesn't trade"));
+        assert!(message.contains("crypto spot, perps, and lending"));
+        assert!(!message.to_ascii_lowercase().contains("say buy"));
+        assert!(cant_wall_for("my favourite colour is teal").is_none());
+        assert!(cant_wall_for("buy $50").is_none());
+    }
+
+    #[test]
+    fn apply_unclear_copy_replaces_trade_shaped_clarification() {
+        let value = apply_unclear_copy(json!({
+            "kind": "unclear",
+            "message": "I didn't catch an instrument in that. Say buy, a size, and the name.",
+        }));
+        let message = value["message"].as_str().unwrap();
+        assert_eq!(message, crate::reporting::UNCLEAR_MESSAGE);
+        assert!(message.contains("I trade crypto spot, perps, and lending"));
+        assert!(message.contains("/p"));
+        assert!(!message.to_ascii_lowercase().contains("say buy"));
     }
 }

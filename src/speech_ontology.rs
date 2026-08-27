@@ -1402,10 +1402,7 @@ fn repair_eth_heard_as_eight(tokens: &mut Vec<String>, channel: Channel) -> Opti
     if has_money_frame(tokens) || has_named_instrument(tokens) {
         return None;
     }
-    let act = tokens
-        .first()
-        .filter(|t| is_trade_act(t))
-        .cloned();
+    let act = tokens.first().filter(|t| is_trade_act(t)).cloned();
     if tokens.first().is_some_and(|t| is_question_opener(t)) {
         return None;
     }
@@ -1429,14 +1426,7 @@ fn repair_eth_heard_as_eight(tokens: &mut Vec<String>, channel: Channel) -> Opti
 fn is_trade_act(token: &str) -> bool {
     matches!(
         token,
-        "buy"
-            | "sell"
-            | "long"
-            | "short"
-            | "lend"
-            | "borrow"
-            | "close"
-            | "unwind"
+        "buy" | "sell" | "long" | "short" | "lend" | "borrow" | "close" | "unwind"
     )
 }
 
@@ -2119,7 +2109,10 @@ mod tests {
         assert!(!lower.iter().any(|t| t == "beef" || t == "these"));
         let buy = lower.iter().position(|t| t == "buy").expect("buy");
         let eth = lower.iter().position(|t| t == "eth").expect("eth");
-        assert!(buy < eth, "command openers must seed before instruments: {lower:?}");
+        assert!(
+            buy < eth,
+            "command openers must seed before instruments: {lower:?}"
+        );
         assert!(terms.len() <= EXTRA_KEYTERM_BUDGET);
     }
 
@@ -2404,6 +2397,10 @@ mod tests {
         let (cat, noun) = unfulfillable_kind("buy me $50 of beef", &["beef".into()]).unwrap();
         assert_eq!(cat, "food");
         assert_eq!(noun, "beef");
+        let (cat, noun) = unfulfillable_kind("buy me $50 of beef", &[]).unwrap();
+        assert_eq!(cat, "food");
+        assert_eq!(noun, "beef");
         assert!(unfulfillable_kind("buy $50", &[]).is_none());
+        assert!(unfulfillable_kind("my favourite colour is teal", &[]).is_none());
     }
 }

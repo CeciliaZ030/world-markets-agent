@@ -99,6 +99,10 @@ impl BrainClient {
         self.post("/v1/outbound/drain", &json!({ "limit": limit }))
     }
 
+    pub(crate) fn enqueue_outbound(&self, body: &Value) -> Result<Value, String> {
+        self.post("/v1/outbound/enqueue", body)
+    }
+
     pub(crate) fn ledger_summary(&self, account_id: u64) -> Result<Value, String> {
         self.get(&format!("/v1/ledger/summary?account_id={account_id}"))
     }
