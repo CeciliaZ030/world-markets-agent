@@ -183,6 +183,7 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
 }
 
 const MIN_LIVE_AUDIO: usize = 1200;
+const MIN_LIVE_WAV: usize = 4000;
 
 /// Partial STT for hold-to-talk captions. Deepgram only; never ingests or dispatches.
 pub fn transcribe_live(account_id: u64, body: &Value) -> Result<Value, String> {
@@ -200,11 +201,34 @@ fn transcribe_live_text(account_id: u64, body: &Value) -> String {
         .get("mime")
         .and_then(Value::as_str)
         .unwrap_or("audio/webm");
-    let keyterms = seed_keyterms(account_id);
-    match stt::transcribe(&audio, mime, &keyterms) {
+    let keyterms = live_keyterms(account_id);
+    match stt::transcribe_partial(&audio, mime, &keyterms) {
         Ok(transcript) => transcript.text.trim().to_string(),
         Err(_) => String::new(),
     }
+}
+
+fn live_keyterms(_account_id: u64) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut push = |term: &str| {
+        let t = term.trim();
+        if t.len() < 2 || t.contains(char::is_whitespace) {
+            return;
+        }
+        if seen.insert(t.to_ascii_lowercase()) {
+            out.push(t.to_string());
+        }
+    };
+    for term in [
+        "ETH", "WETH", "BTC", "WBTC", "SOL", "USDC", "USDT", "buy", "sell", "watch", "worth",
+    ] {
+        push(term);
+    }
+    for term in speech_ontology::boostable_keyterms().into_iter().take(24) {
+        push(&term);
+    }
+    out
 }
 
 fn decode_live_audio(body: &Value) -> Option<Vec<u8>> {
@@ -212,7 +236,9 @@ fn decode_live_audio(body: &Value) -> Option<Vec<u8>> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(raw.trim())
         .ok()?;
-    if bytes.len() < MIN_LIVE_AUDIO || bytes.len() > 5_000_000 {
+    let mime = body.get("mime").and_then(Value::as_str).unwrap_or("");
+    let min = if mime.contains("wav") { MIN_LIVE_WAV } else { MIN_LIVE_AUDIO };
+    if bytes.len() < min || bytes.len() > 5_000_000 {
         return None;
     }
     Some(bytes)
@@ -394,6 +420,7 @@ mod tests {
         assert!(!body.contains("ingest_utterance"));
         assert!(!body.contains("submit_heard"));
         assert!(!body.contains("ingest_voice"));
+        assert!(body.contains("transcribe_partial"));
     }
 
     #[test]

@@ -1102,10 +1102,38 @@ body.home-v7 .toast {
   pointer-events: none;
 }
 .voice-hero .mic-svg { position: relative; z-index: 1; }
-.voice-hero .wave, .voice-hero .rip, .voice-hero .check, .voice-hero .sending-spin {
+.voice-hero .wave, .voice-hero .rip, .voice-hero .check, .voice-hero .sending-spin, .voice-hero .voice-arm {
   display: none;
 }
-.voice-dock.listening .voice-hero {
+.voice-arm {
+  position: absolute;
+  inset: -11px;
+  border-radius: 50%;
+  pointer-events: none;
+  z-index: 2;
+  animation: voice-orbit 0.85s linear infinite;
+}
+.voice-arm i {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: 11px;
+  height: 11px;
+  margin-left: -5.5px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 12px 3px rgba(77, 163, 255, 0.55);
+}
+.voice-dock.arming .voice-arm {
+  display: block;
+  box-shadow: inset 0 0 0 1px rgba(77, 163, 255, 0.28);
+}
+.voice-dock.arming .voice-hero {
+  border-color: rgba(77, 163, 255, 0.85);
+  box-shadow: 0 0 0 2px rgba(77, 163, 255, 0.18), 0 20px 54px rgba(0, 0, 0, 0.55);
+}
+.voice-dock.arming .voice-status { color: var(--accent); }
+.voice-dock.listening:not(.arming) .voice-hero {
   background: radial-gradient(circle at 50% 30%, #7cbcff, #2f7fe0 70%);
   border-color: #8cc4ff;
   box-shadow: 0 0 0 11px rgba(77, 163, 255, 0.16), 0 0 80px 13px rgba(77, 163, 255, 0.38);
@@ -1113,8 +1141,8 @@ body.home-v7 .toast {
   transform: scale(1.07);
   animation: fadein 0.12s;
 }
-.voice-dock.listening .voice-halo, .voice-dock.listening .mic-svg { display: none; }
-.voice-dock.listening .wave, .voice-dock.listening .rip { display: block; }
+.voice-dock.listening:not(.arming) .voice-halo, .voice-dock.listening:not(.arming) .mic-svg { display: none; }
+.voice-dock.listening:not(.arming) .wave, .voice-dock.listening:not(.arming) .rip { display: block; }
 .voice-dock.live-level .wave i { animation: none; }
 .voice-dock.drafted .voice-hero {
   background: var(--well);
@@ -1160,7 +1188,7 @@ body.home-v7 .toast {
   align-items: center;
   pointer-events: none;
 }
-.voice-dock.listening .wave { display: flex; }
+.voice-dock.listening:not(.arming) .wave { display: flex; }
 .wave i {
   width: 5px;
   border-radius: 3px;
@@ -1187,7 +1215,7 @@ body.home-v7 .toast {
   pointer-events: none;
   transition: opacity 0.12s ease;
 }
-.voice-dock.listening .voice-level { opacity: 1; }
+.voice-dock.listening:not(.arming) .voice-level { opacity: 1; }
 .voice-level i {
   display: block;
   height: 9px;
@@ -1212,7 +1240,7 @@ body.home-v7 .toast {
   color: var(--mute);
   min-height: 16px;
 }
-.voice-dock.listening .voice-status { color: var(--accent); }
+.voice-dock.listening:not(.arming) .voice-status { color: var(--accent); }
 .voice-dock.drafted .voice-status { color: var(--pos); }
 
 .home-acts {
@@ -1265,6 +1293,9 @@ body.home-v7 .toast {
   from { transform: scale(1); opacity: 0.55; }
   to { transform: scale(1.9); opacity: 0; }
 }
+@keyframes voice-orbit {
+  to { transform: rotate(360deg); }
+}
 @keyframes wv {
   from { transform: scaleY(0.3); }
   to { transform: scaleY(1); }
@@ -1280,11 +1311,11 @@ body.home-v7 .toast {
 .heartbeat .dot { animation: pulse-dot 2.4s infinite; }
 @media (prefers-reduced-motion: reduce) {
   .voice-halo, .rip, .wave i, .listen-lab, .listen-caret, .heartbeat .dot,
-  .row.voice-draft.fresh .row-front, .home-act.type-pulse {
+  .row.voice-draft.fresh .row-front, .home-act.type-pulse, .voice-arm {
     animation: none !important;
   }
   .home-ledger { transition: none; }
-  .voice-dock.listening .voice-hero { transform: none; }
+  .voice-dock.listening:not(.arming) .voice-hero { transform: none; }
   .voice-level { transition: none; }
   .voice-level i { transition: none; }
 }

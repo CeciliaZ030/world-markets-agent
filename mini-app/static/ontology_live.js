@@ -3,6 +3,8 @@
 
 const PROTECTED_KINDS = new Set(["act", "size", "unit", "size_frame", "product", "order_type"]);
 const PROTECTED_TOKENS = new Set(["of", "a", "an", "the", "and", "then", "to", "for", "me", "my"]);
+/** Phonetic STT misses shown as the instrument while holding; not pronouns or real words like beef. */
+const LIVE_HINTS = new Set(["east", "eath", "eeth", "eeths", "ease", "soul", "sawl"]);
 
 const FALLBACK_ENTRIES = [
   { surface_form: "ether", normalized_target: "ETH", kind: "instrument" },
@@ -42,7 +44,12 @@ function loadEntries(entries) {
       protectedSurfaces.add(key);
       continue;
     }
-    if (kind === "confusable") continue;
+    if (kind === "confusable") {
+      if (LIVE_HINTS.has(key) && target) {
+        aliasBySurface.set(key, target);
+      }
+      continue;
+    }
     if (kind !== "instrument") continue;
     if (!target || key === normalizeKey(target)) continue;
     aliasBySurface.set(key, target);

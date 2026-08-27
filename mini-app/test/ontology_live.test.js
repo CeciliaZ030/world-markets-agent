@@ -15,8 +15,20 @@ test("live transcript rewrites instrument aliases", () => {
   assert.equal(correctLiveTranscript("watch solana"), "watch SOL");
 });
 
-test("live transcript does not silent-map confusables", () => {
+test("live transcript maps phonetic ETH/SOL misses only", () => {
+  setOntologyEntries([
+    { surface_form: "ether", normalized_target: "ETH", kind: "instrument" },
+    { surface_form: "east", normalized_target: "ETH", kind: "confusable" },
+    { surface_form: "eath", normalized_target: "ETH", kind: "confusable" },
+    { surface_form: "soul", normalized_target: "SOL", kind: "confusable" },
+    { surface_form: "beef", normalized_target: "ETH", kind: "confusable" },
+    { surface_form: "it", normalized_target: "ETH", kind: "confusable" },
+    { surface_form: "these", normalized_target: "ETH", kind: "confusable" },
+  ]);
+  assert.equal(correctLiveTranscript("buy one east"), "buy one ETH");
+  assert.equal(correctLiveTranscript("sell soul"), "sell SOL");
   assert.equal(correctLiveTranscript("buy fifty of beef"), "buy fifty of beef");
+  assert.equal(correctLiveTranscript("watch it"), "watch it");
   assert.equal(correctLiveTranscript("buy these"), "buy these");
 });
 

@@ -906,12 +906,13 @@ function voiceDockHtml() {
     words +
     `</div>` +
     `</div>` +
-    `<div class="voice-dock ${phase}" id="voiceDock">` +
+    `<div class="voice-dock ${phase}${phase === "listening" && !voiceReady ? " arming" : ""}" id="voiceDock">` +
     nudge +
     `<div class="voice-hero-wrap">` +
     voiceLevelHtml() +
     `<button type="button" class="voice-hero" id="voiceBtn" aria-label="${escapeHtml(voiceStatusText())}">` +
     `<div class="voice-halo"></div>` +
+    `<div class="voice-arm" aria-hidden="true"><i></i></div>` +
     `<div class="rip"></div><div class="rip d2"></div>` +
     micSvg() +
     `<div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i></div>` +
@@ -2247,6 +2248,8 @@ let voiceChunks = [];
 let voiceStream = null;
 let voiceWanted = false;
 let voiceReady = false;
+let voiceCaptureArmed = false;
+let voiceReadyTimer = null;
 let voiceStartedAt = 0;
 let voiceTick = null;
 let voiceNudgeTimer = null;
@@ -2257,6 +2260,10 @@ let livePollInFlight = false;
 let livePollSeq = 0;
 let liveAppliedSeq = 0;
 let liveFromServer = false;
+let livePcmChunks = [];
+let livePcmSamples = 0;
+let livePcmRate = 48000;
+let liveCapture = null;
 let voiceAnalyser = null;
 let voiceAudioCtx = null;
 let voiceLevelRaf = 0;
@@ -2374,20 +2381,25 @@ function syncVoiceDom() {
   const scrim = document.getElementById("listenScrim");
   const status = document.getElementById("voiceStatus");
   const btn = document.getElementById("voiceBtn");
+  const listening = state.voice.phase === "listening";
+  const arming = listening && !voiceReady;
   if (dock) {
     dock.className =
-      "voice-dock " + state.voice.phase + (voiceAnalyser ? " live-level" : "");
+      "voice-dock " +
+      state.voice.phase +
+      (arming ? " arming" : "") +
+      (voiceAnalyser && !arming ? " live-level" : "");
   }
-  if (ledger) ledger.classList.toggle("dim", state.voice.phase === "listening");
-  if (scrim) scrim.classList.toggle("on", state.voice.phase === "listening");
+  if (ledger) ledger.classList.toggle("dim", listening);
+  if (scrim) scrim.classList.toggle("on", listening);
   if (status) status.textContent = voiceStatusText();
   if (btn) {
-    btn.classList.toggle("hot", state.voice.phase === "listening");
+    btn.classList.toggle("hot", listening && !arming);
     btn.setAttribute("aria-label", voiceStatusText());
   }
   const words = document.getElementById("liveWords");
   if (words) {
-    const show = liveWordsOn() && state.voice.phase === "listening";
+    const show = liveWordsOn() && listening;
     words.hidden = !show;
     if (show) words.innerHTML = liveWordsInnerHtml();
   }
@@ -2413,10 +2425,14 @@ function ensureAudioCtx() {
   if (!AC) return null;
   if (!voiceAudioCtx || voiceAudioCtx.state === "closed") {
     try {
-      voiceAudioCtx = new AC();
+      voiceAudioCtx = new AC({ latencyHint: "interactive" });
     } catch (_) {
-      voiceAudioCtx = null;
-      return null;
+      try {
+        voiceAudioCtx = new AC();
+      } catch (__) {
+        voiceAudioCtx = null;
+        return null;
+      }
     }
   }
   if (voiceAudioCtx.state === "suspended") {
@@ -2426,9 +2442,9 @@ function ensureAudioCtx() {
 }
 
 function mapVoiceLevel(rms, peak) {
-  const floor = 0.018;
-  const body = Math.max(0, rms - floor) * 4.6;
-  const spike = Math.max(0, peak - 0.06) * 0.9;
+  const floor = 0.004;
+  const body = Math.max(0, rms - floor) * 5.4;
+  const spike = Math.max(0, peak - 0.03) * 1.1;
   return Math.min(1, Math.pow(Math.max(body, body * 0.72 + spike * 0.5), 0.62));
 }
 
@@ -2519,6 +2535,25 @@ function stopLevelLoop() {
 
 function disconnectAnalyserNodes() {
   stopLevelLoop();
+  if (liveCapture) {
+    try {
+      liveCapture.proc.disconnect();
+    } catch (_) {
+      /* ignore */
+    }
+    try {
+      liveCapture.sink.disconnect();
+    } catch (_) {
+      /* ignore */
+    }
+    try {
+      if (liveCapture.mute) liveCapture.mute.disconnect();
+    } catch (_) {
+      /* ignore */
+    }
+    liveCapture.proc.onaudioprocess = null;
+    liveCapture = null;
+  }
   if (voiceAnalyser && voiceAnalyser.src) {
     try {
       voiceAnalyser.src.disconnect();
@@ -2527,6 +2562,8 @@ function disconnectAnalyserNodes() {
     }
   }
   voiceAnalyser = null;
+  livePcmChunks = [];
+  livePcmSamples = 0;
 }
 
 function startAnalyser(stream) {
@@ -2537,25 +2574,37 @@ function startAnalyser(stream) {
     const src = ctx.createMediaStreamSource(stream);
     const an = ctx.createAnalyser();
     an.fftSize = 256;
-    an.smoothingTimeConstant = 0.28;
+    an.smoothingTimeConstant = 0.18;
     src.connect(an);
     voiceAnalyser = { ctx, src, an, time: new Uint8Array(an.fftSize) };
     startLevelLoop();
+    if (typeof ctx.createScriptProcessor !== "function") return;
+    const proc = ctx.createScriptProcessor(2048, 1, 1);
+    const sink = ctx.createMediaStreamDestination();
+    const mute = ctx.createGain();
+    mute.gain.value = 0;
+    src.connect(proc);
+    proc.connect(sink);
+    proc.connect(mute);
+    mute.connect(ctx.destination);
+    livePcmChunks = [];
+    livePcmSamples = 0;
+    livePcmRate = ctx.sampleRate || 48000;
+    proc.onaudioprocess = (ev) => {
+      if (!voiceWanted) return;
+      const input = ev.inputBuffer.getChannelData(0);
+      livePcmChunks.push(new Float32Array(input));
+      livePcmSamples += input.length;
+      markVoiceReady();
+    };
+    liveCapture = { proc, sink, mute };
   } catch (_) {
-    voiceAnalyser = null;
+    if (!voiceAnalyser) voiceAnalyser = null;
   }
 }
 
 function stopAnalyser() {
   disconnectAnalyserNodes();
-  if (voiceAudioCtx && voiceAudioCtx.state !== "closed") {
-    try {
-      voiceAudioCtx.close();
-    } catch (_) {
-      /* ignore */
-    }
-  }
-  voiceAudioCtx = null;
 }
 
 function liveWordsInnerHtml() {
@@ -2572,7 +2621,7 @@ function liveWordsInnerHtml() {
     .map((span) => {
       const display = escapeHtml(span.display);
       if (!span.rewritten) return display;
-      return `<s class="listen-from">${escapeHtml(span.surface)}</s><span class="listen-to">${display}</span>`;
+      return `<s class="listen-from">${escapeHtml(span.surface)}</s> <span class="listen-to">${display}</span>`;
     })
     .join(" ");
   return html + caret;
@@ -2646,7 +2695,7 @@ function stopLivePoll() {
 function startLivePoll() {
   stopLivePoll();
   if (!liveWordsOn()) return;
-  scheduleLivePoll(400);
+  scheduleLivePoll(160);
 }
 
 function scheduleLivePoll(delay) {
@@ -2654,21 +2703,70 @@ function scheduleLivePoll(delay) {
   livePollTimer = setTimeout(tickLivePoll, delay);
 }
 
+function encodeWavFromPcm(chunks, sampleRate) {
+  let count = 0;
+  for (let i = 0; i < chunks.length; i++) count += chunks[i].length;
+  if (!count) return null;
+  const pcm = new Int16Array(count);
+  let o = 0;
+  for (let c = 0; c < chunks.length; c++) {
+    const src = chunks[c];
+    for (let i = 0; i < src.length; i++) {
+      const s = Math.max(-1, Math.min(1, src[i]));
+      pcm[o++] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+  }
+  const bytes = pcm.byteLength;
+  const buf = new ArrayBuffer(44 + bytes);
+  const view = new DataView(buf);
+  const writeStr = (off, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i));
+  };
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + bytes, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, "data");
+  view.setUint32(40, bytes, true);
+  new Uint8Array(buf, 44).set(new Uint8Array(pcm.buffer));
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+function liveCaptionBlob() {
+  if (livePcmSamples >= livePcmRate * 0.18) {
+    const wav = encodeWavFromPcm(livePcmChunks.slice(), livePcmRate);
+    if (wav && wav.size >= 4000) return wav;
+  }
+  if (voiceRecorder && typeof voiceRecorder.requestData === "function" && voiceRecorder.state === "recording") {
+    try {
+      voiceRecorder.requestData();
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  if (!voiceChunks.length) return null;
+  const mime = (voiceRecorder && voiceRecorder.mimeType) || "audio/webm";
+  const blob = new Blob(voiceChunks.slice(), { type: mime });
+  return blob.size >= 1200 ? blob : null;
+}
+
 async function tickLivePoll() {
   livePollTimer = null;
   if (!shouldLivePoll()) return;
   if (livePollInFlight) {
-    scheduleLivePoll(250);
+    scheduleLivePoll(180);
     return;
   }
-  if (!voiceChunks.length) {
-    scheduleLivePoll(280);
-    return;
-  }
-  const mime = (voiceRecorder && voiceRecorder.mimeType) || "audio/webm";
-  const blob = new Blob(voiceChunks.slice(), { type: mime });
-  if (blob.size < 1200) {
-    scheduleLivePoll(280);
+  const blob = liveCaptionBlob();
+  if (!blob) {
+    scheduleLivePoll(160);
     return;
   }
   const seq = ++livePollSeq;
@@ -2678,7 +2776,7 @@ async function tickLivePoll() {
     if (!shouldLivePoll()) return;
     const out = await api("/api/v1/mini-app/voice/live", {
       method: "POST",
-      body: { audio_base64, mime: blob.type || mime },
+      body: { audio_base64, mime: blob.type || "audio/wav" },
     });
     if (seq < liveAppliedSeq) return;
     liveAppliedSeq = seq;
@@ -2691,8 +2789,22 @@ async function tickLivePoll() {
     /* keep last caption */
   } finally {
     livePollInFlight = false;
-    if (shouldLivePoll()) scheduleLivePoll(200);
+    if (shouldLivePoll()) scheduleLivePoll(120);
   }
+}
+
+function markVoiceReady() {
+  if (voiceReady || !voiceWanted || state.voice.phase !== "listening") return;
+  if (!voiceCaptureArmed) return;
+  clearTimeout(voiceReadyTimer);
+  voiceReadyTimer = null;
+  voiceReady = true;
+  voiceStartedAt = Date.now();
+  startLivePoll();
+  haptic("impact", "light");
+  const btn = document.getElementById("voiceBtn");
+  if (btn) btn.classList.add("hot");
+  syncVoiceDom();
 }
 
 function beginListening(btn) {
@@ -2703,6 +2815,9 @@ function beginListening(btn) {
   }
   voiceWanted = true;
   voiceReady = false;
+  voiceCaptureArmed = false;
+  clearTimeout(voiceReadyTimer);
+  voiceReadyTimer = null;
   voiceChunks = [];
   voiceStartedAt = Date.now();
   state.voice.phase = "listening";
@@ -2713,13 +2828,20 @@ function beginListening(btn) {
   haptic("impact", "light");
   syncVoiceDom();
   startVoiceTick();
-  startLiveWords();
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     onMicDenied();
     return;
   }
   navigator.mediaDevices
-    .getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } })
+    .getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
+    })
+    .catch(() => navigator.mediaDevices.getUserMedia({ audio: true }))
     .then((stream) => {
       if (!voiceWanted || state.voice.phase !== "listening") {
         stream.getTracks().forEach((t) => t.stop());
@@ -2748,10 +2870,9 @@ function beginListening(btn) {
       } catch (_) {
         voiceRecorder.start();
       }
-      voiceStartedAt = Date.now();
-      voiceReady = true;
-      startLivePoll();
-      if (btn) btn.classList.add("hot");
+      voiceCaptureArmed = true;
+      voiceReadyTimer = setTimeout(markVoiceReady, 280);
+      if (livePcmSamples > 0) markVoiceReady();
       syncVoiceDom();
     })
     .catch(() => {
@@ -2775,6 +2896,9 @@ function onMicDenied() {
 function closeCaptureImmediate() {
   voiceWanted = false;
   voiceReady = false;
+  voiceCaptureArmed = false;
+  clearTimeout(voiceReadyTimer);
+  voiceReadyTimer = null;
   clearInterval(voiceTick);
   voiceTick = null;
   stopLivePoll();
@@ -3570,7 +3694,13 @@ async function loadChartView(params) {
 function warmMic() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
   navigator.mediaDevices
-    .getUserMedia({ audio: true })
+    .getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
+    })
     .then((stream) => stream.getTracks().forEach((t) => t.stop()))
     .catch(() => {
       /* permission prompt happens on first hold */

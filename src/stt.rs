@@ -70,6 +70,20 @@ pub fn deepgram_configured() -> bool {
 }
 
 pub fn transcribe(audio: &[u8], mime: &str, keyterms: &[String]) -> Result<Transcript, SttError> {
+    transcribe_with(audio, mime, keyterms, false)
+}
+
+/// Faster partial captions: no endpointing/punctuation so words land before a pause.
+pub fn transcribe_partial(audio: &[u8], mime: &str, keyterms: &[String]) -> Result<Transcript, SttError> {
+    transcribe_with(audio, mime, keyterms, true)
+}
+
+fn transcribe_with(
+    audio: &[u8],
+    mime: &str,
+    keyterms: &[String],
+    partial: bool,
+) -> Result<Transcript, SttError> {
     if audio.is_empty() {
         return Err(SttError::empty());
     }
@@ -79,7 +93,10 @@ pub fn transcribe(audio: &[u8], mime: &str, keyterms: &[String]) -> Result<Trans
             .unwrap_or_default()
             .trim()
             .to_string();
-        return deepgram(audio, content_type, &key, keyterms);
+        return deepgram(audio, content_type, &key, keyterms, partial);
+    }
+    if partial {
+        return Err(SttError::unconfigured());
     }
     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         let key = key.trim().to_string();
@@ -95,18 +112,20 @@ fn deepgram(
     content_type: &str,
     key: &str,
     keyterms: &[String],
+    partial: bool,
 ) -> Result<Transcript, SttError> {
+    let timeout = if partial {
+        std::time::Duration::from_secs(12)
+    } else {
+        std::time::Duration::from_secs(60)
+    };
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(timeout)
         .build()
         .map_err(|err| SttError::provider(err.to_string()))?;
     let mut request = client
         .post(DEEPGRAM_URL)
-        .query(&[
-            ("model", "nova-2"),
-            ("smart_format", "true"),
-            ("punctuate", "true"),
-        ])
+        .query(&deepgram_query(partial))
         .header("Authorization", format!("Token {key}"))
         .header("Content-Type", content_type)
         .body(audio.to_vec());
@@ -127,6 +146,25 @@ fn deepgram(
         .json()
         .map_err(|err| SttError::provider(format!("deepgram returned invalid JSON ({err})")))?;
     parse_deepgram(value, keyterm_applied)
+}
+
+fn deepgram_query(partial: bool) -> Vec<(&'static str, &'static str)> {
+    if partial {
+        vec![
+            ("model", "nova-2"),
+            ("smart_format", "false"),
+            ("punctuate", "false"),
+            ("numerals", "false"),
+            ("endpointing", "false"),
+            ("filler_words", "false"),
+        ]
+    } else {
+        vec![
+            ("model", "nova-2"),
+            ("smart_format", "true"),
+            ("punctuate", "true"),
+        ]
+    }
 }
 
 /// nova-2 `keywords` intensifier is roughly 1–10. Instruments use 5 so ETH/WETH
@@ -305,5 +343,14 @@ mod tests {
             "nickname".to_string(),
         ]);
         assert_eq!(params, vec!["ETH:5", "buy:3", "worth:3", "nickname:2"]);
+    }
+
+    #[test]
+    fn live_query_disables_endpointing() {
+        let q = deepgram_query(true);
+        assert!(q.contains(&("endpointing", "false")));
+        assert!(q.contains(&("punctuate", "false")));
+        assert!(q.contains(&("smart_format", "false")));
+        assert!(q.contains(&("numerals", "false")));
     }
 }
