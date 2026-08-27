@@ -78,6 +78,7 @@ const state = {
     phase: "idle",
     heldMs: 0,
     transcript: "",
+    transcriptRaw: "",
     nudge: "",
     micDenied: false,
     typePulse: false,
@@ -882,6 +883,10 @@ function voiceStatusText() {
   return voiceMode() === "tap" ? C.voice.tapIdle : C.voice.hold;
 }
 
+function voiceLevelHtml() {
+  return `<div class="voice-level" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>`;
+}
+
 function voiceDockHtml() {
   const phase = state.voice.phase;
   const nudge = state.voice.nudge
@@ -889,23 +894,22 @@ function voiceDockHtml() {
     : `<div class="voice-nudge" id="voiceNudge" hidden></div>`;
   const words = `<div class="listen-words" id="liveWords"${
     liveWordsOn() && phase === "listening" ? "" : " hidden"
-  }>${
-    phase === "listening"
-      ? escapeHtml(state.voice.transcript || "") +
-        `<span class="listen-caret">${escapeHtml(C.listening.caret)}</span>`
-      : `<span class="listen-caret">${escapeHtml(C.listening.caret)}</span>`
-  }</div>`;
+  }>${liveWordsInnerHtml()}</div>`;
   const typePulse = state.voice.typePulse ? " type-pulse" : "";
   return (
     `<div class="home-ledger-wrap">` +
     `<div class="home-ledger${phase === "listening" ? " dim" : ""}" id="homeLedger">` +
     ledgerZonesHtml() +
     `</div>` +
-    `<div class="listen-scrim${phase === "listening" ? " on" : ""}" id="listenScrim"><div class="listen-lab">${escapeHtml(C.listening.label)}</div></div>` +
+    `<div class="listen-scrim${phase === "listening" ? " on" : ""}" id="listenScrim">` +
+    `<div class="listen-lab">${escapeHtml(C.listening.label)}</div>` +
+    words +
+    `</div>` +
     `</div>` +
     `<div class="voice-dock ${phase}" id="voiceDock">` +
     nudge +
-    words +
+    `<div class="voice-hero-wrap">` +
+    voiceLevelHtml() +
     `<button type="button" class="voice-hero" id="voiceBtn" aria-label="${escapeHtml(voiceStatusText())}">` +
     `<div class="voice-halo"></div>` +
     `<div class="rip"></div><div class="rip d2"></div>` +
@@ -914,6 +918,8 @@ function voiceDockHtml() {
     `<div class="spin sending-spin"></div>` +
     `<div class="check">✓</div>` +
     `</button>` +
+    voiceLevelHtml() +
+    `</div>` +
     `<div class="voice-status" id="voiceStatus">${escapeHtml(voiceStatusText())}</div>` +
     `</div>` +
     nearMatchHtml() +
@@ -2246,7 +2252,17 @@ let voiceTick = null;
 let voiceNudgeTimer = null;
 let voiceDraftTimer = null;
 let liveRec = null;
+let livePollTimer = null;
+let livePollInFlight = false;
+let livePollSeq = 0;
+let liveAppliedSeq = 0;
+let liveFromServer = false;
 let voiceAnalyser = null;
+let voiceAudioCtx = null;
+let voiceLevelRaf = 0;
+let voiceLevelSmoothed = 0;
+let voiceLevelEls = [];
+let voiceWaveBars = [];
 
 function bindVoice() {
   const btn = document.getElementById("voiceBtn");
@@ -2293,6 +2309,7 @@ function pointInCircle(btn, x, y) {
 }
 
 function onVoiceDown(btn) {
+  ensureAudioCtx();
   if (state.voice.phase === "drafted" || state.voice.phase === "sending") {
     clearTimeout(voiceDraftTimer);
     state.voice.phase = "idle";
@@ -2357,7 +2374,10 @@ function syncVoiceDom() {
   const scrim = document.getElementById("listenScrim");
   const status = document.getElementById("voiceStatus");
   const btn = document.getElementById("voiceBtn");
-  if (dock) dock.className = "voice-dock " + state.voice.phase;
+  if (dock) {
+    dock.className =
+      "voice-dock " + state.voice.phase + (voiceAnalyser ? " live-level" : "");
+  }
   if (ledger) ledger.classList.toggle("dim", state.voice.phase === "listening");
   if (scrim) scrim.classList.toggle("on", state.voice.phase === "listening");
   if (status) status.textContent = voiceStatusText();
@@ -2369,11 +2389,7 @@ function syncVoiceDom() {
   if (words) {
     const show = liveWordsOn() && state.voice.phase === "listening";
     words.hidden = !show;
-    if (show) {
-      words.innerHTML =
-        escapeHtml(state.voice.transcript || "") +
-        `<span class="listen-caret">${escapeHtml(C.listening.caret)}</span>`;
-    }
+    if (show) words.innerHTML = liveWordsInnerHtml();
   }
 }
 
@@ -2389,48 +2405,177 @@ function startVoiceTick() {
     state.voice.heldMs = Date.now() - (voiceStartedAt || Date.now());
     const status = document.getElementById("voiceStatus");
     if (status) status.textContent = voiceStatusText();
-    tickWave();
   }, 110);
 }
 
-function tickWave() {
-  const bars = document.querySelectorAll(".wave i");
-  if (!bars.length || !voiceAnalyser) return;
-  voiceAnalyser.an.getByteFrequencyData(voiceAnalyser.data);
-  bars.forEach((bar, i) => {
-    const v = voiceAnalyser.data[i + 1] || 0;
-    bar.style.height = 8 + (v / 255) * 30 + "px";
+function ensureAudioCtx() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return null;
+  if (!voiceAudioCtx || voiceAudioCtx.state === "closed") {
+    try {
+      voiceAudioCtx = new AC();
+    } catch (_) {
+      voiceAudioCtx = null;
+      return null;
+    }
+  }
+  if (voiceAudioCtx.state === "suspended") {
+    voiceAudioCtx.resume().catch(() => {});
+  }
+  return voiceAudioCtx;
+}
+
+function mapVoiceLevel(rms, peak) {
+  const floor = 0.018;
+  const body = Math.max(0, rms - floor) * 4.6;
+  const spike = Math.max(0, peak - 0.06) * 0.9;
+  return Math.min(1, Math.pow(Math.max(body, body * 0.72 + spike * 0.5), 0.62));
+}
+
+function paintVoiceLevel(level) {
+  const litFrac = Math.max(0, Math.min(1, level));
+  voiceLevelEls.forEach((col) => {
+    const segs = col.children;
+    const n = segs.length;
+    const lit = Math.round(litFrac * n);
+    for (let i = 0; i < n; i++) {
+      const on = i < lit;
+      segs[i].classList.toggle("on", on);
+      segs[i].classList.toggle("hot", on && i >= n - 2 && litFrac > 0.82);
+    }
   });
+  const wrap = document.querySelector(".voice-hero-wrap");
+  if (wrap) wrap.style.setProperty("--voice-lvl", litFrac.toFixed(3));
+}
+
+function paintWaveFromTime(time, level) {
+  const n = voiceWaveBars.length;
+  if (!n || !time || !time.length) return;
+  const slice = Math.max(1, Math.floor(time.length / n));
+  for (let i = 0; i < n; i++) {
+    let peak = 0;
+    const start = i * slice;
+    const end = Math.min(time.length, start + slice);
+    for (let j = start; j < end; j++) {
+      const a = Math.abs((time[j] - 128) / 128);
+      if (a > peak) peak = a;
+    }
+    voiceWaveBars[i].style.height = 8 + Math.max(peak, level * 0.28) * 44 + "px";
+  }
+}
+
+function resetVoiceLevelDom() {
+  paintVoiceLevel(0);
+  voiceWaveBars.forEach((bar) => {
+    bar.style.height = "";
+  });
+  const wrap = document.querySelector(".voice-hero-wrap");
+  if (wrap) wrap.style.removeProperty("--voice-lvl");
+}
+
+function tickVoiceLevel() {
+  if (!voiceAnalyser) return;
+  const { an, time } = voiceAnalyser;
+  an.getByteTimeDomainData(time);
+  let sum = 0;
+  let peak = 0;
+  for (let i = 0; i < time.length; i++) {
+    const x = (time[i] - 128) / 128;
+    sum += x * x;
+    const a = Math.abs(x);
+    if (a > peak) peak = a;
+  }
+  const mapped = mapVoiceLevel(Math.sqrt(sum / time.length), peak);
+  const follow = mapped > voiceLevelSmoothed ? 0.55 : 0.18;
+  voiceLevelSmoothed += (mapped - voiceLevelSmoothed) * (reduceMotion ? 1 : follow);
+  paintVoiceLevel(voiceLevelSmoothed);
+  paintWaveFromTime(time, voiceLevelSmoothed);
+}
+
+function startLevelLoop() {
+  stopLevelLoop();
+  voiceLevelSmoothed = 0;
+  voiceLevelEls = Array.from(document.querySelectorAll("#voiceDock .voice-level"));
+  voiceWaveBars = Array.from(document.querySelectorAll("#voiceBtn .wave i"));
+  const dock = document.getElementById("voiceDock");
+  if (dock) dock.classList.add("live-level");
+  const loop = () => {
+    voiceLevelRaf = requestAnimationFrame(loop);
+    tickVoiceLevel();
+  };
+  voiceLevelRaf = requestAnimationFrame(loop);
+}
+
+function stopLevelLoop() {
+  if (voiceLevelRaf) cancelAnimationFrame(voiceLevelRaf);
+  voiceLevelRaf = 0;
+  voiceLevelSmoothed = 0;
+  const dock = document.getElementById("voiceDock");
+  if (dock) dock.classList.remove("live-level");
+  resetVoiceLevelDom();
+  voiceLevelEls = [];
+  voiceWaveBars = [];
+}
+
+function disconnectAnalyserNodes() {
+  stopLevelLoop();
+  if (voiceAnalyser && voiceAnalyser.src) {
+    try {
+      voiceAnalyser.src.disconnect();
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  voiceAnalyser = null;
 }
 
 function startAnalyser(stream) {
-  stopAnalyser();
+  disconnectAnalyserNodes();
   try {
-    const AC = window.AudioContext || window.webkitAudioContext;
-    if (!AC) return;
-    const ctx = new AC();
+    const ctx = ensureAudioCtx();
+    if (!ctx) return;
     const src = ctx.createMediaStreamSource(stream);
     const an = ctx.createAnalyser();
-    an.fftSize = 32;
+    an.fftSize = 256;
+    an.smoothingTimeConstant = 0.28;
     src.connect(an);
-    voiceAnalyser = { ctx, an, data: new Uint8Array(an.frequencyBinCount) };
+    voiceAnalyser = { ctx, src, an, time: new Uint8Array(an.fftSize) };
+    startLevelLoop();
   } catch (_) {
     voiceAnalyser = null;
   }
 }
 
 function stopAnalyser() {
-  if (voiceAnalyser && voiceAnalyser.ctx) {
+  disconnectAnalyserNodes();
+  if (voiceAudioCtx && voiceAudioCtx.state !== "closed") {
     try {
-      voiceAnalyser.ctx.close();
+      voiceAudioCtx.close();
     } catch (_) {
       /* ignore */
     }
   }
-  voiceAnalyser = null;
-  document.querySelectorAll(".wave i").forEach((bar) => {
-    bar.style.height = "";
-  });
+  voiceAudioCtx = null;
+}
+
+function liveWordsInnerHtml() {
+  const caret = `<span class="listen-caret">${escapeHtml(C.listening.caret)}</span>`;
+  if (state.voice.phase !== "listening") return caret;
+  const raw = state.voice.transcriptRaw || "";
+  if (!raw) return caret;
+  const annotate =
+    typeof window.annotateLiveTranscript === "function" ? window.annotateLiveTranscript : null;
+  if (!annotate) {
+    return escapeHtml(state.voice.transcript || raw) + caret;
+  }
+  const html = annotate(raw)
+    .map((span) => {
+      const display = escapeHtml(span.display);
+      if (!span.rewritten) return display;
+      return `<s class="listen-from">${escapeHtml(span.surface)}</s><span class="listen-to">${display}</span>`;
+    })
+    .join(" ");
+  return html + caret;
 }
 
 function paintLiveWords() {
@@ -2438,16 +2583,13 @@ function paintLiveWords() {
   if (!words) return;
   const show = liveWordsOn() && state.voice.phase === "listening";
   words.hidden = !show;
-  if (show) {
-    words.innerHTML =
-      escapeHtml(state.voice.transcript || "") +
-      `<span class="listen-caret">${escapeHtml(C.listening.caret)}</span>`;
-  }
+  if (show) words.innerHTML = liveWordsInnerHtml();
 }
 
 function applyLiveTranscript(text) {
   const raw = String(text || "").trim();
   const correct = typeof window.correctLiveTranscript === "function" ? window.correctLiveTranscript : null;
+  state.voice.transcriptRaw = raw;
   state.voice.transcript = correct ? correct(raw) : raw;
   paintLiveWords();
 }
@@ -2462,6 +2604,7 @@ function startLiveWords() {
     rec.continuous = true;
     rec.interimResults = true;
     rec.onresult = (ev) => {
+      if (liveFromServer) return;
       let t = "";
       for (let i = 0; i < ev.results.length; i++) t += ev.results[i][0].transcript;
       applyLiveTranscript(t);
@@ -2485,6 +2628,73 @@ function stopLiveWords() {
   liveRec = null;
 }
 
+function shouldLivePoll() {
+  return liveWordsOn() && voiceWanted && state.voice.phase === "listening";
+}
+
+function stopLivePoll() {
+  livePollInFlight = false;
+  liveFromServer = false;
+  livePollSeq = 0;
+  liveAppliedSeq = 0;
+  if (livePollTimer) {
+    clearTimeout(livePollTimer);
+    livePollTimer = null;
+  }
+}
+
+function startLivePoll() {
+  stopLivePoll();
+  if (!liveWordsOn()) return;
+  scheduleLivePoll(400);
+}
+
+function scheduleLivePoll(delay) {
+  if (livePollTimer) clearTimeout(livePollTimer);
+  livePollTimer = setTimeout(tickLivePoll, delay);
+}
+
+async function tickLivePoll() {
+  livePollTimer = null;
+  if (!shouldLivePoll()) return;
+  if (livePollInFlight) {
+    scheduleLivePoll(250);
+    return;
+  }
+  if (!voiceChunks.length) {
+    scheduleLivePoll(280);
+    return;
+  }
+  const mime = (voiceRecorder && voiceRecorder.mimeType) || "audio/webm";
+  const blob = new Blob(voiceChunks.slice(), { type: mime });
+  if (blob.size < 1200) {
+    scheduleLivePoll(280);
+    return;
+  }
+  const seq = ++livePollSeq;
+  livePollInFlight = true;
+  try {
+    const audio_base64 = await blobToBase64(blob);
+    if (!shouldLivePoll()) return;
+    const out = await api("/api/v1/mini-app/voice/live", {
+      method: "POST",
+      body: { audio_base64, mime: blob.type || mime },
+    });
+    if (seq < liveAppliedSeq) return;
+    liveAppliedSeq = seq;
+    const text = String((out && out.text) || "").trim();
+    if (text) {
+      liveFromServer = true;
+      applyLiveTranscript(text);
+    }
+  } catch (_) {
+    /* keep last caption */
+  } finally {
+    livePollInFlight = false;
+    if (shouldLivePoll()) scheduleLivePoll(200);
+  }
+}
+
 function beginListening(btn) {
   if (state.voice.phase === "listening") return;
   if (state.voice.micDenied) {
@@ -2498,10 +2708,12 @@ function beginListening(btn) {
   state.voice.phase = "listening";
   state.voice.heldMs = 0;
   state.voice.transcript = "";
+  state.voice.transcriptRaw = "";
   state.voice.nudge = "";
   haptic("impact", "light");
   syncVoiceDom();
   startVoiceTick();
+  startLiveWords();
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     onMicDenied();
     return;
@@ -2538,7 +2750,7 @@ function beginListening(btn) {
       }
       voiceStartedAt = Date.now();
       voiceReady = true;
-      startLiveWords();
+      startLivePoll();
       if (btn) btn.classList.add("hot");
       syncVoiceDom();
     })
@@ -2565,6 +2777,7 @@ function closeCaptureImmediate() {
   voiceReady = false;
   clearInterval(voiceTick);
   voiceTick = null;
+  stopLivePoll();
   stopLiveWords();
   stopAnalyser();
   if (voiceStream) {
@@ -2590,6 +2803,7 @@ function cancelVoice(reason) {
   teardownVoice();
   state.voice.phase = "idle";
   state.voice.transcript = "";
+  state.voice.transcriptRaw = "";
   syncVoiceDom();
   if (reason === "slide") showNudge(C.voice.slideOff);
   else if (reason === "short") showNudge(C.voice.shortTap);
@@ -2744,6 +2958,7 @@ function landVoiceDraft(text, correlation_id, instruction_id) {
   );
   state.voice.phase = "drafted";
   state.voice.transcript = "";
+  state.voice.transcriptRaw = "";
   paint();
   clearTimeout(voiceDraftTimer);
   voiceDraftTimer = setTimeout(() => {

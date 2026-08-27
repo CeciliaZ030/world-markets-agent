@@ -3,7 +3,11 @@ import { createRequire } from "node:module";
 import test from "node:test";
 
 const require = createRequire(import.meta.url);
-const { correctLiveTranscript, setOntologyEntries } = require("../static/ontology_live.js");
+const {
+  correctLiveTranscript,
+  annotateLiveTranscript,
+  setOntologyEntries,
+} = require("../static/ontology_live.js");
 
 test("live transcript rewrites instrument aliases", () => {
   assert.equal(correctLiveTranscript("buy fifty dollars worth of ether"), "buy fifty dollars worth of ETH");
@@ -28,4 +32,29 @@ test("setOntologyEntries reloads aliases", () => {
   ]);
   assert.equal(correctLiveTranscript("ether please"), "ETH please");
   assert.equal(correctLiveTranscript("beef please"), "beef please");
+});
+
+test("annotateLiveTranscript marks rewritten instrument spans", () => {
+  setOntologyEntries([
+    { surface_form: "ether", normalized_target: "ETH", kind: "instrument" },
+    { surface_form: "bitcoin", normalized_target: "WBTC", kind: "instrument" },
+  ]);
+  const spans = annotateLiveTranscript("buy fifty dollars worth of ether");
+  const ether = spans.find((span) => span.surface.toLowerCase() === "ether");
+  assert.equal(ether.display, "ETH");
+  assert.equal(ether.rewritten, true);
+  const buy = spans.find((span) => span.surface === "buy");
+  assert.equal(buy.rewritten, false);
+  assert.equal(buy.display, "buy");
+});
+
+test("annotateLiveTranscript leaves confusables unmarked", () => {
+  setOntologyEntries([
+    { surface_form: "ether", normalized_target: "ETH", kind: "instrument" },
+    { surface_form: "beef", normalized_target: "ETH", kind: "confusable" },
+  ]);
+  const spans = annotateLiveTranscript("buy fifty of beef");
+  const beef = spans.find((span) => span.surface === "beef");
+  assert.equal(beef.display, "beef");
+  assert.equal(beef.rewritten, false);
 });

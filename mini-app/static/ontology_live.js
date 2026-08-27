@@ -64,10 +64,10 @@ function tokenize(raw) {
     .filter(Boolean);
 }
 
-function correctLiveTranscript(raw) {
+function annotateLiveTranscript(raw) {
   const original = String(raw || "");
   const tokens = tokenize(original);
-  if (!tokens.length) return original.trim();
+  if (!tokens.length) return [];
   const out = [];
   let i = 0;
   while (i < tokens.length) {
@@ -94,16 +94,33 @@ function correctLiveTranscript(raw) {
         hit = aliasBySurface.get(key);
       }
     }
-    out.push(hit || tokens[i]);
+    const surface = tokens.slice(i, i + consumed).join(" ");
+    out.push({
+      surface,
+      display: hit || surface,
+      rewritten: Boolean(hit),
+    });
     i += consumed;
   }
-  return out.join(" ");
+  return out;
+}
+
+function correctLiveTranscript(raw) {
+  const spans = annotateLiveTranscript(raw);
+  if (!spans.length) return String(raw || "").trim();
+  return spans.map((span) => span.display).join(" ");
 }
 
 if (typeof window !== "undefined") {
   window.correctLiveTranscript = correctLiveTranscript;
+  window.annotateLiveTranscript = annotateLiveTranscript;
   window.setOntologyEntries = setOntologyEntries;
 }
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { correctLiveTranscript, setOntologyEntries, loadEntries };
+  module.exports = {
+    correctLiveTranscript,
+    annotateLiveTranscript,
+    setOntologyEntries,
+    loadEntries,
+  };
 }

@@ -182,6 +182,42 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
     }))
 }
 
+const MIN_LIVE_AUDIO: usize = 1200;
+
+/// Partial STT for hold-to-talk captions. Deepgram only; never ingests or dispatches.
+pub fn transcribe_live(account_id: u64, body: &Value) -> Result<Value, String> {
+    Ok(json!({ "text": transcribe_live_text(account_id, body) }))
+}
+
+fn transcribe_live_text(account_id: u64, body: &Value) -> String {
+    if !stt::deepgram_configured() {
+        return String::new();
+    }
+    let Some(audio) = decode_live_audio(body) else {
+        return String::new();
+    };
+    let mime = body
+        .get("mime")
+        .and_then(Value::as_str)
+        .unwrap_or("audio/webm");
+    let keyterms = seed_keyterms(account_id);
+    match stt::transcribe(&audio, mime, &keyterms) {
+        Ok(transcript) => transcript.text.trim().to_string(),
+        Err(_) => String::new(),
+    }
+}
+
+fn decode_live_audio(body: &Value) -> Option<Vec<u8>> {
+    let raw = body.get("audio_base64").and_then(Value::as_str)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(raw.trim())
+        .ok()?;
+    if bytes.len() < MIN_LIVE_AUDIO || bytes.len() > 5_000_000 {
+        return None;
+    }
+    Some(bytes)
+}
+
 fn decode_audio(body: &Value) -> Result<Vec<u8>, String> {
     let raw = body
         .get("audio_base64")
@@ -334,6 +370,30 @@ mod tests {
     #[test]
     fn empty_stt_uses_live_words() {
         assert_eq!(choose_transcript("", Some("sell all sol")), "sell all sol");
+    }
+
+    #[test]
+    fn live_captions_empty_without_audio() {
+        let out = transcribe_live(1, &json!({})).unwrap();
+        assert_eq!(out.get("text").and_then(Value::as_str), Some(""));
+        let tiny = transcribe_live(
+            1,
+            &json!({ "audio_base64": base64::engine::general_purpose::STANDARD.encode(b"too-small") }),
+        )
+        .unwrap();
+        assert_eq!(tiny.get("text").and_then(Value::as_str), Some(""));
+    }
+
+    #[test]
+    fn transcribe_live_fn_does_not_ingest() {
+        let src = include_str!("voice.rs");
+        let start = src.find("pub fn transcribe_live").expect("transcribe_live");
+        let rest = &src[start..];
+        let end = rest.find("\nfn decode_audio").unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(!body.contains("ingest_utterance"));
+        assert!(!body.contains("submit_heard"));
+        assert!(!body.contains("ingest_voice"));
     }
 
     #[test]

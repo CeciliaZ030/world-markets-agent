@@ -63,16 +63,23 @@ impl SttError {
     }
 }
 
+pub fn deepgram_configured() -> bool {
+    std::env::var("DEEPGRAM_API_KEY")
+        .map(|key| !key.trim().is_empty())
+        .unwrap_or(false)
+}
+
 pub fn transcribe(audio: &[u8], mime: &str, keyterms: &[String]) -> Result<Transcript, SttError> {
     if audio.is_empty() {
         return Err(SttError::empty());
     }
     let content_type = if mime.is_empty() { "audio/webm" } else { mime };
-    if let Ok(key) = std::env::var("DEEPGRAM_API_KEY") {
-        let key = key.trim().to_string();
-        if !key.is_empty() {
-            return deepgram(audio, content_type, &key, keyterms);
-        }
+    if deepgram_configured() {
+        let key = std::env::var("DEEPGRAM_API_KEY")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        return deepgram(audio, content_type, &key, keyterms);
     }
     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         let key = key.trim().to_string();

@@ -110,6 +110,7 @@ async fn main() {
         .route("/api/v1/mini-app/ledger/{id}", get(ledger_one_handler))
         .route("/api/v1/mini-app/ledger", get(ledger_handler))
         .route("/api/v1/mini-app/compose", post(compose_handler))
+        .route("/api/v1/mini-app/voice/live", post(voice_live_handler))
         .route("/api/v1/mini-app/voice", post(voice_handler))
         .route("/api/v1/mini-app/share", post(share_handler))
         .route(
@@ -668,6 +669,36 @@ async fn desk_context_handler(State(state): State<AppState>, headers: HeaderMap)
     }
 }
 
+async fn voice_live_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<VoiceRequest>,
+) -> Response {
+    if !session_ok(&state, &headers) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let Some(account_id) = state.account_id else {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed");
+    };
+    let payload = json!({
+        "audio_base64": body.audio_base64,
+        "mime": body.mime,
+    });
+    match spawn_blocking(move || world_markets::mini_app::transcribe_live(account_id, &payload))
+        .await
+    {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "live caption failed");
+            Json(json!({ "text": "" })).into_response()
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "live caption join failed");
+            Json(json!({ "text": "" })).into_response()
+        }
+    }
+}
+
 async fn voice_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1126,13 +1157,23 @@ mod tests {
     fn voice_is_not_a_ledger_route() {
         let src = include_str!("main.rs");
         assert!(src.contains(r#".route("/api/v1/mini-app/voice", post(voice_handler))"#));
+        assert!(src.contains(r#".route("/api/v1/mini-app/voice/live", post(voice_live_handler))"#));
         assert!(src.contains("ingest_voice_note"));
+        assert!(src.contains("transcribe_live"));
         let desk_fn = format!("post_{}_voice", "desk");
         assert!(
             !src.contains(&format!("world_markets::mini_app::{desk_fn}")),
             "voice handler must not call The Desk"
         );
         assert!(src.contains(r#".route("/api/v1/desk/context", get(desk_context_handler))"#));
+        let live = src
+            .split("async fn voice_live_handler")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn voice_handler").next())
+            .expect("voice_live_handler body");
+        assert!(live.contains("transcribe_live"));
+        assert!(!live.contains("ingest_voice_note"));
+        assert!(!live.contains("submit_heard"));
     }
 
     #[test]
@@ -1155,6 +1196,7 @@ mod tests {
             r#"/api/v1/mini-app/auth"#,
             r#"/api/v1/mini-app/compose"#,
             r#"/api/v1/mini-app/voice"#,
+            r#"/api/v1/mini-app/voice/live"#,
             r#"/api/v1/mini-app/share"#,
         ];
         for line in src.lines() {

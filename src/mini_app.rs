@@ -781,6 +781,11 @@ pub fn ingest_voice_note(account_id: u64, body: &Value) -> Result<Value, String>
     crate::voice::ingest_voice(account_id, body)
 }
 
+/// Live captions while holding Record. Transcribes only; does not ingest.
+pub fn transcribe_live(account_id: u64, body: &Value) -> Result<Value, String> {
+    crate::voice::transcribe_live(account_id, body)
+}
+
 pub fn ontology_summary() -> Result<Value, String> {
     BrainClient::from_env().ontology_summary()
 }

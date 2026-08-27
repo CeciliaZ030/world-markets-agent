@@ -997,8 +997,8 @@ body.home-v7 .toast {
   flex-direction: column;
   align-items: center;
   justify-content: flex-end;
-  gap: 8px;
-  padding: 0 28px 12px;
+  gap: 10px;
+  padding: 0 24px 16px;
   text-align: center;
   background: linear-gradient(180deg, rgba(14, 17, 22, 0) 0%, rgba(14, 17, 22, 0.9) 60%);
   pointer-events: none;
@@ -1011,17 +1011,25 @@ body.home-v7 .toast {
   color: var(--accent);
   animation: pulse-dot 1.6s infinite;
 }
-.voice-dock .listen-words {
-  min-height: 44px;
-  max-width: 280px;
-  font-size: 16px;
-  font-weight: 600;
-  line-height: 1.4;
+.listen-scrim .listen-words {
+  max-width: 100%;
+  font-size: 32px;
+  font-weight: 650;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
   text-align: center;
   color: var(--ink);
   pointer-events: none;
+  word-break: break-word;
 }
-.voice-dock .listen-words[hidden] { display: none; }
+.listen-scrim .listen-words[hidden] { display: none; }
+.listen-from {
+  text-decoration: line-through;
+  opacity: 0.45;
+  font-weight: 500;
+  margin-right: 0.18em;
+}
+.listen-to { color: var(--accent); }
 .listen-caret {
   color: var(--accent);
   animation: blink 1s step-end infinite;
@@ -1036,6 +1044,14 @@ body.home-v7 .toast {
   padding: 8px 16px;
   position: relative;
   border-top: 1px solid var(--line);
+}
+.voice-hero-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  width: 100%;
+  --voice-lvl: 0;
 }
 .voice-nudge {
   position: absolute;
@@ -1059,7 +1075,7 @@ body.home-v7 .toast {
   min-height: 120px;
   position: relative;
   flex: 0 0 auto;
-  margin-top: 2px;
+  margin-top: 0;
   border-radius: 50%;
   display: flex;
   align-items: center;
@@ -1099,6 +1115,7 @@ body.home-v7 .toast {
 }
 .voice-dock.listening .voice-halo, .voice-dock.listening .mic-svg { display: none; }
 .voice-dock.listening .wave, .voice-dock.listening .rip { display: block; }
+.voice-dock.live-level .wave i { animation: none; }
 .voice-dock.drafted .voice-hero {
   background: var(--well);
   border-color: rgba(70, 192, 138, 0.55);
@@ -1157,6 +1174,36 @@ body.home-v7 .toast {
 .wave i:nth-child(4) { height: 20px; animation-duration: 0.5s; animation-delay: 0.18s; }
 .wave i:nth-child(5) { height: 32px; animation-duration: 0.62s; animation-delay: 0.12s; }
 .wave i:nth-child(6) { height: 16px; animation-duration: 0.48s; animation-delay: 0.22s; }
+
+.voice-level {
+  width: 12px;
+  height: 118px;
+  flex: 0 0 12px;
+  display: flex;
+  flex-direction: column-reverse;
+  justify-content: space-between;
+  gap: 3px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+.voice-dock.listening .voice-level { opacity: 1; }
+.voice-level i {
+  display: block;
+  height: 9px;
+  border-radius: 3px;
+  background: rgba(77, 163, 255, 0.16);
+  box-shadow: none;
+  transition: background 70ms linear, box-shadow 70ms linear, opacity 70ms linear;
+}
+.voice-level i.on {
+  background: var(--accent);
+  box-shadow: 0 0 8px rgba(77, 163, 255, 0.45);
+}
+.voice-level i.on.hot {
+  background: #c8e4ff;
+  box-shadow: 0 0 10px rgba(200, 228, 255, 0.55);
+}
 
 .voice-status {
   font-family: var(--mono);
@@ -1238,4 +1285,6 @@ body.home-v7 .toast {
   }
   .home-ledger { transition: none; }
   .voice-dock.listening .voice-hero { transform: none; }
+  .voice-level { transition: none; }
+  .voice-level i { transition: none; }
 }
