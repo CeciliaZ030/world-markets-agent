@@ -12,15 +12,61 @@ export function listPreferences(accountId) {
   }));
 }
 
+export function classifyProtectedVeto(text) {
+  const lower = String(text || "").toLowerCase();
+  const protect =
+    lower.includes("never sell") ||
+    lower.includes("don't ever sell") ||
+    lower.includes("dont ever sell") ||
+    lower.includes("do not ever sell") ||
+    lower.includes("protect my") ||
+    lower.includes("don't sell my") ||
+    lower.includes("dont sell my") ||
+    (lower.includes("never") && lower.includes("sell"));
+  if (!protect) return null;
+  const absolute =
+    lower.includes("never") ||
+    lower.includes("ever") ||
+    lower.includes("no matter what") ||
+    lower.includes("under any circumstance");
+  const asset = String(text || "")
+    .split(/[\s,.:;!?]+/)
+    .reverse()
+    .find((t) => {
+      const w = t.toLowerCase();
+      return (
+        w &&
+        !["never", "sell", "ever", "dont", "don't", "do", "not", "my", "the", "protect", "please", "stack", "position", "holdings"].includes(w)
+      );
+    });
+  return { asset: (asset || "that").toUpperCase(), absolute };
+}
+
+export function vetoMessage(veto) {
+  const asset = veto.asset || "that";
+  const base = `Stored: I'll avoid selling your ${asset}. One exception you've already signed: if your portfolio breaches your floor and ${asset} is the only way back above it, the guardian may sell some — your mandate outranks this preference. To make it absolute, change your policies on World.`;
+  if (veto.absolute) {
+    return `${base} [View mandate on World ↗]`;
+  }
+  return base;
+}
+
 export function upsertPreference(accountId, item) {
   const data = readJson(prefsPath(accountId), { items: [] });
   const now = Math.floor(Date.now() / 1000);
   const id = item.id || `p-${accountId}-${now}`;
+  const veto = classifyProtectedVeto(item.text);
   const next = {
     id,
     text: String(item.text || "").trim(),
     created_at: item.created_at || now,
     on_chain: false,
+    kind: veto ? "guardian_preference" : "preference",
+    override_scope: veto
+      ? "guardian may sell if the signed floor requires it and this is the only path back above"
+      : null,
+    asset: veto ? veto.asset : null,
+    absolute: veto ? veto.absolute : false,
   };
   if (!next.text) {
     return { ok: false, error: "empty_preference" };
@@ -28,7 +74,13 @@ export function upsertPreference(accountId, item) {
   data.items = data.items.filter((row) => row.id !== id);
   data.items.push(next);
   writeJson(prefsPath(accountId), data);
-  return { ok: true, item: next };
+  const out = { ok: true, item: next };
+  if (veto) {
+    out.message = vetoMessage(veto);
+    out.reply_verbatim = true;
+    out.categorical_veto = false;
+  }
+  return out;
 }
 
 export function cancelPreference(accountId, id) {

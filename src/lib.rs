@@ -21,6 +21,7 @@ mod reporting;
 mod research;
 mod rpc;
 mod share;
+mod size;
 mod speech_ontology;
 mod staged;
 mod stt;

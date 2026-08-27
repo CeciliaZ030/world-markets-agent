@@ -29,35 +29,33 @@ test("source cannot reach execute helpers", () => {
   assert.equal(src.includes("execute_"), false);
 });
 
-test("buy beef offers ETH and BIFI then wall on escape", () => {
+test("buy beef walls immediately as food, never a near-match", () => {
   const account = "cant-1";
-  const first = heard(account, "Buy $50 of beef");
-  assert.equal(first.kind, "near_match");
+  const first = heard(account, "Buy me $50 of beef");
+  assert.equal(first.kind, "cant");
   assert.equal(first.skip_llm, true);
   assert.equal(first.executable, false);
-  const labels = first.controls.join(" ");
-  assert.match(labels, /BIFI/);
-  assert.match(labels, /ETH/);
-  assert.match(labels, /No — I meant beef/);
-  assert.equal(listInstructions(account).length, 0);
-
-  const wall = heard(account, "No — I meant beef");
-  assert.equal(wall.kind, "cant");
-  assert.match(wall.message, /heard: "buy \$50 of beef"/i);
-  assert.match(wall.message, /World doesn't trade beef/);
-  assert.match(wall.message, /Kept for the record/);
-  assert.equal(wall.message.includes("!"), false);
+  assert.match(first.message, /heard: "buy me \$50 of beef"/i);
+  assert.match(first.message, /World doesn't trade beef/);
+  assert.match(first.message, /Kept for the record/);
+  assert.equal(first.message.includes("!"), false);
   const rows = listInstructions(account).filter((row) => row.status === "cant");
   assert.equal(rows.length, 1);
   assert.equal(rows[0].display_status, "can't");
   assert.equal(summary(account).holding, 0);
 });
 
+test("buy $50 with no instrument noun is unclear", () => {
+  const account = "cant-1b";
+  const out = heard(account, "buy $50");
+  assert.equal(out.kind, "unclear");
+  assert.equal(out.skip_llm, true);
+});
+
 test("repeat ask same day appends trail and does not add a row", () => {
   const account = "cant-2";
-  heard(account, "Buy $50 of beef");
-  heard(account, "No — I meant beef");
-  const again = heard(account, "Buy $50 of beef");
+  heard(account, "Buy me $50 of beef");
+  const again = heard(account, "Buy me $50 of beef");
   assert.equal(again.kind, "cant");
   assert.match(again.message, /Still can't/);
   const rows = listInstructions(account).filter((row) => row.status === "cant");
@@ -80,8 +78,7 @@ test("book me a flight is out of scope", () => {
 
 test("mixed note walls beef and leaves the close", () => {
   const account = "cant-4";
-  heard(account, "buy fifty of beef and close half the perp");
-  const wall = heard(account, "No — I meant beef");
+  const wall = heard(account, "buy fifty of beef and close half the perp");
   assert.equal(wall.kind, "cant");
   assert.match(wall.remaining_text, /close half the perp/i);
   assert.equal(wall.skip_llm, false);
@@ -98,18 +95,15 @@ test("in-book asset does not create a cant row", () => {
   assert.equal(listInstructions(account).filter((row) => row.status === "cant").length, 0);
 });
 
-test("confirming BIFI writes lexicon and later beef resolves", () => {
+test("phonetic near-match still offers book names", () => {
   const account = "cant-6";
-  const first = heard(account, "Buy $50 of beef");
-  const bifi = first.controls.find((label) => /BIFI/.test(label));
-  const confirmed = heard(account, bifi);
+  const first = heard(account, "Buy $50 of etherium");
+  assert.equal(first.kind, "near_match");
+  const eth = first.controls.find((label) => /ETH/.test(label));
+  assert.ok(eth);
+  const confirmed = heard(account, eth);
   assert.equal(confirmed.kind, "resolved");
   assert.equal(confirmed.skip_llm, false);
-  assert.match(confirmed.rewritten_text, /BIFI/);
-  const lex = lexiconOf(account);
-  assert.ok(lex.some((row) => row.surface_form.toLowerCase() === "beef" && row.source === "confirmed"));
-  const again = heard(account, "Buy $50 of beef");
-  assert.equal(again.kind, "unmatched");
 });
 
 test("unclear transcripts skip llm and write no row", () => {

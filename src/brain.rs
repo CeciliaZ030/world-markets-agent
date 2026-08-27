@@ -315,6 +315,29 @@ impl BrainClient {
         self.post("/v1/share", body)
     }
 
+    pub(crate) fn confirm_action_kind(&self, account_id: u64, kind: &str) -> Result<Value, String> {
+        self.post(
+            "/v1/action-kinds/confirm",
+            &json!({ "account_id": account_id, "kind": kind }),
+        )
+    }
+
+    pub(crate) fn action_kind_status(&self, account_id: u64, kind: &str) -> Result<Value, String> {
+        self.get(&format!(
+            "/v1/action-kinds?account_id={account_id}&kind={kind}"
+        ))
+    }
+
+    pub(crate) fn supersede_watch(&self, body: &Value) -> Result<Value, String> {
+        self.post("/v1/watches/supersede", body)
+    }
+
+    pub(crate) fn match_watches(&self, account_id: u64, symbol: &str) -> Result<Value, String> {
+        self.get(&format!(
+            "/v1/watches/match?account_id={account_id}&symbol={symbol}"
+        ))
+    }
+
     fn get(&self, path: &str) -> Result<Value, String> {
         let url = format!("{}{path}", self.base_url);
         let response = self

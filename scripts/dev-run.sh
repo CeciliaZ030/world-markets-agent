@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Local aomi-run with the execution sidecar. The plugin never sees WORLD_PRIVATE_KEY.
+# Wipe residual brain state: WORLD_BRAIN_WIPE=1 or --wipe (deletes WORLD_BRAIN_DIR).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -8,6 +9,27 @@ cd "$ROOT"
 if [[ ! -f .env ]]; then
   echo "copy .env.example to .env and set OPENROUTER_API_KEY, WORLD_ACCOUNT_ID, WORLD_PRIVATE_KEY" >&2
   exit 1
+fi
+
+WIPE=0
+ARGS=()
+for arg in "$@"; do
+  if [[ "$arg" == "--wipe" ]]; then
+    WIPE=1
+  else
+    ARGS+=("$arg")
+  fi
+done
+if [[ "${WORLD_BRAIN_WIPE:-}" == "1" ]]; then
+  WIPE=1
+fi
+if [[ "$WIPE" == "1" ]]; then
+  BRAIN_DIR="${WORLD_BRAIN_DIR:-}"
+  if [[ -z "$BRAIN_DIR" ]]; then
+    BRAIN_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/aomi/world-markets/brain"
+  fi
+  rm -rf "$BRAIN_DIR"
+  echo "wiped brain dir $BRAIN_DIR (per-account files under this env)"
 fi
 
 cargo build
@@ -90,4 +112,4 @@ fi
 # Seed post-trade RAPV from live RAPV when ATLAS projection fails (stubbed evm-core).
 export WORLD_DEV_SEED_POST_TRADE_RAPV="${WORLD_DEV_SEED_POST_TRADE_RAPV:-1}"
 
-aomi-run "$PLUGIN" --env-file .env --provider openrouter "$@"
+aomi-run "$PLUGIN" --env-file .env --provider openrouter "${ARGS[@]}"

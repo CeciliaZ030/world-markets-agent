@@ -30,12 +30,18 @@ import {
   cancelWatch,
   evaluateAll,
   listWatches,
+  matchWatches,
   pauseWatch,
   resumeWatch,
   setWatch,
+  supersedeWatch,
   cancelTask,
   watchedAccounts,
 } from "./watches.js";
+import {
+  confirm as confirmActionKind,
+  status as actionKindStatus,
+} from "./action_kinds.js";
 import {
   archiveInstruction,
   composeDraft,
@@ -225,6 +231,26 @@ async function handle(req, res) {
     );
     return;
   }
+  if (req.method === "GET" && url.pathname === "/v1/action-kinds") {
+    const accountId = url.searchParams.get("account_id");
+    const kind = url.searchParams.get("kind");
+    if (!accountId || !kind) {
+      send(res, 400, { ok: false, error: "account_id and kind are required" });
+      return;
+    }
+    send(res, 200, actionKindStatus(accountId, kind));
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/v1/watches/match") {
+    const accountId = url.searchParams.get("account_id");
+    const symbol = url.searchParams.get("symbol");
+    if (!accountId || !symbol) {
+      send(res, 400, { ok: false, error: "account_id and symbol are required" });
+      return;
+    }
+    send(res, 200, matchWatches(accountId, symbol));
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/v1/ledger/summary") {
     const accountId = url.searchParams.get("account_id");
     if (!accountId) {
@@ -289,6 +315,12 @@ async function handle(req, res) {
       return;
     case "/v1/watches/cancel":
       send(res, 200, cancelWatch(accountIdOf(body), body.id));
+      return;
+    case "/v1/watches/supersede":
+      send(res, 200, supersedeWatch(accountIdOf(body), body));
+      return;
+    case "/v1/action-kinds/confirm":
+      send(res, 200, confirmActionKind(accountIdOf(body), body.kind));
       return;
     case "/v1/tasks/cancel":
       send(res, 200, cancelTask(accountIdOf(body), cancelIdOf(body)));

@@ -11,6 +11,7 @@ import { resolvePredicate } from "./resolve.js";
 import { admit, dueForDailyFlush, emptyLimiter, flushHeld } from "./rateLimit.js";
 import { enqueue } from "./outbound.js";
 import {
+  appendEvent,
   attachWatch,
   cancelInstruction,
   onWatchExpired,
@@ -63,10 +64,12 @@ export function watchedAccounts() {
 }
 
 export function listWatches(accountId) {
-  return (loadWatches(accountId).items || []).map((item) => ({
-    ...item,
-    on_chain: false,
-  }));
+  return (loadWatches(accountId).items || [])
+    .filter((item) => item.status !== "superseded")
+    .map((item) => ({
+      ...item,
+      on_chain: false,
+    }));
 }
 
 export function allActiveWatches() {
@@ -168,6 +171,68 @@ export function cancelWatch(accountId, id) {
   data.items = data.items.filter((row) => row.id !== id);
   saveWatches(accountId, data);
   return { ok: true, item: removed, remaining: data.items.length };
+}
+
+export function matchWatches(accountId, symbol) {
+  const key = String(symbol || "").trim().toUpperCase();
+  const live = (loadWatches(accountId).items || []).filter((row) => {
+    if (row.status && row.status !== "active") return false;
+    const sym = String(row.predicate?.symbol || row.symbol || "").toUpperCase();
+    return !key || sym === key || sym.includes(key) || key.includes(sym);
+  });
+  if (live.length > 1) {
+    return {
+      ok: true,
+      ambiguous: true,
+      message: `Which ${key || "watch"}? ${live
+        .map((w) => `\`${w.original_phrase || w.id}\``)
+        .join(" · ")}`,
+      reply_verbatim: true,
+      candidates: live.map((w) => ({
+        id: w.id,
+        phrase: w.original_phrase,
+        symbol: w.predicate?.symbol || w.symbol,
+      })),
+    };
+  }
+  return { ok: true, ambiguous: false, matches: live };
+}
+
+export function supersedeWatch(accountId, body) {
+  const now = Math.floor(Date.now() / 1000);
+  const matches = matchWatches(accountId, body.symbol || body.referent);
+  if (matches.ambiguous) return matches;
+  const old = (matches.matches || [])[0];
+  if (old) {
+    const data = loadWatches(accountId);
+    const item = (data.items || []).find((row) => row.id === old.id);
+    if (item) {
+      item.status = "superseded";
+      item.superseded_at = now;
+      saveWatches(accountId, data);
+      if (item.instruction_id) {
+        appendEvent(
+          accountId,
+          item.instruction_id,
+          "superseded",
+          body.phrase || "updated",
+          now,
+          { actor: "you" },
+        );
+      }
+    }
+  }
+  const created = setWatch(accountId, {
+    ...body,
+    phrase: body.phrase,
+    symbol: body.symbol,
+  });
+  created.superseded_id = old?.id || null;
+  created.message =
+    created.message ||
+    `Updated — now ${body.phrase || body.symbol}. The previous version is in this task's history.`;
+  created.reply_verbatim = true;
+  return created;
 }
 
 function findWatch(accountId, id) {

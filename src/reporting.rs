@@ -37,9 +37,11 @@ pub(crate) struct Figure {
 
 impl Figure {
     pub(crate) fn estimate(value: impl Into<String>, unit: impl Into<String>) -> Self {
+        let value = value.into();
+        let unit = unit.into();
         Self {
-            value: value.into(),
-            unit: unit.into(),
+            value: value.clone(),
+            unit: unit.clone(),
             is_estimate: true,
         }
     }
@@ -54,6 +56,10 @@ impl Figure {
             unit: unit.into(),
             is_estimate,
         }
+    }
+
+    pub(crate) fn rendered(&self) -> String {
+        crate::lookups::render_figure(&self.value, &self.unit, self.is_estimate)
     }
 }
 
@@ -91,6 +97,25 @@ impl Transition {
             direction,
         }
     }
+
+    pub(crate) fn rendered_arrow(&self) -> String {
+        let money = self.unit.eq_ignore_ascii_case("USDT") || self.unit == "$";
+        if money {
+            format!(
+                "`{}` → `{}`",
+                crate::lookups::format_money_str(&self.before, false),
+                crate::lookups::format_money_str(&self.after, false)
+            )
+        } else if self.unit.is_empty() {
+            format!("`{}` → `{}`", trim_risk(&self.before), trim_risk(&self.after))
+        } else {
+            format!("`{}` → `{}`", self.before, self.after)
+        }
+    }
+}
+
+fn trim_risk(raw: &str) -> String {
+    crate::lookups::format_risk(raw)
 }
 
 /// One polarity mapping per risk field. Do not put RAPV and the 0–10 score
@@ -142,6 +167,9 @@ pub(crate) struct AccountEffect {
     pub(crate) direction: Option<String>,
     /// One portfolio-level clause. Never invented by the model.
     pub(crate) concern_clause: String,
+    /// Pasteable concern line with the 0–10 delta, or empty when the delta is unprovable.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) concern_line: String,
     pub(crate) missing_mark_symbols: Vec<String>,
     pub(crate) post_trade_risk_unavailable: bool,
     pub(crate) baseline: String,
@@ -364,6 +392,12 @@ pub(crate) fn derive_account_effect(plan: &EffectPlan) -> AccountEffect {
         _ => None,
     };
     let direction = liquidation_risk.as_ref().map(|t| t.direction.clone());
+    let concern = concern_line(liquidation_risk.as_ref(), &plan.concern_clause);
+    let concern_clause = if liquidation_risk.is_some() {
+        plan.concern_clause.clone()
+    } else {
+        String::new()
+    };
     AccountEffect {
         expected_net_yield: None,
         directional_exposure: exposure,
@@ -374,11 +408,196 @@ pub(crate) fn derive_account_effect(plan: &EffectPlan) -> AccountEffect {
             .estimated_cost
             .map(|c| Figure::decimal(c, plan.quote.clone(), true)),
         direction,
-        concern_clause: plan.concern_clause.clone(),
+        concern_clause,
+        concern_line: concern,
         missing_mark_symbols: plan.missing_mark_symbols.clone(),
         post_trade_risk_unavailable: plan.post_trade_risk_unavailable
             || plan.liquidation_risk_after.is_none(),
         baseline: plan.baseline.clone(),
+    }
+}
+
+fn concern_line(risk: Option<&Transition>, clause: &str) -> String {
+    let Some(risk) = risk else {
+        return String::new();
+    };
+    if risk.unchanged {
+        return String::new();
+    }
+    let line = format!(
+        "Risk `{}` → `{}`",
+        crate::lookups::format_risk(&risk.before),
+        crate::lookups::format_risk(&risk.after)
+    );
+    if clause.trim().is_empty() {
+        line
+    } else {
+        format!("{line} — {clause}")
+    }
+}
+
+/// House-formatted deny string. The raw engine `detail` stays beside this as `detail_rendered`.
+pub(crate) fn render_deny(
+    rule: &str,
+    detail: &str,
+    symbol: Option<&str>,
+    projected: Option<Decimal>,
+    cap_or_floor: Option<Decimal>,
+    product_pair: Option<&str>,
+) -> String {
+    let money = |d: Decimal| format!("`{}`", crate::lookups::format_money(d, false));
+    match rule {
+        "position_notional" => {
+            let pos = projected.map(money).unwrap_or_else(|| extract_money(detail));
+            let cap = cap_or_floor.map(money).unwrap_or_else(|| extract_last_money(detail));
+            let asset = symbol.unwrap_or("position");
+            format!("⊘ That would take your {asset} position to {pos} — above your {cap} cap.")
+        }
+        "portfolio_floor" | "post_trade_portfolio_floor" => {
+            let floor = cap_or_floor.map(money).unwrap_or_else(|| extract_last_money(detail));
+            format!("⊘ That would take your portfolio below your floor — {floor}. The limit is yours, and it held.")
+        }
+        "market_not_permitted" => {
+            let pair = product_pair.unwrap_or("that market");
+            format!("⊘ `{pair}` isn't in your signed markets list. I can't trade it until you add it on World.")
+        }
+        "liquidatable" => {
+            "⊘ Your account is eligible for liquidation and your mandate requires a halt. I'm not adding any exposure."
+                .to_string()
+        }
+        "insufficient_spot_balance" => {
+            let asset = symbol.unwrap_or("that asset");
+            format!("⊘ That sell would move your live `{asset}` balance below zero.")
+        }
+        "withdraw_not_supported" => {
+            "⊘ Withdrawal isn't a power the key has. Requests like this are rejected.".to_string()
+        }
+        "missing_mandate" | "unknown_mandate_key" | "invalid_mandate" | "unsupported_mandate_version" => {
+            format!("⊘ {detail}")
+        }
+        "leverage" => {
+            let cap = cap_or_floor
+                .map(|d| format!("`{}×`", d.normalize()))
+                .unwrap_or_else(|| extract_last_money(detail));
+            format!("⊘ That leverage is above your {cap} cap.")
+        }
+        _ => {
+            let cleaned = house_numbers(detail);
+            format!("⊘ {cleaned}")
+        }
+    }
+}
+
+fn extract_money(detail: &str) -> String {
+    crate::lookups::first_money_token(detail)
+        .unwrap_or_else(|| format!("`{detail}`"))
+}
+
+fn extract_last_money(detail: &str) -> String {
+    crate::lookups::last_money_token(detail).unwrap_or_else(|| extract_money(detail))
+}
+
+fn house_numbers(detail: &str) -> String {
+    crate::lookups::rewrite_engine_numbers(detail)
+}
+
+/// Frozen §6.5 receipt. The model pastes `message`; it does not compose fields.
+pub(crate) fn render_receipt(
+    happened: &str,
+    why: &str,
+    account_effect: Option<&AccountEffect>,
+    fill_price: Option<&str>,
+    cost: Option<&str>,
+    policy: &str,
+    next: &str,
+    graduation: Option<&str>,
+    landing_ledger: bool,
+) -> String {
+    let mut lines = vec![
+        format!("What happened · {happened}"),
+        format!("Why · {why}"),
+    ];
+    if let Some(effect) = account_effect {
+        let mut bits = Vec::new();
+        if !effect.directional_exposure.unchanged {
+            bits.push(format!(
+                "{} {}",
+                effect.exposure_symbol,
+                effect.directional_exposure.rendered_arrow()
+            ));
+        }
+        if !effect.available_to_deploy.unchanged {
+            bits.push(format!(
+                "Available {}",
+                effect.available_to_deploy.rendered_arrow()
+            ));
+        }
+        if let Some(risk) = &effect.liquidation_risk
+            && !risk.unchanged
+        {
+            bits.push(format!("Risk {}", risk.rendered_arrow()));
+        }
+        if let Some(cost_fig) = &effect.estimated_cost {
+            bits.push(format!("Cost `{}`", cost_fig.rendered()));
+        }
+        if bits.is_empty() {
+            bits.push("nothing measurable changed".to_string());
+        }
+        lines.push(format!("Account effect · {}", bits.join(" · ")));
+    } else if let Some(price) = fill_price {
+        lines.push(format!("Account effect · fill `{price}` · cost `{cost}`", cost = cost.unwrap_or("—")));
+    } else {
+        lines.push("Account effect · staged — fill pending the cancel window.".to_string());
+    }
+    if let Some(price) = fill_price {
+        let cost_bit = cost.unwrap_or("—");
+        lines.push(format!("Execution quality · fill `{price}` · cost `{cost_bit}`."));
+    } else {
+        lines.push("Execution quality · staged, not yet filled.".to_string());
+    }
+    lines.push(format!("Policy · {policy}"));
+    let mut next_line = format!("Next · {next}");
+    if landing_ledger {
+        next_line.push_str(" · on your ledger");
+    }
+    lines.push(next_line);
+    if let Some(effect) = account_effect
+        && !effect.concern_line.is_empty()
+    {
+        lines.push(format!("One thing to flag: {}", effect.concern_line));
+    }
+    if let Some(grad) = graduation.filter(|s| !s.is_empty()) {
+        lines.push(grad.to_string());
+    }
+    lines.push("[View on World ↗] [Explain] [Preview exit]".to_string());
+    lines.join("\n")
+}
+
+pub(crate) const GRADUATION_NOTICE: &str =
+    "Orders like this now execute automatically. Say `always ask` to keep confirmations.";
+
+pub(crate) const CONFIRM_ONCE_MESSAGE: &str =
+    "First time for this kind of order — confirm to send it. Say yes to place it, or change the size.";
+
+/// Dollarpower PASTE sentence. Operands: separate-venue (effective) ÷ World (committed).
+pub(crate) fn render_dollarpower_message(dp: &Dollarpower) -> String {
+    let committed = dp.committed.rendered();
+    let effective = dp.effective.rendered();
+    let ratio = dp.ratio.value.trim();
+    format!(
+        "Dollarpower is how hard each committed dollar works: separate-venue collateral `{effective}` ÷ World collateral `{committed}`. Yours is `{ratio}`× — your `{committed}` is doing the work of `{effective}`."
+    )
+}
+
+pub(crate) fn render_protected_veto_message(asset: &str, absolute: bool) -> String {
+    let asset = asset.trim().to_ascii_uppercase();
+    let base = format!(
+        "Stored: I'll avoid selling your {asset}. One exception you've already signed: if your portfolio breaches your floor and {asset} is the only way back above it, the guardian may sell some — your mandate outranks this preference. To make it absolute, change your policies on World."
+    );
+    if absolute {
+        format!("{base} [View mandate on World ↗]")
+    } else {
+        base
     }
 }
 
@@ -927,5 +1146,21 @@ mod tests {
             false, // emergency slippage NOT reachable
         );
         assert!(!plan.reached_target);
+    }
+
+    #[test]
+    fn dollarpower_message_divides_effective_by_committed() {
+        let dp = Dollarpower {
+            ratio: Figure::estimate("2.4", "×"),
+            committed: Figure::estimate("10300", "USDT"),
+            effective: Figure::estimate("24700", "USDT"),
+        };
+        let message = render_dollarpower_message(&dp);
+        assert!(message.contains("2.4"));
+        assert!(message.contains("doing the work of"));
+        let veto = render_protected_veto_message("SOL", true);
+        assert!(veto.contains("guardian may sell"));
+        assert!(veto.contains("View mandate on World"));
+        assert!(!veto.to_lowercase().contains("i won't sell your sol"));
     }
 }
