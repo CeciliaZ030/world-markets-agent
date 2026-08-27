@@ -338,6 +338,9 @@ fn args_from_params(params: &Value, account_id: u64) -> ExecuteWorldOrderArgs {
             .and_then(Value::as_str)
             .map(str::to_string),
         sentence: None,
+        instruction_id: None,
+        size_usd: params.get("size_usd").and_then(Value::as_str).map(str::to_string),
+        size_base: params.get("size_base").and_then(Value::as_str).map(str::to_string),
     }
 }
 

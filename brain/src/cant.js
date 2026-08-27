@@ -55,6 +55,63 @@ const SCOPE_CUES = new Set([
   "plane",
   "ticket",
 ]);
+const CATEGORY_LEXICON = {
+  food: [
+    "beef",
+    "pork",
+    "chicken",
+    "steak",
+    "pizza",
+    "burger",
+    "coffee",
+    "milk",
+    "eggs",
+    "bread",
+    "rice",
+  ],
+  commodities: [
+    "gold",
+    "silver",
+    "oil",
+    "crude",
+    "gas",
+    "wheat",
+    "corn",
+    "copper",
+    "platinum",
+  ],
+  equities: [
+    "tsla",
+    "aapl",
+    "nvda",
+    "msft",
+    "amzn",
+    "goog",
+    "meta",
+    "spy",
+    "qqq",
+    "stock",
+    "stocks",
+    "share",
+    "shares",
+    "equity",
+    "equities",
+  ],
+  fx: ["euro", "euros", "yen", "gbp", "pound", "pounds", "franc", "cad", "aud", "fx", "forex"],
+};
+
+function instrumentCategory(noun) {
+  const key = String(noun || "")
+    .trim()
+    .toLowerCase()
+    .replace(/s$/, "");
+  const raw = String(noun || "").trim().toLowerCase();
+  for (const [category, words] of Object.entries(CATEGORY_LEXICON)) {
+    if (words.includes(raw) || words.includes(key)) return category;
+  }
+  return null;
+}
+
 const LOOKUP_WORDS = new Set([
   "b",
   "p",
@@ -522,6 +579,10 @@ function classifyClause(clause, universe, lexicon, declined, slots) {
   }
   const resolved = exactResolve(entity, universe, lexicon);
   if (resolved) return { kind: "pass", clause, resolved };
+  const category = instrumentCategory(entity);
+  if (category) {
+    return { kind: "cant_category", entity, clause, category, candidates: [] };
+  }
   const candidates = nearMatches(entity, universe, lexicon, declined);
   return {
     kind: "unresolved",
@@ -717,7 +778,12 @@ export function handleHeard(accountId, body = {}, now = nowSecs()) {
 
   const unresolved = classified
     .map((row, i) => ({ ...row, index: i }))
-    .filter((row) => row.kind === "unresolved" || row.kind === "out_of_scope");
+    .filter(
+      (row) =>
+        row.kind === "unresolved" ||
+        row.kind === "out_of_scope" ||
+        row.kind === "cant_category",
+    );
   const unclear = classified.filter((row) => row.kind === "unclear");
   const remainder = classified
     .filter((row) => row.kind === "pass")

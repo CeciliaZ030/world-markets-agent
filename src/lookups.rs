@@ -10,6 +10,7 @@ use rust_decimal::Decimal;
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::Signed;
 use serde::Serialize;
+use serde_json::{Value, json};
 
 use crate::client::{Account, Asset, BASE_TOKEN_ID, WorldClient};
 use crate::mandate::parse_decimal;
@@ -684,6 +685,236 @@ fn money_code(raw: &str, is_estimate: bool) -> Result<String, String> {
     Ok(format!("`{}`", format_money(value, is_estimate)))
 }
 
+pub(crate) fn format_money_str(raw: &str, is_estimate: bool) -> String {
+    parse_decimal(raw, "money")
+        .map(|v| format_money(v, is_estimate))
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+pub(crate) fn format_risk(raw: &str) -> String {
+    let Ok(value) = parse_decimal(raw, "risk") else {
+        return raw.to_string();
+    };
+    let rounded = value.round_dp_with_strategy(1, RoundingStrategy::MidpointAwayFromZero);
+    let mut s = rounded.normalize().to_string();
+    if !s.contains('.') {
+        s.push_str(".0");
+    }
+    s
+}
+
+pub(crate) fn render_figure(value: &str, unit: &str, is_estimate: bool) -> String {
+    if unit.eq_ignore_ascii_case("USDT") || unit == "$" {
+        return format_money_str(value, is_estimate);
+    }
+    if unit == "×" || unit == "x" {
+        return format!("{value}×");
+    }
+    value.to_string()
+}
+
+pub(crate) fn first_money_token(detail: &str) -> Option<String> {
+    money_tokens(detail).into_iter().next()
+}
+
+pub(crate) fn last_money_token(detail: &str) -> Option<String> {
+    money_tokens(detail).into_iter().last()
+}
+
+fn money_tokens(detail: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in detail.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            cur.push(ch);
+        } else if !cur.is_empty() {
+            if let Ok(v) = parse_decimal(&cur, "n") {
+                out.push(format!("`{}`", format_money(v, false)));
+            }
+            cur.clear();
+        }
+    }
+    if !cur.is_empty()
+        && let Ok(v) = parse_decimal(&cur, "n")
+    {
+        out.push(format!("`{}`", format_money(v, false)));
+    }
+    out
+}
+
+pub(crate) fn rewrite_engine_numbers(detail: &str) -> String {
+    let mut out = String::new();
+    let mut cur = String::new();
+    for ch in detail.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            cur.push(ch);
+        } else {
+            if !cur.is_empty() {
+                if let Ok(v) = parse_decimal(&cur, "n") {
+                    if cur.contains('.') && cur.split('.').nth(1).map(|f| f.len()).unwrap_or(0) > 2 {
+                        out.push_str(&format!("`{}`", format_money(v, false)));
+                    } else {
+                        out.push_str(&cur);
+                    }
+                } else {
+                    out.push_str(&cur);
+                }
+                cur.clear();
+            }
+            out.push(ch);
+        }
+    }
+    if !cur.is_empty() {
+        if let Ok(v) = parse_decimal(&cur, "n") {
+            if cur.contains('.') && cur.split('.').nth(1).map(|f| f.len()).unwrap_or(0) > 2 {
+                out.push_str(&format!("`{}`", format_money(v, false)));
+            } else {
+                out.push_str(&cur);
+            }
+        } else {
+            out.push_str(&cur);
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ShareAsk {
+    pub pct: Decimal,
+    pub of: String,
+    pub label: String,
+}
+
+/// "what's 20% of my portfolio" / "half of my SOL" / "10% of my SOL position"
+pub(crate) fn parse_share_ask(raw: &str) -> Option<ShareAsk> {
+    let lower = raw.trim().to_ascii_lowercase();
+    if ["buy ", "sell ", "short ", "long ", "put ", "spend ", "invest ", "deploy "]
+        .iter()
+        .any(|verb| lower.contains(verb))
+    {
+        return None;
+    }
+    let has_pct = lower.contains('%')
+        || lower.contains("percent")
+        || lower.contains("half")
+        || lower.contains("quarter");
+    if !has_pct {
+        return None;
+    }
+    let has_of = lower.contains("of my")
+        || lower.contains("of the")
+        || lower.contains("portfolio")
+        || lower.contains("position")
+        || lower.contains("account")
+        || lower.contains("nav");
+    if !has_of {
+        return None;
+    }
+    let of = if lower.contains("portfolio") || lower.contains("account") || lower.contains("nav") {
+        "portfolio".to_string()
+    } else if let Some(sym) = share_symbol(&lower) {
+        sym
+    } else {
+        "portfolio".to_string()
+    };
+    let pct = if lower.contains("half") {
+        Decimal::new(50, 0)
+    } else if lower.contains("quarter") {
+        Decimal::new(25, 0)
+    } else {
+        regex_pct(&lower)?
+    };
+    Some(ShareAsk {
+        pct,
+        of: of.clone(),
+        label: format!("{}% of {of}", pct.normalize()),
+    })
+}
+
+pub(crate) fn share_from_lookups_json(lookups: &Value, ask: &ShareAsk) -> Option<Value> {
+    let base = if ask.of == "portfolio" {
+        let raw = lookups.get("portfolio_value").and_then(Value::as_str)?;
+        parse_money_token(raw)?
+    } else {
+        position_notional_json(lookups, &ask.of)?
+    };
+    let amount = compute_share(ask.pct, base);
+    let rendered = format_money(amount, false);
+    Some(json!({
+        "label": ask.label,
+        "pct": ask.pct.normalize().to_string(),
+        "of": ask.of,
+        "base": format_money(base, false),
+        "amount": rendered,
+        "message": format!("{} is `{rendered}`.", ask.label),
+    }))
+}
+
+fn parse_money_token(raw: &str) -> Option<Decimal> {
+    let cleaned = raw
+        .trim()
+        .trim_start_matches('≈')
+        .trim_start_matches('$')
+        .replace(',', "");
+    parse_decimal(&cleaned, "money").ok()
+}
+
+fn position_notional_json(lookups: &Value, symbol: &str) -> Option<Decimal> {
+    let classes = lookups.pointer("/positions/classes")?.as_array()?;
+    for group in classes {
+        let entries = group.get("entries")?.as_array()?;
+        for entry in entries {
+            let sym = entry.get("symbol").and_then(Value::as_str).unwrap_or("");
+            if sym.eq_ignore_ascii_case(symbol) {
+                let raw = entry.get("notional_usdt").and_then(Value::as_str)?;
+                return parse_money_token(raw);
+            }
+        }
+    }
+    let netting = lookups.pointer("/positions/netting")?.as_array()?;
+    for row in netting {
+        let sym = row.get("symbol").and_then(Value::as_str).unwrap_or("");
+        if sym.eq_ignore_ascii_case(symbol) {
+            let raw = row.get("net_notional_usdt").and_then(Value::as_str)?;
+            return parse_money_token(raw);
+        }
+    }
+    None
+}
+
+fn regex_pct(lower: &str) -> Option<Decimal> {
+    let chars: Vec<char> = lower.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_ascii_digit() {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                i += 1;
+            }
+            let num: String = chars[start..i].iter().collect();
+            let rest: String = chars[i..].iter().collect();
+            if rest.trim_start().starts_with('%') || rest.trim_start().starts_with("percent") {
+                return parse_decimal(&num, "pct").ok();
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn share_symbol(lower: &str) -> Option<String> {
+    for needle in ["weth", "eth", "wbtc", "btc", "sol", "usdt"] {
+        if lower.contains(needle) {
+            return Some(needle.to_ascii_uppercase());
+        }
+    }
+    None
+}
+
+pub(crate) fn compute_share(pct: Decimal, base: Decimal) -> Decimal {
+    (base * pct) / Decimal::new(100, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -736,6 +967,18 @@ mod tests {
         ];
         sort_class_rows(&mut rows);
         assert_eq!(rows[0].symbol, "WBTC");
+    }
+
+    #[test]
+    fn parse_share_ask_reads_percent_of_portfolio() {
+        let ask = parse_share_ask("what's 20% of my portfolio?").unwrap();
+        assert_eq!(ask.pct, d("20"));
+        assert_eq!(ask.of, "portfolio");
+        assert!(parse_share_ask("buy half").is_none());
+        assert!(parse_share_ask("sell 20% of my portfolio").is_none());
+        let half = parse_share_ask("what's half of my SOL position?").unwrap();
+        assert_eq!(half.pct, d("50"));
+        assert_eq!(half.of, "SOL");
     }
 
     #[test]

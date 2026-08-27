@@ -154,6 +154,7 @@ pub struct ActionIr {
     pub referent: Option<String>,
     pub frame_id: Option<String>,
     pub order_type: Option<String>,
+    pub size_kind: Option<String>,
 }
 
 impl ActionIr {
@@ -166,8 +167,41 @@ impl ActionIr {
             "referent": self.referent,
             "frame_id": self.frame_id,
             "order_type": self.order_type,
+            "size_kind": self.size_kind,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeKind {
+    Quote,
+    Base,
+    Ambiguous,
+    None,
+}
+
+impl SizeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SizeKind::Quote => "quote",
+            SizeKind::Base => "base",
+            SizeKind::Ambiguous => "ambiguous",
+            SizeKind::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SizeSpan {
+    pub kind: SizeKind,
+    pub surface: String,
+    pub amount: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectedVeto {
+    pub asset: String,
+    pub absolute: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -999,25 +1033,324 @@ fn nearest_alias(token: &str, aliases: &[(String, String)]) -> Option<String> {
 
 fn tokenize(raw: &str) -> Vec<String> {
     let lower = raw.to_ascii_lowercase();
-    let mut out = String::new();
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
     for ch in lower.chars() {
-        if ch == '$' {
-            continue;
-        }
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch);
+        if ch == '.' && !cur.is_empty() && cur.chars().all(|c| c.is_ascii_digit()) {
+            cur.push('.');
+        } else if ch.is_ascii_alphanumeric() {
+            cur.push(ch);
         } else {
-            out.push(' ');
+            flush_token(&mut cur, &mut tokens);
         }
     }
-    out.split_whitespace()
-        .map(str::to_string)
-        .filter(|tok| !tok.is_empty())
-        .collect()
+    flush_token(&mut cur, &mut tokens);
+    tokens
+}
+
+fn flush_token(cur: &mut String, tokens: &mut Vec<String>) {
+    if cur.is_empty() {
+        return;
+    }
+    tokens.push(std::mem::take(cur));
 }
 
 fn is_number_token(token: &str) -> bool {
-    !token.is_empty() && token.chars().all(|c| c.is_ascii_digit())
+    parse_amount_token(token).is_some()
+}
+
+/// Parse "200", "0.02", "$50", "5k", "fifty" into a decimal string.
+pub fn parse_amount_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_start_matches('$').replace(',', "");
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(word) = number_word(&lower) {
+        return Some(word);
+    }
+    let (body, mult) = if let Some(stripped) = lower.strip_suffix('k') {
+        (stripped, 1_000i64)
+    } else if let Some(stripped) = lower.strip_suffix('m') {
+        (stripped, 1_000_000i64)
+    } else {
+        (lower.as_str(), 1i64)
+    };
+    if body.is_empty() {
+        return None;
+    }
+    if !body.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    if body == "." || body.chars().filter(|c| *c == '.').count() > 1 {
+        return None;
+    }
+    if mult == 1 {
+        return Some(body.trim_start_matches('0').to_string()).map(|s| {
+            if s.is_empty() || s.starts_with('.') {
+                format!("0{s}")
+            } else {
+                s
+            }
+        });
+    }
+    let n: f64 = body.parse().ok()?;
+    Some(((n * mult as f64).round() as i64).to_string())
+}
+
+fn number_word(token: &str) -> Option<String> {
+    let n = match token {
+        "zero" | "oh" => 0,
+        "one" => 1,
+        "two" => 2,
+        "three" => 3,
+        "four" => 4,
+        "five" => 5,
+        "six" => 6,
+        "seven" => 7,
+        "eight" => 8,
+        "nine" => 9,
+        "ten" => 10,
+        "eleven" => 11,
+        "twelve" => 12,
+        "thirteen" => 13,
+        "fourteen" => 14,
+        "fifteen" => 15,
+        "sixteen" => 16,
+        "seventeen" => 17,
+        "eighteen" => 18,
+        "nineteen" => 19,
+        "twenty" => 20,
+        "thirty" => 30,
+        "forty" => 40,
+        "fifty" => 50,
+        "sixty" => 60,
+        "seventy" => 70,
+        "eighty" => 80,
+        "ninety" => 90,
+        "hundred" => 100,
+        _ => return None,
+    };
+    Some(n.to_string())
+}
+
+const MONEY_VERBS: &[&str] = &["put", "spend", "invest", "deploy"];
+const CURRENCY_MARKERS: &[&str] = &[
+    "usd", "usdt", "dollar", "dollars", "worth", "bucks", "buck",
+];
+const BUY_ACTS: &[&str] = &[
+    "buy", "sell", "long", "short", "shorts", "longs", "purchase", "dump",
+];
+
+pub fn parse_size(sentence: &str, instrument: Option<&str>) -> SizeSpan {
+    let tokens = tokenize(sentence);
+    let mut span = classify_size_tokens(&tokens, instrument);
+    if sentence.contains('$') && !matches!(span.kind, SizeKind::None) {
+        span.kind = SizeKind::Quote;
+    }
+    span
+}
+
+pub fn classify_size_tokens(tokens: &[String], instrument: Option<&str>) -> SizeSpan {
+    let Some(idx) = tokens.iter().position(|t| is_number_token(t)) else {
+        return SizeSpan {
+            kind: SizeKind::None,
+            surface: String::new(),
+            amount: String::new(),
+        };
+    };
+    let mut amount = parse_amount_token(&tokens[idx]).unwrap_or_else(|| tokens[idx].clone());
+    let mut surface = tokens[idx].clone();
+    if tokens.get(idx + 1).map(String::as_str) == Some("hundred") {
+        if let Ok(n) = amount.parse::<i64>() {
+            amount = (n * 100).to_string();
+            surface = format!("{} hundred", tokens[idx]);
+        }
+    }
+    let window_lo = idx.saturating_sub(3);
+    let window_hi = (idx + 4).min(tokens.len());
+    let window = &tokens[window_lo..window_hi];
+    let has_currency = window.iter().any(|t| CURRENCY_MARKERS.iter().any(|m| m == t))
+        || tokens.iter().any(|t| CURRENCY_MARKERS.iter().any(|m| m == t) && {
+            let pos = tokens.iter().position(|x| x == t).unwrap_or(0);
+            pos.abs_diff(idx) <= 4
+        });
+    let money_verb = tokens.iter().any(|t| MONEY_VERBS.iter().any(|v| v == t));
+    let inst = instrument
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let next = tokens.get(idx + 1).map(String::as_str);
+    let unit_is_asset = match (next, inst.as_deref()) {
+        (Some(n), Some(i)) if n == i || n.eq_ignore_ascii_case(i) => true,
+        (Some("eth" | "ether" | "weth" | "btc" | "wbtc" | "sol" | "usdt"), _) => true,
+        (Some(n), _) if inst.as_deref() == Some(n) => true,
+        _ => false,
+    };
+    let has_of_asset = tokens.get(idx + 1).map(String::as_str) == Some("of")
+        && tokens.get(idx + 2).is_some();
+    let kind = if has_currency {
+        SizeKind::Quote
+    } else if money_verb {
+        SizeKind::Quote
+    } else if unit_is_asset {
+        SizeKind::Base
+    } else if has_of_asset && !has_currency {
+        SizeKind::Quote
+    } else {
+        SizeKind::Ambiguous
+    };
+    SizeSpan {
+        kind,
+        surface,
+        amount,
+    }
+}
+
+pub fn infer_side(sentence: &str) -> Option<String> {
+    let tokens = tokenize(sentence);
+    infer_side_tokens(&tokens)
+}
+
+pub fn infer_side_tokens(tokens: &[String]) -> Option<String> {
+    for t in tokens {
+        match t.as_str() {
+            "short" | "shorts" | "shorting" => return Some("sell".to_string()),
+            "long" | "longs" | "longing" => return Some("buy".to_string()),
+            "sell" | "selling" | "dump" => return Some("sell".to_string()),
+            "buy" | "buying" | "purchase" | "purchasing" => return Some("buy".to_string()),
+            _ => {}
+        }
+    }
+    None
+}
+
+pub fn infer_product(sentence: &str) -> Option<String> {
+    let tokens = tokenize(sentence);
+    if tokens.iter().any(|t| matches!(t.as_str(), "perp" | "perpetual" | "perps" | "short" | "long"))
+    {
+        return Some("perp".to_string());
+    }
+    if tokens
+        .iter()
+        .any(|t| matches!(t.as_str(), "lend" | "lending" | "borrow"))
+    {
+        return Some("lend".to_string());
+    }
+    if tokens.iter().any(|t| matches!(t.as_str(), "spot")) {
+        return Some("spot".to_string());
+    }
+    None
+}
+
+pub fn classify_protected_veto(sentence: &str) -> Option<ProtectedVeto> {
+    let lower = sentence.to_ascii_lowercase();
+    let protect = lower.contains("never sell")
+        || lower.contains("don't ever sell")
+        || lower.contains("dont ever sell")
+        || lower.contains("do not ever sell")
+        || lower.contains("protect my")
+        || lower.contains("don't sell my")
+        || lower.contains("dont sell my")
+        || (lower.contains("never") && lower.contains("sell"));
+    if !protect {
+        return None;
+    }
+    let tokens = tokenize(sentence);
+    let asset = tokens
+        .iter()
+        .rev()
+        .find(|t| {
+            !matches!(
+                t.as_str(),
+                "never"
+                    | "sell"
+                    | "ever"
+                    | "dont"
+                    | "don't"
+                    | "do"
+                    | "not"
+                    | "my"
+                    | "the"
+                    | "protect"
+                    | "please"
+                    | "stack"
+                    | "position"
+                    | "holdings"
+            ) && !is_number_token(t)
+        })
+        .cloned()
+        .unwrap_or_else(|| "that".to_string());
+    let absolute = lower.contains("never")
+        || lower.contains("ever")
+        || lower.contains("no matter what")
+        || lower.contains("under any circumstance");
+    Some(ProtectedVeto { asset, absolute })
+}
+
+const FOOD: &[&str] = &[
+    "beef", "pork", "chicken", "steak", "pizza", "burger", "coffee", "milk", "eggs", "bread",
+    "rice", "corn", "wheat", "soy", "soybeans",
+];
+const COMMODITY: &[&str] = &[
+    "gold", "silver", "oil", "crude", "gas", "wheat", "corn", "copper", "platinum", "palladium",
+];
+const EQUITY: &[&str] = &[
+    "tsla", "aapl", "nvda", "msft", "amzn", "goog", "meta", "spy", "qqq", "stock", "stocks",
+    "share", "shares", "equity", "equities",
+];
+const FX: &[&str] = &[
+    "euro", "euros", "yen", "gbp", "pound", "pounds", "franc", "cad", "aud", "fx", "forex",
+];
+
+pub fn instrument_category(noun: &str) -> Option<&'static str> {
+    let key = noun.trim().trim_end_matches('s').to_ascii_lowercase();
+    if FOOD.contains(&key.as_str()) || FOOD.iter().any(|w| *w == noun.trim().to_ascii_lowercase()) {
+        return Some("food");
+    }
+    if COMMODITY.contains(&key.as_str())
+        || COMMODITY
+            .iter()
+            .any(|w| *w == noun.trim().to_ascii_lowercase())
+    {
+        return Some("commodities");
+    }
+    if EQUITY.contains(&noun.trim().to_ascii_lowercase().as_str()) || key == "sp" {
+        return Some("equities");
+    }
+    if FX.contains(&noun.trim().to_ascii_lowercase().as_str()) {
+        return Some("fx");
+    }
+    None
+}
+
+/// Buy-verb + a concrete noun with no universe hit → CANT category. No noun → unclear.
+pub fn unfulfillable_kind(sentence: &str, unknown: &[String]) -> Option<(&'static str, String)> {
+    let tokens = tokenize(sentence);
+    let has_act = tokens.iter().any(|t| BUY_ACTS.iter().any(|a| a == t) || MONEY_VERBS.iter().any(|a| a == t));
+    if !has_act {
+        return None;
+    }
+    if let Some(noun) = unknown.iter().find(|n| !n.trim().is_empty()) {
+        let category = instrument_category(noun).unwrap_or("that");
+        return Some((category, noun.clone()));
+    }
+    for t in tokens.iter().rev() {
+        if is_number_token(t)
+            || CURRENCY_MARKERS.iter().any(|m| m == t)
+            || BUY_ACTS.iter().any(|a| a == t)
+            || MONEY_VERBS.iter().any(|a| a == t)
+            || matches!(t.as_str(), "of" | "the" | "my" | "me" | "a" | "an" | "some" | "into" | "on" | "with")
+        {
+            continue;
+        }
+        if let Some(cat) = instrument_category(t) {
+            return Some((cat, t.clone()));
+        }
+        if t.len() >= 3 {
+            return Some(("that", t.clone()));
+        }
+    }
+    None
 }
 
 fn is_size_filler(token: &str, ont: &Ontology) -> bool {
@@ -1225,6 +1558,7 @@ fn match_referent_frame(
         referent,
         frame_id: Some(frame.id.clone()),
         order_type: None,
+        size_kind: None,
     })
 }
 
@@ -1254,6 +1588,7 @@ fn match_level_frame(
                 referent: None,
                 frame_id: Some(frame.id.clone()),
                 order_type: None,
+                size_kind: Some("base".to_string()),
             }),
         ));
     }
@@ -1267,6 +1602,7 @@ fn match_level_frame(
             referent: None,
             frame_id: Some(frame.id.clone()),
             order_type: None,
+            size_kind: None,
         }),
     ))
 }
@@ -1281,6 +1617,12 @@ fn match_trade_frame(
     let instrument = tokens.iter().find_map(|t| universe.canonical_instrument(t));
     let size = find_size_token(tokens);
     let order_type = find_order_type(tokens);
+    let size_kind = Some(
+        classify_size_tokens(tokens, instrument.as_deref())
+            .kind
+            .as_str()
+            .to_string(),
+    );
     if instrument.is_some() {
         if frame.size.as_deref() == Some("required") && size.is_none() {
             return Some((
@@ -1293,6 +1635,7 @@ fn match_trade_frame(
                     referent: None,
                     frame_id: Some(frame.id.clone()),
                     order_type,
+                    size_kind,
                 }),
             ));
         }
@@ -1306,6 +1649,7 @@ fn match_trade_frame(
                 referent: None,
                 frame_id: Some(frame.id.clone()),
                 order_type,
+                size_kind,
             }),
         ));
     }
@@ -1319,6 +1663,7 @@ fn match_trade_frame(
             referent: None,
             frame_id: Some(frame.id.clone()),
             order_type,
+            size_kind,
         }),
     ))
 }
@@ -1710,5 +2055,50 @@ mod tests {
         assert_eq!(speech.proposals.len(), 1);
         let text = norm("buy fifty dollars worth of beef", Channel::Text);
         assert!(text.proposals.is_empty());
+    }
+
+    #[test]
+    fn parse_size_quote_vs_base() {
+        assert_eq!(parse_size("buy $200 of ETH", Some("ETH")).kind, SizeKind::Quote);
+        assert_eq!(
+            parse_size("put 300 into ether", Some("ETH")).kind,
+            SizeKind::Quote
+        );
+        assert_eq!(
+            parse_size("spend $200 on WETH", Some("WETH")).kind,
+            SizeKind::Quote
+        );
+        assert_eq!(
+            parse_size("buy 200 dollars worth of WETH", Some("WETH")).kind,
+            SizeKind::Quote
+        );
+        assert_eq!(
+            parse_size("buy 0.02 WETH", Some("WETH")).kind,
+            SizeKind::Base
+        );
+        assert_eq!(parse_size("buy 200 WETH", Some("WETH")).kind, SizeKind::Base);
+        assert_eq!(parse_size("buy 200", None).kind, SizeKind::Ambiguous);
+        assert_eq!(parse_amount_token("5k").as_deref(), Some("5000"));
+        assert_eq!(parse_amount_token("0.02").as_deref(), Some("0.02"));
+    }
+
+    #[test]
+    fn short_verb_infers_sell_side() {
+        assert_eq!(infer_side("short $5k of WBTC").as_deref(), Some("sell"));
+        assert_eq!(infer_side("long another ETH perp").as_deref(), Some("buy"));
+    }
+
+    #[test]
+    fn protected_veto_and_category() {
+        let veto = classify_protected_veto("don't ever sell my SOL").unwrap();
+        assert_eq!(veto.asset, "sol");
+        assert!(veto.absolute);
+        assert_eq!(instrument_category("beef"), Some("food"));
+        assert_eq!(instrument_category("gold"), Some("commodities"));
+        assert_eq!(instrument_category("TSLA"), Some("equities"));
+        let (cat, noun) = unfulfillable_kind("buy me $50 of beef", &["beef".into()]).unwrap();
+        assert_eq!(cat, "food");
+        assert_eq!(noun, "beef");
+        assert!(unfulfillable_kind("buy $50", &[]).is_none());
     }
 }
