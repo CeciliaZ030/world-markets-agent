@@ -103,6 +103,38 @@ test("sliced fills keep real progress until they are actually done", () => {
   assert.equal(revealed.revealed, true);
 });
 
+test("a just-recorded with_aomi task is queued immediately", () => {
+  const row = {
+    instruction_id: "opt",
+    status: "with_aomi",
+    kind: "voice",
+    created_at: EXECUTE_AT - 3,
+    delay_secs: 3,
+  };
+  const ux = touchFillUx(row, null, T0, {});
+  const view = presentQueue(row, ux, T0, {});
+  assert.equal(view.zone, "queued");
+  assert.equal(view.phase, "wait");
+  assert.equal(view.remainingDisplay, 3);
+});
+
+test("the 3s clock does not restart when the server later stages the same task", () => {
+  const heard = {
+    instruction_id: "opt",
+    status: "with_aomi",
+    created_at: EXECUTE_AT - 3,
+    delay_secs: 3,
+  };
+  let ux = touchFillUx(heard, null, T0, {});
+  ux = touchFillUx(heard, ux, T0 + 3000, {});
+  assert.ok(ux.fillStartedAt);
+  const staged = trade("pending_execute", { instruction_id: "server", execute_at: EXECUTE_AT + 60 });
+  ux = touchFillUx(staged, ux, T0 + 3100, {});
+  const view = presentQueue(staged, ux, T0 + 3100, {});
+  assert.equal(view.zone, "queued");
+  assert.equal(view.phase, "fill");
+});
+
 test("reduced motion keeps the 3s sit and skips the 1s hold", () => {
   const pending = trade("pending_execute");
   const wait = presentQueue(pending, touchFillUx(pending, null, T0, { reduceMotion: true }), T0, {

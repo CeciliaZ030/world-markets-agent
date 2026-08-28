@@ -57,9 +57,7 @@ async fn proxy_inner(
         .await
         .map_err(|err| format!("deepgram stream: {err}"))?;
     client
-        .send(Message::Text(
-            json!({ "type": "ready" }).to_string().into(),
-        ))
+        .send(Message::Text(json!({ "type": "ready" }).to_string().into()))
         .await
         .map_err(|err| err.to_string())?;
 
@@ -81,6 +79,11 @@ async fn proxy_inner(
                             if wants_finalize(text.as_str()) {
                                 deepgram
                                     .send(DgMessage::Text(r#"{"type":"Finalize"}"#.into()))
+                                    .await
+                                    .map_err(|err| err.to_string())?;
+                            } else if wants_keepalive(text.as_str()) {
+                                deepgram
+                                    .send(DgMessage::Text(r#"{"type":"KeepAlive"}"#.into()))
                                     .await
                                     .map_err(|err| err.to_string())?;
                             } else if wants_close(text.as_str()) {
@@ -116,13 +119,14 @@ async fn proxy_inner(
                                     .map_err(|err| err.to_string())?;
                                 continue;
                             }
-                            if let Some((heard, is_final)) =
-                                world_markets::mini_app::stream_transcript_text(&value)
+                            if let Some((heard, is_final, confidence)) =
+                                world_markets::mini_app::stream_transcript_caption(&value)
                             {
                                 let msg = json!({
                                     "type": "transcript",
                                     "text": heard,
                                     "is_final": is_final,
+                                    "confidence": confidence,
                                 });
                                 client
                                     .send(Message::Text(msg.to_string().into()))
@@ -160,6 +164,10 @@ fn wants_finalize(text: &str) -> bool {
     command_type(text).is_some_and(|kind| kind.eq_ignore_ascii_case("finalize"))
 }
 
+fn wants_keepalive(text: &str) -> bool {
+    command_type(text).is_some_and(|kind| kind.eq_ignore_ascii_case("keepalive"))
+}
+
 fn command_type(text: &str) -> Option<String> {
     serde_json::from_str::<Value>(text)
         .ok()?
@@ -177,6 +185,8 @@ mod tests {
         assert!(wants_close(r#"{"type":"close"}"#));
         assert!(wants_close(r#"{"type":"Close"}"#));
         assert!(wants_finalize(r#"{"type":"finalize"}"#));
+        assert!(wants_keepalive(r#"{"type":"KeepAlive"}"#));
+        assert!(wants_keepalive(r#"{"type":"keepalive"}"#));
         assert!(!wants_finalize(r#"{"type":"close"}"#));
         assert!(!wants_close(r#"{"type":"keepalive"}"#));
         assert!(!wants_close("nope"));

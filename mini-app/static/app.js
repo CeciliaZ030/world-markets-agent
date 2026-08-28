@@ -221,7 +221,83 @@ function queueView(row, nowMs) {
   const now = nowMs != null ? nowMs : Date.now();
   const ux = touchFillUx(row, state.fillUx[row.instruction_id], now, { reduceMotion });
   state.fillUx[row.instruction_id] = ux;
-  return presentQueue(row, ux, now, { reduceMotion });
+  const presented = ux.waitUntil != null ? { ...row, wait_until_ms: ux.waitUntil } : row;
+  return presentQueue(presented, ux, now, { reduceMotion });
+}
+
+function adoptFillUx(fromId, toId) {
+  if (!fromId || !toId || fromId === toId) return;
+  if (state.fillUx[toId] && state.fillUx[toId].waitUntil != null) return;
+  if (!state.fillUx[fromId]) return;
+  state.fillUx[toId] = { ...state.fillUx[fromId] };
+  delete state.fillUx[fromId];
+}
+
+function queuedSentenceBetter(current, next) {
+  const a = String(current || "").trim();
+  const b = String(next || "").trim();
+  if (!b) return a;
+  if (!a) return b;
+  const placeholder =
+    typeof window.isPlaceholderTranscript === "function"
+      ? window.isPlaceholderTranscript
+      : () => false;
+  if (placeholder(b) && !placeholder(a)) return a;
+  if (placeholder(a) && !placeholder(b)) return b;
+  if (b === C.draftRow.hearing && a !== C.draftRow.hearing) return a;
+  if (a === C.draftRow.hearing && b !== C.draftRow.hearing) return b;
+  return b.length >= a.length ? b : a;
+}
+
+function dropOptimistic(correlation_id, instruction_id) {
+  const ids = new Set(
+    [correlation_id, instruction_id].filter((v) => v != null && String(v)).map(String),
+  );
+  state.optimistic = state.optimistic.filter(
+    (r) => !ids.has(String(r.instruction_id)) && !ids.has(String(r.correlation_id)),
+  );
+}
+
+function landQueuedTask(text, correlation_id, instruction_id, extra = {}) {
+  const id = instruction_id || correlation_id;
+  const existing = state.optimistic.find(
+    (r) =>
+      r.instruction_id === id ||
+      (correlation_id && r.correlation_id === correlation_id),
+  );
+  const sentence = String(text || "").trim();
+  if (existing) {
+    const next = queuedSentenceBetter(existing.sentence, sentence);
+    if (next) existing.sentence = next;
+    if (instruction_id && existing.instruction_id !== instruction_id) {
+      adoptFillUx(existing.instruction_id, instruction_id);
+      existing.instruction_id = instruction_id;
+    }
+    existing.updated_at = nowSecs();
+    tunePoll();
+    return existing;
+  }
+  const now = nowSecs();
+  const row = {
+    instruction_id: id,
+    sentence: sentence || C.draftRow.hearing,
+    status: "pending_execute",
+    kind: extra.kind || "trade",
+    fire_kind: "act",
+    correlation_id,
+    created_at: now,
+    updated_at: now,
+    execute_at: now + 3,
+    delay_secs: 3,
+    queued_local: true,
+    voice_landed_at: extra.voice ? Date.now() : undefined,
+    ...extra.row,
+  };
+  state.optimistic = [row].concat(
+    state.optimistic.filter((r) => r.instruction_id !== id && r.correlation_id !== correlation_id),
+  );
+  tunePoll();
+  return row;
 }
 
 function loadDismissed() {
@@ -283,10 +359,13 @@ function instructions() {
 function zoneOf(row) {
   const view = queueView(row);
   if (view && view.zone === "queued") return "queued";
-  if (row.status === "awaiting_confirm" || row.status === "triggered" || row.status === "with_aomi") {
+  if (row.status === "awaiting_confirm" || row.status === "triggered") {
     return "needs";
   }
-  if (row.status === "pending_execute" || row.status === "executing") return "queued";
+  if (row.status === "pending_execute" || row.status === "executing" || row.status === "with_aomi") {
+    return "queued";
+  }
+  if (row.status === "misheard") return "queued";
   if (row.status === "watching" || row.status === "paused") return "watch";
   if (row.status === "cant") return "cant";
   const today = new Date().toISOString().slice(0, 10);
@@ -298,7 +377,6 @@ function zoneOf(row) {
 }
 
 function glyph(row) {
-  if (row.voice_draft) return { g: "›", cls: "warn" };
   const view = queueView(row);
   if (view && view.phase === "wait") {
     return { g: view.remainingDisplay == null ? "·" : String(view.remainingDisplay), cls: "count" };
@@ -306,6 +384,8 @@ function glyph(row) {
   if (view && (view.phase === "fill" || view.phase === "sliced")) {
     return { g: "", spin: true };
   }
+  if (row.status === "misheard") return { g: "·", cls: "faint" };
+  if (row.voice_draft) return { g: "›", cls: "warn" };
   if (row.status === "awaiting_confirm" || row.status === "triggered") return { g: "!", cls: "" };
   if (row.status === "with_aomi") return { g: "›", cls: "" };
   if (row.status === "executing") return { g: "", spin: true };
@@ -324,7 +404,7 @@ function glyph(row) {
 function chipClass(status) {
   if (status === "watching") return "pos";
   if (status === "paused") return "mute";
-  if (status === "done" || status === "expired") return "faint";
+  if (status === "done" || status === "expired" || status === "misheard") return "faint";
   if (status === "cant") return "cant";
   if (status === "blocked") return "neg";
   return "";
@@ -422,12 +502,13 @@ async function archiveInPlace(rowOrId) {
 function subLine(row) {
   if (state.pending[row.instruction_id] === "pause") return C.sub.pendingPause;
   if (state.pending[row.instruction_id] === "resume") return C.sub.pendingResume;
-  if (row.voice_draft) return C.draftRow.sub;
+  if (row.status === "misheard") return "";
   const view = queueView(row);
   if (view && view.phase === "wait") {
     return fillCopy(C.sub.pendingExecute, { n: view.remainingDisplay == null ? "—" : view.remainingDisplay });
   }
   if (view && view.phase === "fill") return C.sub.completing;
+  if (row.voice_draft) return C.draftRow.sub;
   if (row.status === "with_aomi") return C.sub.withAomi;
   if (row.status === "paused") return C.sub.paused;
   if (row.status === "awaiting_confirm" || row.status === "triggered") {
@@ -803,13 +884,62 @@ function syncTgBackButton() {
   }
 }
 
+let lastMainPaintKey = "";
+
+function mainPaintKey() {
+  const rows = instructions();
+  return JSON.stringify({
+    view: state.view,
+    tab: state.tab,
+    compact: state.compact,
+    status: state.ledgerStatus,
+    holding: state.summary && state.summary.holding,
+    needs: state.summary && state.summary.needs_you,
+    toast: state.toast,
+    sheet: state.sheet,
+    openSwipe: state.openSwipe,
+    earlier: state.earlierOpen,
+    search: state.searchOpen,
+    near: state.nearMatch && state.nearMatch.asked_entity,
+    voicePhase: state.voice && state.voice.phase,
+    rows: rows.map((r) => [
+      r.instruction_id,
+      r.status,
+      r.display_status,
+      r.sentence,
+      r.progress_pct,
+      r.receipt,
+      r.execute_at,
+      r.updated_at,
+      r.status_changed_at,
+      r.distance && r.distance.pct,
+    ]),
+    fill: Object.keys(state.fillUx)
+      .sort()
+      .map((id) => {
+        const u = state.fillUx[id];
+        return [id, u && u.revealed, u && u.fillStartedAt, u && u.waitUntil];
+      }),
+  });
+}
+
+function captureLedgerScroll() {
+  const led = document.getElementById("homeLedger");
+  return {
+    ledger: led ? led.scrollTop : 0,
+    win: window.scrollY,
+    hadLedger: Boolean(led),
+  };
+}
+
+function restoreLedgerScroll(saved) {
+  const led = document.getElementById("homeLedger");
+  if (led && saved && saved.hadLedger) led.scrollTop = saved.ledger || 0;
+  else if (!led && saved && saved.win) window.scrollTo(0, saved.win);
+}
+
 function paint() {
-  if (
-    state.voice &&
-    (state.voice.phase === "listening" ||
-      state.voice.phase === "sending" ||
-      voiceFinalizing)
-  ) {
+  if (state.voice && state.voice.phase === "listening" && !voiceFinalizing) {
     return;
   }
   if (state.view === "chart") return;
@@ -821,6 +951,7 @@ function paint() {
 
 function renderMain() {
   const voiceHome = isVoiceHome();
+  const savedScroll = captureLedgerScroll();
   document.body.className = [
     state.sheet || state.searchOpen ? "locked" : "",
     voiceHome ? "home-v7" : "",
@@ -867,6 +998,8 @@ function renderMain() {
   bindPortfolio();
   bindSheet();
   bindHomeActs();
+  restoreLedgerScroll(savedScroll);
+  lastMainPaintKey = mainPaintKey();
 }
 
 function homeHeartbeatText() {
@@ -904,7 +1037,12 @@ function voiceStatusText() {
   const phase = state.voice.phase;
   if (phase === "listening") {
     if (voiceFinalizing) return C.voice.finalizing || C.voice.processing;
-    if (!voiceReady) return C.voice.starting;
+    if (!voiceReady) {
+      if (voiceChirping) return C.voice.ready || C.voice.starting;
+      if (voiceCaptureArmed && !voiceStreamReady) return C.voice.connecting || C.voice.starting;
+      return C.voice.starting;
+    }
+    if (!voiceHadSpeech) return C.voice.speakNow || C.voice.listening;
     const s = Math.floor((state.voice.heldMs || 0) / 1000);
     const m = Math.floor(s / 60);
     const ss = String(s % 60).padStart(2, "0");
@@ -930,12 +1068,16 @@ function voiceDockHtml() {
   const typePulse = state.voice.typePulse ? " type-pulse" : "";
   return (
     `<div class="home-ledger-wrap">` +
-    `<div class="home-ledger${phase === "listening" || voiceFinalizing || phase === "sending" ? " dim" : ""}" id="homeLedger">` +
+    `<div class="home-ledger${state.voice.phase === "listening" && !voiceFinalizing ? " dim" : ""}" id="homeLedger">` +
     ledgerZonesHtml() +
     `</div>` +
-    `<div class="listen-scrim${phase === "listening" || voiceFinalizing || phase === "sending" ? " on" : ""}" id="listenScrim">` +
+    `<div class="listen-scrim${state.voice.phase === "listening" && !voiceFinalizing ? " on" : ""}" id="listenScrim">` +
     `<div class="listen-lab">${escapeHtml(
-      voiceFinalizing ? C.listening.finalizing || C.listening.label : C.listening.label,
+      voiceFinalizing
+        ? C.listening.finalizing || C.listening.label
+        : !voiceReady
+          ? C.listening.opening || C.listening.label
+          : C.listening.label,
     )}</div>` +
     words +
     `</div>` +
@@ -955,6 +1097,7 @@ function voiceDockHtml() {
     `</button>` +
     voiceLevelHtml() +
     `</div>` +
+    `<div class="meter queue-fill voice-wait" id="voiceWaitMeter" hidden><span></span></div>` +
     `<div class="voice-status" id="voiceStatus">${escapeHtml(voiceStatusText())}</div>` +
     `</div>` +
     nearMatchHtml() +
@@ -1160,8 +1303,11 @@ function zoneRows(rows) {
         queued && view.phase === "fill" ? "is-queued" : "",
         row.status === "done" && !queued ? "is-done" : "",
         row.status === "cant" ? "is-cant" : "",
-        row.voice_draft ? "voice-draft" : "",
-        row.voice_draft && Date.now() - (row.voice_landed_at || 0) < 500 ? "fresh" : "",
+        row.status === "misheard" ? "is-misheard" : "",
+        (row.queued_local || row.voice_draft) && row.status !== "misheard" ? "voice-draft" : "",
+        (row.queued_local || row.voice_draft) && Date.now() - (row.voice_landed_at || 0) < 500
+          ? "fresh"
+          : "",
       ]
         .filter(Boolean)
         .join(" ");
@@ -2015,6 +2161,8 @@ function bindSheetDrag(sheet, handle) {
 }
 
 async function openInstruction(id) {
+  const row = instructions().find((r) => r.instruction_id === id);
+  if (row && row.status === "misheard") return;
   state.insId = id;
   state.sheet = "instruction";
   state.detent = "half";
@@ -2175,17 +2323,7 @@ async function doSend() {
       (recorded && recorded.instruction && recorded.instruction.instruction_id) ||
       c.instruction_id ||
       correlation_id;
-    const row = {
-      instruction_id: id,
-      sentence: c.message,
-      status: "with_aomi",
-      display_status: "with aomi",
-      kind: c.kind,
-      correlation_id,
-      created_at: nowSecs(),
-      updated_at: nowSecs(),
-    };
-    state.optimistic = state.optimistic.filter((r) => r.instruction_id !== id).concat([row]);
+    landQueuedTask(c.message, correlation_id, id, { kind: c.kind || "trade" });
     state.sent = { id, kind: c.kind, message: c.message, question: false };
   } else {
     state.sent = { id: null, kind: c.kind, message: c.message, question: true };
@@ -2208,7 +2346,7 @@ function renderSent() {
       ${
         s.question
           ? `<p class="note">${escapeHtml(C.sent.askNote)}</p>`
-          : `<div class="mini-card" id="sentCard"><div class="title">${escapeHtml((row && row.sentence) || s.message)}</div><div class="chip">${escapeHtml((row && row.display_status) || "with aomi")}</div><p class="sub">${escapeHtml(C.sub.withAomi)}</p></div><p class="note">${escapeHtml(C.sent.cardNote)}</p>`
+          : `<div class="mini-card" id="sentCard"><div class="title">${escapeHtml((row && row.sentence) || s.message)}</div><div class="chip">${escapeHtml((row && row.display_status) || C.zones.queued)}</div><p class="sub">${escapeHtml((row && subLine(row)) || fillCopy(C.sub.pendingExecute, { n: 3 }))}</p></div><p class="note">${escapeHtml(C.sent.cardNote)}</p>`
       }
       <button type="button" class="ghost-btn" id="openThread">${escapeHtml(C.sent.openThread)}</button>
     </div>` +
@@ -2293,6 +2431,8 @@ let voiceStartedAt = 0;
 let voiceTick = null;
 let voiceNudgeTimer = null;
 let voiceDraftTimer = null;
+const voiceMisheardTimers = new Map();
+const MISHEARD_MS = 3000;
 let livePollTimer = null;
 let livePollInFlight = false;
 let livePollSeq = 0;
@@ -2318,6 +2458,14 @@ let voiceStreamQueue = [];
 let voiceStreamOnFinal = null;
 let voiceStreamFallbackTimer = null;
 let voiceHeardCommitted = "";
+let voiceOnCue = null;
+let voiceChirping = false;
+let voiceHoldArmed = false;
+let voiceHadSpeech = false;
+let voiceSpeechAt = 0;
+let voiceKeepAliveAt = 0;
+let voiceWaitAt = 0;
+let voiceFlushAt = 0;
 
 function bindVoice() {
   const btn = document.getElementById("voiceBtn");
@@ -2446,7 +2594,7 @@ function syncVoiceDom() {
   const status = document.getElementById("voiceStatus");
   const btn = document.getElementById("voiceBtn");
   const listening = state.voice.phase === "listening";
-  const overlay = listening || voiceFinalizing || state.voice.phase === "sending";
+  const overlay = listening && !voiceFinalizing;
   const arming = listening && (!voiceReady || voiceFinalizing);
   if (dock) {
     dock.className =
@@ -2461,7 +2609,9 @@ function syncVoiceDom() {
   if (lab) {
     lab.textContent = voiceFinalizing
       ? C.listening.finalizing || C.listening.label
-      : C.listening.label;
+      : !voiceReady
+        ? C.listening.opening || C.listening.label
+        : C.listening.label;
   }
   if (status) status.textContent = voiceStatusText();
   if (btn) {
@@ -2474,26 +2624,57 @@ function syncVoiceDom() {
     words.hidden = !show;
     if (show) words.innerHTML = liveWordsInnerHtml();
   }
+  paintVoiceWait();
 }
 
 function startVoiceTick() {
   clearInterval(voiceTick);
   voiceTick = setInterval(() => {
-    if (state.voice.phase !== "listening") return;
-    if (voiceFinalizing) {
+    if (state.voice.phase !== "listening" && state.voice.phase !== "sending") return;
+    if (voiceFinalizing || !voiceReady) {
       const status = document.getElementById("voiceStatus");
       if (status) status.textContent = voiceStatusText();
-      return;
-    }
-    if (!voiceReady) {
-      const status = document.getElementById("voiceStatus");
-      if (status) status.textContent = voiceStatusText();
+      paintVoiceWait();
       return;
     }
     state.voice.heldMs = Date.now() - (voiceStartedAt || Date.now());
     const status = document.getElementById("voiceStatus");
     if (status) status.textContent = voiceStatusText();
+    paintVoiceWait();
   }, 110);
+}
+
+function paintVoiceWait() {
+  const el = document.getElementById("voiceWaitMeter");
+  if (!el) return;
+  const bar = el.querySelector("span");
+  const phase = state.voice.phase;
+  let mode = null;
+  let pct = 0;
+  if (voiceFlushing) {
+    mode = "det";
+    const dur = Math.max(1, Number(window.PCM_FLUSH_MS) || 400);
+    pct = Math.min(100, ((Date.now() - (voiceFlushAt || Date.now())) / dur) * 100);
+  } else if (phase === "sending") {
+    mode = "indet";
+  } else if (phase === "listening" && !voiceReady) {
+    if (voiceChirping) {
+      mode = "det";
+      const dur =
+        Math.max(1, Number(window.CHIRP_MS) || 180) + Math.max(0, Number(window.CHIRP_TAIL_MS) || 40);
+      pct = Math.min(100, ((Date.now() - (voiceWaitAt || Date.now())) / dur) * 100);
+    } else {
+      mode = "indet";
+    }
+  }
+  if (!mode) {
+    el.hidden = true;
+    el.classList.remove("is-indet");
+    return;
+  }
+  el.hidden = false;
+  el.classList.toggle("is-indet", mode === "indet");
+  if (bar) bar.style.width = mode === "indet" ? "36%" : pct.toFixed(1) + "%";
 }
 
 function ensureAudioCtx() {
@@ -2519,6 +2700,74 @@ function ensureAudioCtx() {
     voiceAudioCtx.resume().catch(() => {});
   }
   return voiceAudioCtx;
+}
+
+function stopVoiceOnSound() {
+  if (!voiceOnCue) return;
+  const cue = voiceOnCue;
+  voiceOnCue = null;
+  cue.oscs.forEach((osc) => {
+    try {
+      osc.stop();
+    } catch (_) {
+      /* already stopped */
+    }
+  });
+  try {
+    cue.master.disconnect();
+  } catch (_) {
+    /* already disconnected */
+  }
+}
+
+function playVoiceOnSound(done) {
+  stopVoiceOnSound();
+  const ctx = ensureAudioCtx();
+  const finish = () => {
+    if (typeof done === "function") done();
+  };
+  if (!ctx) {
+    finish();
+    return;
+  }
+  const fire = () => {
+    if (!voiceWanted || state.voice.phase !== "listening") {
+      finish();
+      return;
+    }
+    const now = ctx.currentTime;
+    const master = ctx.createGain();
+    master.gain.setValueAtTime(0.22, now);
+    master.connect(ctx.destination);
+    const oscs = [];
+    const chirp = (freq, start, dur) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(freq, start);
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(1, start + 0.008);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+      osc.connect(gain);
+      gain.connect(master);
+      osc.start(start);
+      osc.stop(start + dur + 0.02);
+      oscs.push(osc);
+      return osc;
+    };
+    chirp(880, now, 0.055);
+    const last = chirp(1318.5, now + 0.07, 0.085);
+    voiceOnCue = { master, oscs };
+    last.onended = () => {
+      if (voiceOnCue && voiceOnCue.master === master) stopVoiceOnSound();
+      finish();
+    };
+  };
+  if (ctx.state === "suspended") {
+    ctx.resume().then(fire).catch(() => finish());
+    return;
+  }
+  fire();
 }
 
 function mapVoiceLevel(rms, peak) {
@@ -2678,10 +2927,23 @@ function startAnalyser(stream) {
     proc.onaudioprocess = (ev) => {
       if (!voiceWanted && !voiceFlushing) return;
       const input = ev.inputBuffer.getChannelData(0);
+      if (!voiceHoldArmed && !voiceFlushing) {
+        cueVoiceReady();
+        sendStreamKeepAlive();
+        return;
+      }
+      const speechFn = typeof window.isSpeechFrame === "function" ? window.isSpeechFrame : null;
+      if (speechFn ? speechFn(input) : false) {
+        voiceHadSpeech = true;
+        voiceSpeechAt = Date.now();
+      }
       livePcmChunks.push(new Float32Array(input));
       livePcmSamples += input.length;
-      markVoiceReady();
-      sendPcmToStream(input);
+      if (voiceFlushing || (speechFn ? speechFn(input) : true)) {
+        sendPcmToStream(input);
+      } else {
+        sendStreamKeepAlive();
+      }
       if (typeof voiceFlushWait === "function") voiceFlushWait();
     };
     liveCapture = { proc, sink, mute };
@@ -2735,7 +2997,17 @@ function paintLiveWords() {
   if (show) words.innerHTML = liveWordsInnerHtml();
 }
 
-function applyLiveTranscript(text, isFinal, replace) {
+function applyLiveTranscript(text, isFinal, replace, confidence) {
+  if (!voiceFinalizing) {
+    const recentFn =
+      typeof window.speechHeardRecently === "function" ? window.speechHeardRecently : null;
+    const recent = recentFn
+      ? recentFn(voiceSpeechAt, Date.now())
+      : voiceSpeechAt && Date.now() - voiceSpeechAt < 1500;
+    if (!recent) return;
+    const confFn = typeof window.liveConfidenceOk === "function" ? window.liveConfidenceOk : null;
+    if (confFn ? !confFn(confidence) : Number(confidence) > 0 && Number(confidence) < 0.55) return;
+  }
   const raw = String(text || "").trim();
   const paintFn =
     typeof window.shouldPaintInterim === "function" ? window.shouldPaintInterim : null;
@@ -2772,6 +3044,10 @@ function voiceStreamUrl(sampleRate) {
 
 function sendPcmToStream(input) {
   if (voiceFinalizing && !voiceFlushing) return;
+  if (!voiceHoldArmed && !voiceFlushing) {
+    sendStreamKeepAlive();
+    return;
+  }
   const toInt16 = window.floatToInt16;
   const toBytes = window.int16Bytes;
   if (typeof toInt16 !== "function" || typeof toBytes !== "function") return;
@@ -2799,6 +3075,19 @@ function sendPcmToStream(input) {
     window.enqueueStreamPcm(voiceStreamQueue, bytes);
   } else if (voiceWanted && voiceStreamQueue.length < 10) {
     voiceStreamQueue.push(bytes);
+  }
+}
+
+function sendStreamKeepAlive() {
+  if (!voiceStreamSock || voiceStreamSock.readyState !== 1) return;
+  const gap = Number(window.STREAM_KEEPALIVE_MS) || 3000;
+  const now = Date.now();
+  if (voiceKeepAliveAt && now - voiceKeepAliveAt < gap) return;
+  voiceKeepAliveAt = now;
+  try {
+    voiceStreamSock.send(JSON.stringify({ type: "KeepAlive" }));
+  } catch (_) {
+    /* keep recording */
   }
 }
 
@@ -2871,7 +3160,7 @@ function openVoiceStream() {
     }
     if (msg && msg.type === "transcript" && msg.text) {
       liveFromServer = true;
-      applyLiveTranscript(msg.text, Boolean(msg.is_final));
+      applyLiveTranscript(msg.text, Boolean(msg.is_final), false, msg.confidence);
     }
     if (msg && msg.type === "error" && !voiceFinalizing) {
       voiceStreamReady = false;
@@ -2947,6 +3236,7 @@ function shouldLivePoll() {
   return (
     liveWordsOn() &&
     voiceWanted &&
+    voiceReady &&
     !voiceStreamReady &&
     !voiceFinalizing &&
     state.voice.phase === "listening"
@@ -3028,11 +3318,37 @@ async function tickLivePoll() {
   }
 }
 
+function cueVoiceReady() {
+  if (voiceChirping || voiceReady || !voiceWanted || state.voice.phase !== "listening") return;
+  if (!voiceCaptureArmed) return;
+  voiceChirping = true;
+  voiceWaitAt = Date.now();
+  clearTimeout(voiceReadyTimer);
+  voiceReadyTimer = null;
+  const chirp = Number(window.CHIRP_MS) || 180;
+  const tail = Number(window.CHIRP_TAIL_MS) || 40;
+  const armAfterChirp = () => {
+    if (!voiceWanted || voiceReady || state.voice.phase !== "listening") return;
+    clearTimeout(voiceReadyTimer);
+    voiceReadyTimer = setTimeout(markVoiceReady, tail);
+  };
+  playVoiceOnSound(armAfterChirp);
+  // If onended never fires, still arm — do not add a second pause on top of the beep.
+  voiceReadyTimer = setTimeout(markVoiceReady, chirp + tail);
+  syncVoiceDom();
+}
+
 function markVoiceReady() {
   if (voiceReady || !voiceWanted || state.voice.phase !== "listening") return;
   if (!voiceCaptureArmed) return;
   clearTimeout(voiceReadyTimer);
   voiceReadyTimer = null;
+  voiceChirping = false;
+  livePcmChunks = [];
+  livePcmSamples = 0;
+  voiceChunks = [];
+  startHoldRecorder();
+  voiceHoldArmed = true;
   voiceReady = true;
   voiceStartedAt = Date.now();
   openVoiceStream();
@@ -3051,6 +3367,13 @@ function beginListening(btn) {
   voiceWanted = true;
   voiceReady = false;
   voiceCaptureArmed = false;
+  voiceChirping = false;
+  voiceHoldArmed = false;
+  voiceHadSpeech = false;
+  voiceSpeechAt = 0;
+  voiceKeepAliveAt = 0;
+  voiceWaitAt = 0;
+  voiceFlushAt = 0;
   voiceFinalizing = false;
   voiceFlushing = false;
   voiceFlushWait = null;
@@ -3077,6 +3400,10 @@ function beginListening(btn) {
     .getUserMedia({
       audio: {
         channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        voiceIsolation: true,
       },
     })
     .catch(() => navigator.mediaDevices.getUserMedia({ audio: true }))
@@ -3085,37 +3412,57 @@ function beginListening(btn) {
         stream.getTracks().forEach((t) => t.stop());
         return;
       }
+      stream.getAudioTracks().forEach((track) => {
+        try {
+          track.contentHint = "speech";
+        } catch (_) {
+          /* optional */
+        }
+      });
       voiceStream = stream;
       startAnalyser(stream);
-      const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-        ? "audio/webm;codecs=opus"
-        : MediaRecorder.isTypeSupported("audio/webm")
-          ? "audio/webm"
-          : "";
-      try {
-        voiceRecorder = mime
-          ? new MediaRecorder(stream, { mimeType: mime })
-          : new MediaRecorder(stream);
-      } catch (_) {
-        onMicDenied();
-        return;
-      }
-      voiceRecorder.ondataavailable = (ev) => {
-        if (ev.data && ev.data.size) voiceChunks.push(ev.data);
-      };
-      try {
-        voiceRecorder.start(100);
-      } catch (_) {
-        voiceRecorder.start();
-      }
+      if (!bindHoldRecorder(stream)) return;
       voiceCaptureArmed = true;
-      voiceReadyTimer = setTimeout(markVoiceReady, 280);
-      if (livePcmSamples > 0) markVoiceReady();
+      voiceReadyTimer = setTimeout(cueVoiceReady, 280);
+      if (livePcmSamples > 0) cueVoiceReady();
       syncVoiceDom();
     })
     .catch(() => {
       onMicDenied();
     });
+}
+
+function bindHoldRecorder(stream) {
+  const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+    ? "audio/webm;codecs=opus"
+    : MediaRecorder.isTypeSupported("audio/webm")
+      ? "audio/webm"
+      : "";
+  try {
+    voiceRecorder = mime
+      ? new MediaRecorder(stream, { mimeType: mime })
+      : new MediaRecorder(stream);
+  } catch (_) {
+    onMicDenied();
+    return false;
+  }
+  voiceRecorder.ondataavailable = (ev) => {
+    if (ev.data && ev.data.size) voiceChunks.push(ev.data);
+  };
+  return true;
+}
+
+function startHoldRecorder() {
+  if (!voiceRecorder || voiceRecorder.state !== "inactive") return;
+  try {
+    voiceRecorder.start(100);
+  } catch (_) {
+    try {
+      voiceRecorder.start();
+    } catch (__) {
+      /* MediaRecorder optional — PCM snapshot still covers the hold */
+    }
+  }
 }
 
 function onMicDenied() {
@@ -3132,9 +3479,12 @@ function onMicDenied() {
 }
 
 function closeCaptureImmediate() {
+  stopVoiceOnSound();
   voiceWanted = false;
   voiceReady = false;
   voiceCaptureArmed = false;
+  voiceChirping = false;
+  voiceHoldArmed = false;
   voiceFlushing = false;
   voiceFlushWait = null;
   voiceStartedAt = 0;
@@ -3199,8 +3549,9 @@ function stopRecorderBlob(recorder, mime, chunks) {
 
 async function submitVoiceBlob(blob, mime, started, correlation_id, liveCaption) {
   if (!blob || !blob.size) {
+    dropOptimistic(correlation_id);
     state.voice.phase = "idle";
-    syncVoiceDom();
+    paint();
     showToast(C.toasts.voiceEmpty);
     return;
   }
@@ -3213,6 +3564,7 @@ async function submitVoiceBlob(blob, mime, started, correlation_id, liveCaption)
       !(typeof window.isPlaceholderTranscript === "function" && window.isPlaceholderTranscript(liveRaw))
         ? liveRaw
         : undefined;
+    if (live_text) landQueuedTask(live_text, correlation_id, correlation_id, { voice: true });
     const out = await api("/api/v1/mini-app/voice", {
       method: "POST",
       body: {
@@ -3223,6 +3575,8 @@ async function submitVoiceBlob(blob, mime, started, correlation_id, liveCaption)
       },
     });
     const heard = String((out && (out.transcript || out.heard_echo)) || "").trim();
+    const kind =
+      (out && (out.voice_kind || (out.heard_handled && out.heard_handled.kind))) || "";
     if (heard) {
       const payload =
         (out && out.send_payload) || {
@@ -3233,8 +3587,6 @@ async function submitVoiceBlob(blob, mime, started, correlation_id, liveCaption)
         };
       payload.message = heard;
       const inTelegram = tg && tg.initData && typeof tg.sendData === "function";
-      const kind =
-        (out && (out.voice_kind || (out.heard_handled && out.heard_handled.kind))) || "";
       const skipSend = out && out.skip_send_data;
       if (inTelegram && !skipSend) {
         try {
@@ -3243,22 +3595,23 @@ async function submitVoiceBlob(blob, mime, started, correlation_id, liveCaption)
           /* host may still ingest via webhook */
         }
       }
-      const cid = payload.correlation_id || correlation_id || newId();
       if (kind === "cant" || kind === "unclear" || kind === "near_match") {
-        applyHeardOutcome(out.heard_handled || out, heard, cid);
+        applyHeardOutcome(out.heard_handled || out, heard, correlation_id);
         burstPoll();
       } else {
-        landVoiceDraft(heard, cid, out && out.instruction_id);
+        landVoiceDraft(heard, correlation_id, (out && out.instruction_id) || correlation_id);
         burstPoll();
       }
+    } else if (live_text) {
+      landVoiceDraft(live_text, correlation_id, correlation_id);
+      burstPoll();
     } else {
-      state.voice.phase = "idle";
-      syncVoiceDom();
-      showToast((out && out.speech) || C.toasts.voiceEmpty);
+      landMisheard(correlation_id);
     }
   } catch (_) {
+    dropOptimistic(correlation_id);
     state.voice.phase = "idle";
-    syncVoiceDom();
+    paint();
     showToast(C.toasts.voiceFailed);
   }
 }
@@ -3280,14 +3633,40 @@ async function commitVoice() {
   const correlation_id = newId();
   const webmChunks = voiceChunks.slice();
   haptic("notify", "success");
+  const liveNow = String(state.voice.transcript || state.voice.transcriptRaw || "").trim();
+  const placeholder =
+    liveNow &&
+    !(typeof window.isPlaceholderTranscript === "function" && window.isPlaceholderTranscript(liveNow))
+      ? liveNow
+      : C.draftRow.hearing;
+  landQueuedTask(placeholder, correlation_id, correlation_id, { voice: true });
   voiceFinalizing = true;
   voiceFlushing = true;
+  voiceFlushAt = Date.now();
   stopLivePoll();
+  state.voice.phase = "sending";
+  paint();
   syncVoiceDom();
   try {
     await waitPcmFlushFrames();
     const pcm = snapshotLivePcm();
+    const hadSpeech =
+      voiceHadSpeech ||
+      (typeof window.holdHadSpeech === "function" && window.holdHadSpeech(pcm.chunks));
+    if (!hadSpeech && pcm.samples > 0) {
+      dropOptimistic(correlation_id);
+      teardownVoice();
+      state.voice.phase = "idle";
+      paint();
+      showToast(C.toasts.voiceEmpty);
+      return;
+    }
     const liveCaption = String(state.voice.transcript || state.voice.transcriptRaw || "").trim();
+    if (liveCaption) {
+      landQueuedTask(liveCaption, correlation_id, correlation_id, { voice: true });
+      const title = document.querySelector(`[data-row="${correlation_id}"] .title`);
+      if (title) title.textContent = liveCaption;
+    }
     const rawWav = wavFromPcm(pcm.chunks, pcm.rate);
     const webm = await stopRecorderBlob(recorder, mime, webmChunks);
     const heldSec = started ? (Date.now() - started) / 1000 : 0;
@@ -3312,26 +3691,12 @@ async function commitVoice() {
     await submitVoiceBlob(blob, (blob && blob.type) || mime, started, correlation_id, liveCaption);
   } finally {
     voiceFinalizing = false;
+    if (state.view === "main") paint();
   }
 }
 
 function landVoiceDraft(text, correlation_id, instruction_id) {
-  const id = instruction_id || correlation_id;
-  const row = {
-    instruction_id: id,
-    sentence: text,
-    status: "with_aomi",
-    display_status: C.draftRow.chip,
-    voice_draft: true,
-    voice_landed_at: Date.now(),
-    kind: "voice",
-    correlation_id,
-    created_at: nowSecs(),
-    updated_at: nowSecs(),
-  };
-  state.optimistic = [row].concat(
-    state.optimistic.filter((r) => r.instruction_id !== id && r.correlation_id !== correlation_id),
-  );
+  landQueuedTask(text, correlation_id, instruction_id, { voice: true });
   state.voice.phase = "drafted";
   state.voice.transcript = "";
   state.voice.transcriptRaw = "";
@@ -3345,23 +3710,67 @@ function landVoiceDraft(text, correlation_id, instruction_id) {
   }, 2400);
 }
 
+function landMisheard(correlation_id) {
+  const existing = state.optimistic.find(
+    (r) => r.instruction_id === correlation_id || r.correlation_id === correlation_id,
+  );
+  const now = nowSecs();
+  const row = existing || {
+    instruction_id: correlation_id,
+    correlation_id,
+    kind: "voice",
+    fire_kind: "act",
+    queued_local: true,
+    created_at: now,
+  };
+  row.sentence = C.draftRow.misheard || "Misheard, try again";
+  row.status = "misheard";
+  row.display_status = "";
+  row.updated_at = now;
+  row.execute_at = null;
+  row.queued_local = true;
+  delete state.fillUx[row.instruction_id];
+  if (!existing) {
+    state.optimistic = [row].concat(
+      state.optimistic.filter(
+        (r) => r.instruction_id !== correlation_id && r.correlation_id !== correlation_id,
+      ),
+    );
+  }
+  state.voice.phase = "idle";
+  state.voice.transcript = "";
+  state.voice.transcriptRaw = "";
+  paint();
+  const id = row.instruction_id || correlation_id;
+  const prev = voiceMisheardTimers.get(id);
+  if (prev) clearTimeout(prev);
+  voiceMisheardTimers.set(
+    id,
+    setTimeout(() => {
+      voiceMisheardTimers.delete(id);
+      dropOptimistic(correlation_id, id);
+      paint();
+    }, MISHEARD_MS),
+  );
+}
+
 function applyHeardOutcome(handled, fallbackText, correlation_id) {
   const kind = handled && (handled.kind || handled.voice_kind);
   state.voice.phase = "idle";
   state.voice.transcript = "";
   if (kind === "near_match") {
+    dropOptimistic(correlation_id);
     state.nearMatch = handled;
     paint();
     return;
   }
   state.nearMatch = null;
   if (kind === "unclear") {
-    if (isVoiceHome()) showNudge(handled.message || C.toasts.voiceEmpty);
-    else showToast(handled.message || C.toasts.voiceEmpty);
-    paint();
+    landMisheard(correlation_id);
     return;
   }
   if (kind === "cant") {
+    dropOptimistic(correlation_id);
     const ins = handled.instruction;
     if (ins && ins.instruction_id) {
       const row = {
@@ -3483,10 +3892,25 @@ async function refreshLedger() {
     const priorById = Object.fromEntries(
       (state.ledger || []).map((row) => [row.instruction_id, row]),
     );
+    const optimisticBySentence = new Map();
+    for (const row of state.optimistic) {
+      const sentence = String(row.sentence || "").trim().toLowerCase();
+      if (sentence) optimisticBySentence.set(sentence, row);
+    }
     state.ledger = (led.instructions || []).map((row) => {
       const prior = priorById[row.instruction_id];
-      if (prior && prior.trail && !row.trail) return { ...row, trail: prior.trail };
-      return row;
+      let next = row;
+      if (prior && prior.trail && !row.trail) next = { ...row, trail: prior.trail };
+      const opt =
+        state.optimistic.find(
+          (r) =>
+            r.instruction_id === row.instruction_id ||
+            (r.correlation_id && row.correlation_id && r.correlation_id === row.correlation_id),
+        ) || optimisticBySentence.get(String(row.sentence || "").trim().toLowerCase());
+      if (opt) {
+        adoptFillUx(opt.instruction_id, row.instruction_id);
+      }
+      return next;
     });
     state.ledgerStatus = "ok";
     const ids = new Set(state.ledger.map((r) => r.instruction_id));
@@ -3497,11 +3921,11 @@ async function refreshLedger() {
       if (ids.has(r.instruction_id) || (r.correlation_id && cor.has(r.correlation_id))) {
         return false;
       }
-      if (r.voice_draft) {
-        const sentence = String(r.sentence || "").trim().toLowerCase();
+      const sentence = String(r.sentence || "").trim().toLowerCase();
+      if (sentence && (r.queued_local || r.voice_draft)) {
         const matched = state.ledger.some((led) => {
           const s = String(led.sentence || "").trim().toLowerCase();
-          return Boolean(s && sentence && s === sentence);
+          return Boolean(s && s === sentence);
         });
         return !matched;
       }
@@ -3526,11 +3950,11 @@ async function refreshLedger() {
     }
     if (
       (state.view === "main" || state.view === "sent") &&
-      state.voice.phase !== "listening" &&
-      state.voice.phase !== "sending" &&
-      !voiceFinalizing
+      !(state.voice.phase === "listening" && !voiceFinalizing)
     ) {
-      paint();
+      const key = mainPaintKey();
+      const skip = state.view === "main" && key === lastMainPaintKey;
+      if (!skip) paint();
     }
     maybeFlushDue();
     tunePoll();
@@ -3540,9 +3964,7 @@ async function refreshLedger() {
     else state.ledgerStatus = "stale";
     if (
       state.view === "main" &&
-      state.voice.phase !== "listening" &&
-      state.voice.phase !== "sending" &&
-      !voiceFinalizing
+      !(state.voice.phase === "listening" && !voiceFinalizing)
     ) {
       paint();
     }
@@ -3554,9 +3976,7 @@ function patchLiveClock() {
   if (
     state.view !== "main" ||
     state.searchOpen ||
-    state.voice.phase === "listening" ||
-    state.voice.phase === "sending" ||
-    voiceFinalizing
+    (state.voice.phase === "listening" && !voiceFinalizing)
   ) {
     tuneAgeClock();
     return;
@@ -3668,7 +4088,8 @@ function burstPoll() {
 function maybeFlushDue() {
   const preview = previewState();
   if (preview && preview !== "dev") return;
-  for (const row of instructions()) {
+  for (const row of state.ledger) {
+    if (row.queued_local) continue;
     if (!isFlushDue(row)) continue;
     const key = flushKey(row);
     if (flushedIds.has(key)) continue;

@@ -98,9 +98,12 @@ const COPY = {
   draftRow: {
     chip: "with aomi",
     sub: "heard — aomi is taking it",
+    hearing: "hearing you…",
+    misheard: "Misheard, try again",
   },
   listening: {
     label: "LISTENING",
+    opening: "OPENING",
     caret: "▌",
     finalizing: "HEARING YOU",
   },
@@ -262,6 +265,9 @@ const COPY = {
     drafted: "heard — aomi is taking it",
     recording: "recording — release to send",
     starting: "starting mic…",
+    connecting: "connecting…",
+    ready: "ready…",
+    speakNow: "speak now · release to send",
     finalizing: "hearing you…",
     sending: "sending to aomi",
     processing: "processing…",

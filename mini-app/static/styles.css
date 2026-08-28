@@ -284,6 +284,9 @@ body.locked { overflow: hidden; }
 .glyph.warn { color: var(--warn); }
 .row.is-done .title { color: var(--mute); }
 .row.is-cant .title { color: var(--faint); }
+.row.is-misheard .title { color: var(--faint); }
+.row.is-misheard .glyph { color: var(--faint); }
+.row.is-misheard .row-front { background: transparent; }
 .row.voice-draft .row-front {
   background: rgba(185, 143, 62, 0.05);
 }
@@ -1238,6 +1241,25 @@ body.home-v7 .toast {
 .voice-level i.on.hot {
   background: #c8e4ff;
   box-shadow: 0 0 10px rgba(200, 228, 255, 0.55);
+}
+
+.voice-wait {
+  width: min(220px, 72%);
+  margin-top: 2px;
+}
+.voice-wait[hidden] {
+  display: none;
+}
+.voice-wait.is-indet > span {
+  width: 36% !important;
+  animation: voice-wait-slide 1.1s ease-in-out infinite;
+}
+@keyframes voice-wait-slide {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(280%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .voice-wait.is-indet > span { animation: none; width: 36% !important; }
 }
 
 .voice-status {

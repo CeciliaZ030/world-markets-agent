@@ -229,7 +229,9 @@ mod tests {
             Ok(()) => {}
             Err(errors) => {
                 assert!(
-                    errors.iter().all(|e| e.contains("over the") && e.contains("budget")),
+                    errors
+                        .iter()
+                        .all(|e| e.contains("over the") && e.contains("budget")),
                     "unexpected skill validation errors: {errors:?}"
                 );
             }

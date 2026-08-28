@@ -128,6 +128,18 @@ const PCM_FLUSH_MS = 400;
 const HOLD_TAIL_SILENCE_MS = 400;
 /** Slide-off must leave the button by this many CSS pixels — a lift is not a send. */
 const SLIDE_CANCEL_PAD_PX = 48;
+/** Two-tone ready cue length. Fallback arm if oscillator onended never fires. */
+const CHIRP_MS = 180;
+/** After the last oscillator ends — shorter than a perceptible pause. */
+const CHIRP_TAIL_MS = 40;
+/** Same floor as the live level meter — below this, frames are hush not speech. */
+const SPEECH_RMS_FLOOR = 0.004;
+/** Live captions only if speech energy was seen this recently. */
+const SPEECH_RECENT_MS = 1500;
+/** Drop Deepgram alternatives below this when a confidence is present. */
+const LIVE_CONFIDENCE_MIN = 0.55;
+/** Deepgram live idle ping while we skip silent PCM. */
+const STREAM_KEEPALIVE_MS = 3000;
 
 function enqueueStreamPcm(queue, bytes, maxChunks) {
   const q = Array.isArray(queue) ? queue : [];
@@ -253,6 +265,40 @@ function padHoldPcm(chunks, sampleRate, ms) {
   return rows.concat(silencePcmChunks(sampleRate, padMs, 2048));
 }
 
+function pcmRms(input) {
+  const src = input || [];
+  if (!src.length) return 0;
+  let sum = 0;
+  for (let i = 0; i < src.length; i++) sum += src[i] * src[i];
+  return Math.sqrt(sum / src.length);
+}
+
+function isSpeechFrame(input, floor) {
+  const lim = floor == null ? SPEECH_RMS_FLOOR : Number(floor);
+  return pcmRms(input) >= lim;
+}
+
+function holdHadSpeech(chunks, floor) {
+  const rows = Array.isArray(chunks) ? chunks : [];
+  for (let i = 0; i < rows.length; i++) {
+    if (isSpeechFrame(rows[i], floor)) return true;
+  }
+  return false;
+}
+
+function speechHeardRecently(at, now, windowMs) {
+  const t = Number(at) || 0;
+  if (!t) return false;
+  const ms = windowMs == null ? SPEECH_RECENT_MS : Number(windowMs);
+  return (Number(now) || Date.now()) - t <= ms;
+}
+
+function liveConfidenceOk(confidence) {
+  const c = Number(confidence);
+  if (!Number.isFinite(c) || c <= 0) return true;
+  return c >= LIVE_CONFIDENCE_MIN;
+}
+
 function preferHeardTranscript(stt, live) {
   const heard = String(stt || "").trim();
   const liveText = String(live || "").trim();
@@ -283,11 +329,22 @@ if (typeof window !== "undefined") {
   window.silencePcmChunks = silencePcmChunks;
   window.padHoldPcm = padHoldPcm;
   window.isPlaceholderTranscript = isPlaceholderTranscript;
+  window.pcmRms = pcmRms;
+  window.isSpeechFrame = isSpeechFrame;
+  window.holdHadSpeech = holdHadSpeech;
+  window.speechHeardRecently = speechHeardRecently;
+  window.liveConfidenceOk = liveConfidenceOk;
   window.MAX_STREAM_QUEUE = MAX_STREAM_QUEUE;
   window.PCM_FLUSH_FRAMES = PCM_FLUSH_FRAMES;
   window.PCM_FLUSH_MS = PCM_FLUSH_MS;
   window.HOLD_TAIL_SILENCE_MS = HOLD_TAIL_SILENCE_MS;
   window.SLIDE_CANCEL_PAD_PX = SLIDE_CANCEL_PAD_PX;
+  window.CHIRP_MS = CHIRP_MS;
+  window.CHIRP_TAIL_MS = CHIRP_TAIL_MS;
+  window.SPEECH_RMS_FLOOR = SPEECH_RMS_FLOOR;
+  window.SPEECH_RECENT_MS = SPEECH_RECENT_MS;
+  window.LIVE_CONFIDENCE_MIN = LIVE_CONFIDENCE_MIN;
+  window.STREAM_KEEPALIVE_MS = STREAM_KEEPALIVE_MS;
 }
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
@@ -310,10 +367,21 @@ if (typeof module !== "undefined" && module.exports) {
     pointInVoiceHit,
     silencePcmChunks,
     padHoldPcm,
+    pcmRms,
+    isSpeechFrame,
+    holdHadSpeech,
+    speechHeardRecently,
+    liveConfidenceOk,
     MAX_STREAM_QUEUE,
     PCM_FLUSH_FRAMES,
     PCM_FLUSH_MS,
     HOLD_TAIL_SILENCE_MS,
     SLIDE_CANCEL_PAD_PX,
+    CHIRP_MS,
+    CHIRP_TAIL_MS,
+    SPEECH_RMS_FLOOR,
+    SPEECH_RECENT_MS,
+    LIVE_CONFIDENCE_MIN,
+    STREAM_KEEPALIVE_MS,
   };
 }

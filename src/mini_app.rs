@@ -817,6 +817,10 @@ pub fn deepgram_replace_pairs() -> &'static [(&'static str, &'static str)] {
 }
 
 pub fn stream_transcript_text(value: &Value) -> Option<(String, bool)> {
+    crate::stt::stream_transcript(value).map(|(text, is_final, _)| (text, is_final))
+}
+
+pub fn stream_transcript_caption(value: &Value) -> Option<(String, bool, f64)> {
     crate::stt::stream_transcript(value)
 }
 

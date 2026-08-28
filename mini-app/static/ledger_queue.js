@@ -11,9 +11,15 @@ function isSlicedQueueRow(row) {
   return n > 1 || type === "twap" || type === "dca";
 }
 
+function isSittingQueueStatus(status) {
+  return status === "pending_execute" || status === "with_aomi";
+}
+
 function isQueueRow(row) {
   if (!row) return false;
-  if (row.status === "pending_execute" || row.status === "executing") return true;
+  if (row.status === "pending_execute" || row.status === "executing" || row.status === "with_aomi") {
+    return true;
+  }
   if (row.status !== "done") return false;
   return (
     row.kind === "trade" ||
@@ -24,10 +30,15 @@ function isQueueRow(row) {
 }
 
 function remainingQueueSecs(row, nowMs) {
-  if (!row || row.status !== "pending_execute") return null;
+  if (!row || !isSittingQueueStatus(row.status)) return null;
   const delay = Number(row.delay_secs) || QUEUE_DELAY_SECS;
   const now = Number(nowMs);
   const clock = Number.isFinite(now) ? now : Date.now();
+  if (row.wait_until_ms != null) {
+    const rem = (Number(row.wait_until_ms) - clock) / 1000;
+    if (!Number.isFinite(rem)) return null;
+    return Math.max(0, Math.min(delay, rem));
+  }
   if (row.execute_at) {
     const rem = (Number(row.execute_at) * 1000 - clock) / 1000;
     if (!Number.isFinite(rem)) return null;
@@ -56,14 +67,23 @@ function touchFillUx(row, ux, nowMs, opts) {
     fillStartedAt: ux && ux.fillStartedAt != null ? ux.fillStartedAt : null,
     revealed: Boolean(ux && ux.revealed),
     toasted: Boolean(ux && ux.toasted),
+    waitUntil: ux && ux.waitUntil != null ? ux.waitUntil : null,
   };
   if (!isQueueRow(row)) {
     next.revealed = true;
     return next;
   }
+  if (isSittingQueueStatus(row.status) && next.waitUntil == null) {
+    const cap = nowMs + QUEUE_DELAY_SECS * 1000;
+    let until = cap;
+    if (row.execute_at) until = Math.min(until, Number(row.execute_at) * 1000);
+    if (row.created_at) until = Math.min(until, Number(row.created_at) * 1000 + QUEUE_DELAY_SECS * 1000);
+    next.waitUntil = until;
+  }
   if (next.revealed) return next;
-  const rem = remainingQueueSecs(row, nowMs);
-  const waiting = row.status === "pending_execute" && rem != null && rem > 0;
+  const presented = next.waitUntil != null ? { ...row, wait_until_ms: next.waitUntil } : row;
+  const rem = remainingQueueSecs(presented, nowMs);
+  const waiting = isSittingQueueStatus(row.status) && rem != null && rem > 0;
   if (waiting) return next;
   if (row.status === "done" && next.fillStartedAt == null) {
     if (isSlicedQueueRow(row) || doneAgeMs(row, nowMs) > RECENT_DONE_MS) {
@@ -89,13 +109,14 @@ function touchFillUx(row, ux, nowMs, opts) {
 function presentQueue(row, ux, nowMs, opts) {
   if (!isQueueRow(row)) return null;
   const reduce = Boolean(opts && opts.reduceMotion);
-  const rem = remainingQueueSecs(row, nowMs);
-  const waiting = row.status === "pending_execute" && rem != null && rem > 0;
+  const presented = ux && ux.waitUntil != null ? { ...row, wait_until_ms: ux.waitUntil } : row;
+  const rem = remainingQueueSecs(presented, nowMs);
+  const waiting = isSittingQueueStatus(row.status) && rem != null && rem > 0;
   if (waiting) {
     return {
       zone: "queued",
       phase: "wait",
-      remainingDisplay: remainingDisplaySecs(row, nowMs),
+      remainingDisplay: remainingDisplaySecs(presented, nowMs),
       fillPct: 0,
       showMeter: true,
       showCountdown: true,
@@ -193,6 +214,7 @@ if (typeof window !== "undefined") {
   window.FILL_MS = FILL_MS;
   window.isSlicedQueueRow = isSlicedQueueRow;
   window.isQueueRow = isQueueRow;
+  window.isSittingQueueStatus = isSittingQueueStatus;
   window.remainingQueueSecs = remainingQueueSecs;
   window.remainingDisplaySecs = remainingDisplaySecs;
   window.touchFillUx = touchFillUx;
@@ -206,6 +228,7 @@ if (typeof module !== "undefined" && module.exports) {
     RECENT_DONE_MS,
     isSlicedQueueRow,
     isQueueRow,
+    isSittingQueueStatus,
     remainingQueueSecs,
     remainingDisplaySecs,
     touchFillUx,

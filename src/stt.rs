@@ -201,11 +201,14 @@ pub(crate) fn deepgram_stream_query(sample_rate: u32) -> Vec<(&'static str, Stri
 
 /// Exact Deepgram `replace` pairs. "buy 5 eth" is often emitted as "five five eight".
 pub(crate) fn deepgram_replace_pairs() -> &'static [(&'static str, &'static str)] {
-    &[("five five eight", "buy 5 ETH"), ("five eight", "buy 5 ETH")]
+    &[
+        ("five five eight", "buy 5 ETH"),
+        ("five eight", "buy 5 ETH"),
+    ]
 }
 
 /// Live WebSocket Results payload (`channel.alternatives`), not prerecorded `results.channels`.
-pub(crate) fn stream_transcript(value: &Value) -> Option<(String, bool)> {
+pub(crate) fn stream_transcript(value: &Value) -> Option<(String, bool, f64)> {
     let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
     if kind == "Error" || kind == "UtteranceEnd" || kind == "Metadata" {
         return None;
@@ -232,7 +235,8 @@ pub(crate) fn stream_transcript(value: &Value) -> Option<(String, bool)> {
             .get("speech_final")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-    Some((text, is_final))
+    let confidence = alt.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
+    Some((text, is_final, confidence))
 }
 
 /// Nova-3 `keyterm` is a plain phrase — no `:intensifier` suffix (that is nova-2
@@ -377,11 +381,7 @@ fn content_type_for<'a>(audio: &[u8], mime: &'a str) -> &'a str {
     if let Some(sniffed) = sniff_audio_type(audio) {
         return sniffed;
     }
-    if mime.is_empty() {
-        "audio/webm"
-    } else {
-        mime
-    }
+    if mime.is_empty() { "audio/webm" } else { mime }
 }
 
 fn extension_for(content_type: &str) -> &'static str {
@@ -470,9 +470,11 @@ mod tests {
         assert!(q.iter().any(|(k, v)| *k == "smart_format" && v == "true"));
         assert!(q.iter().any(|(k, v)| *k == "endpointing" && v == "false"));
         assert!(!q.iter().any(|(k, _)| *k == "keywords"));
-        assert!(deepgram_replace_pairs().iter().any(|(from, to)| {
-            *from == "five five eight" && *to == "buy 5 ETH"
-        }));
+        assert!(
+            deepgram_replace_pairs()
+                .iter()
+                .any(|(from, to)| { *from == "five five eight" && *to == "buy 5 ETH" })
+        );
     }
 
     #[test]
@@ -545,15 +547,15 @@ mod tests {
             "channel": { "alternatives": [{ "transcript": "buy ether" }] }
         }))
         .unwrap();
-        assert_eq!(interim, ("buy ether".to_string(), false));
+        assert_eq!(interim, ("buy ether".to_string(), false, 0.0));
         let fin = stream_transcript(&json!({
             "type": "Results",
             "is_final": true,
             "speech_final": true,
-            "channel": { "alternatives": [{ "transcript": "buy fifty ether" }] }
+            "channel": { "alternatives": [{ "transcript": "buy fifty ether", "confidence": 0.91 }] }
         }))
         .unwrap();
-        assert_eq!(fin, ("buy fifty ether".to_string(), true));
+        assert_eq!(fin, ("buy fifty ether".to_string(), true, 0.91));
         assert!(stream_transcript(&json!({ "type": "Metadata" })).is_none());
         assert!(
             stream_transcript(&json!({

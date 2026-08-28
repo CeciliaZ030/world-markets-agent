@@ -39,19 +39,41 @@ USDT` produced a false cap block. The model sometimes divides and sometimes does
 A user gets a correct execution or a false block depending on a phrasing they
 cannot predict.
 
-**Root cause.** `quantity` is a base-unit field (`src/tool.rs:197` "Human-readable
-base quantity, such as 0.25"). No tool accepts dollar size; no skill line converts.
-`grep -n quantity src/skill/*.md` returns exactly one line, which says pass
-"quantity" and "never figures" — so the model passes the dollar literal into a
-base field. On perps it happens to divide (H5); on spot it often doesn't.
+**Root cause.** `src/size.rs` **already implements this** — the P-A module is written.
+`ExecuteWorldOrderArgs` carries `size_usd` and `size_base` (`tool.rs:211/250`),
+`resolve_size()` (`tool.rs:763`) hands the sentence + denominated size to
+`size::classify_and_resolve()`, which parses the sentence through
+`speech_ontology`, detects a quote-denominated sentence meeting a base-only model
+input, and returns `size_denomination_mismatch` with a guided `retry_with:
+{size_usd}`. The tool description even says, verbatim: *"Pass `size_usd` when they
+named dollars; `size_base` when they named the asset."* The docstring: *"The model
+never converts dollars to base quantity."*
 
-**Why it outranks all prior findings.** Three rounds of dogfooding never saw the
-happy path. Round 1 blamed RAPV fail-closed (D7); round 2 never executed. The
-real reason is *every dollar-denominated probe in the harness blinds itself on
-notional*. This is P2-3, and **P2-3 is not an honest-numbers hygiene item — it is
-a P0 unit confusion that makes the product unusable for its primary utterance.**
-The fix is tool-side: accept dollar/notional size and derive base quantity from
-the same mark the preview uses. No prompt change can or should fix it.
+**So the capability and the guard both exist — and both were defeated live.** The
+model passed `quantity: "50"` (and, on `put 300 into ether`, bare `300`) instead of
+`size_usd: "50"`. `quantity` is still wired as a **deprecated alias for `size_base`**
+(`tool.rs:206`), so a concrete base number is always available; and when the model
+passes `quantity` it evidently does **not** pass the sentence, so `resolve_size`
+has no quote context to contradict the base figure and treats `50` as 50 WETH.
+
+**The precise failure chain:** deprecated `quantity` alias (a trap) + model drops
+the sentence + model ignores the `size_usd` instruction ⇒ the mismatch guard never
+fires ⇒ `$50` becomes 50 WETH ⇒ false notional block.
+
+**Why this corrects the finding.** It is NOT a missing capability (my original
+claim). It is an **adherence + schema-trap failure** on top of a correctly-designed
+deterministic resolver. The fix surface narrows sharply:
+1. **Delete `quantity`** (stop calling it "deprecated alias"; remove it so the
+   model physically cannot route dollars into a base field).
+2. **Require the sentence** on execute/preview (schema-enforced), so resolve_size
+   always has the denominated text to classify against.
+3. Keep `size_usd` / `size_base` mutually exclusive, with `Mismatch` firing
+   when a quote sentence meets base-only input — the resolver already returns a
+   guided retry; it just needs the sentence to see it.
+
+This is now a **small mechanical fix with an existing, well-designed backend**, not
+a new engine capability. The "P0 unit confusion" stands; the "no tool accepts
+dollar size" part does not and is retracted.
 
 ---
 

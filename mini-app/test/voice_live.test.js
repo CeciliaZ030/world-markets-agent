@@ -25,6 +25,16 @@ const {
   PCM_FLUSH_MS,
   HOLD_TAIL_SILENCE_MS,
   padHoldPcm,
+  pcmRms,
+  isSpeechFrame,
+  holdHadSpeech,
+  speechHeardRecently,
+  liveConfidenceOk,
+  CHIRP_MS,
+  CHIRP_TAIL_MS,
+  SPEECH_RMS_FLOOR,
+  SPEECH_RECENT_MS,
+  LIVE_CONFIDENCE_MIN,
 } = require("../static/voice_live.js");
 
 test("does not paint empty or tiny interims", () => {
@@ -208,6 +218,29 @@ test("resampleForStream is a no-op when rates already match", () => {
   assert.equal(down.length, 8);
 });
 
+test("hold-to-talk plays an on chirp, then arms capture after the tail", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const src = readFileSync(join(here, "../static/app.js"), "utf8");
+  assert.match(src, /function playVoiceOnSound\(/);
+  assert.match(src, /function cueVoiceReady\(/);
+  assert.match(src, /function markVoiceReady\(/);
+  assert.match(src, /function startHoldRecorder\(/);
+  const cue = src.slice(src.indexOf("function cueVoiceReady("), src.indexOf("function markVoiceReady("));
+  assert.match(cue, /playVoiceOnSound\(/);
+  assert.match(cue, /CHIRP_TAIL_MS/);
+  assert.match(cue, /armAfterChirp/);
+  const play = src.slice(src.indexOf("function playVoiceOnSound("), src.indexOf("function mapVoiceLevel("));
+  assert.doesNotMatch(play, /!voiceReady/);
+  const ready = src.slice(src.indexOf("function markVoiceReady("), src.indexOf("function beginListening("));
+  assert.match(ready, /startHoldRecorder\(\)/);
+  assert.match(ready, /voiceHoldArmed = true/);
+  assert.doesNotMatch(ready, /playVoiceOnSound\(\)/);
+  const begin = src.slice(src.indexOf("function beginListening("), src.indexOf("function bindHoldRecorder("));
+  assert.doesNotMatch(begin, /playVoiceOnSound\(\)/);
+  assert.doesNotMatch(begin, /voiceRecorder\.start/);
+  assert.match(begin, /cueVoiceReady/);
+});
+
 test("hold-to-talk stream URL uses the declared capture rate", () => {
   const here = dirname(fileURLToPath(import.meta.url));
   const src = readFileSync(join(here, "../static/app.js"), "utf8");
@@ -234,4 +267,101 @@ test("stream queue keeps the start of the hold and does not grow without bound",
   assert.equal(queue.length, MAX_STREAM_QUEUE);
   assert.equal(queue[0], 0);
   assert.equal(queue[MAX_STREAM_QUEUE - 1], MAX_STREAM_QUEUE - 1);
+});
+
+test("pcmRms distinguishes hush from a spoken-scale frame", () => {
+  assert.ok(pcmRms(new Float32Array(2048)) < SPEECH_RMS_FLOOR);
+  assert.equal(isSpeechFrame(new Float32Array(2048)), false);
+  const spoken = new Float32Array(2048);
+  spoken.fill(0.2);
+  assert.ok(pcmRms(spoken) > SPEECH_RMS_FLOOR);
+  assert.equal(isSpeechFrame(spoken), true);
+  assert.equal(holdHadSpeech([new Float32Array(64), spoken]), true);
+  assert.equal(holdHadSpeech([new Float32Array(64), new Float32Array(64)]), false);
+});
+
+test("speechHeardRecently and liveConfidenceOk gate hallucinations", () => {
+  assert.equal(speechHeardRecently(0, 1000), false);
+  assert.equal(speechHeardRecently(1000, 1200), true);
+  assert.equal(speechHeardRecently(1000, 1000 + SPEECH_RECENT_MS + 1), false);
+  assert.equal(liveConfidenceOk(undefined), true);
+  assert.equal(liveConfidenceOk(0), true);
+  assert.equal(liveConfidenceOk(0.4), false);
+  assert.equal(liveConfidenceOk(LIVE_CONFIDENCE_MIN), true);
+  assert.equal(liveConfidenceOk(0.9), true);
+});
+
+test("quiet holds skip STT instead of posting hush", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const src = readFileSync(join(here, "../static/app.js"), "utf8");
+  assert.match(src, /holdHadSpeech/);
+  assert.match(src, /voiceHadSpeech/);
+  const commit = src.slice(src.indexOf("async function commitVoice("), src.indexOf("function landVoiceDraft("));
+  assert.match(commit, /if \(!hadSpeech && pcm\.samples > 0\)/);
+  assert.match(commit, /voiceEmpty/);
+  assert.match(commit, /teardownVoice\(\)/);
+  assert.ok(commit.indexOf("if (!hadSpeech)") < commit.indexOf("submitVoiceBlob"));
+});
+
+test("hold-to-talk requests speech-oriented capture", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const src = readFileSync(join(here, "../static/app.js"), "utf8");
+  assert.match(src, /echoCancellation:\s*true/);
+  assert.match(src, /noiseSuppression:\s*true/);
+  assert.match(src, /autoGainControl:\s*true/);
+  assert.match(src, /voiceIsolation:\s*true/);
+  assert.match(src, /contentHint\s*=\s*["']speech["']/);
+});
+
+test("hold-to-talk shows a wait meter and honest copy while gates run", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const app = readFileSync(join(here, "../static/app.js"), "utf8");
+  const copy = readFileSync(join(here, "../static/copy.js"), "utf8");
+  assert.match(app, /id="voiceWaitMeter"/);
+  assert.match(app, /function paintVoiceWait\(/);
+  assert.match(app, /meter queue-fill voice-wait/);
+  assert.match(copy, /connecting:\s*"connecting/);
+  assert.match(copy, /ready:\s*"ready/);
+  assert.match(copy, /speakNow:\s*"speak now/);
+  assert.match(copy, /opening:\s*"OPENING"/);
+  assert.ok(CHIRP_MS >= 150 && CHIRP_MS <= 220);
+  assert.ok(CHIRP_TAIL_MS >= 20 && CHIRP_TAIL_MS <= 50);
+});
+
+test("unclear voice reuses the client row as a grey misheard card", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const src = readFileSync(join(here, "../static/app.js"), "utf8");
+  const copy = readFileSync(join(here, "../static/copy.js"), "utf8");
+  const submit = src.slice(
+    src.indexOf("async function submitVoiceBlob("),
+    src.indexOf("async function commitVoice("),
+  );
+  const outcome = src.slice(
+    src.indexOf("function applyHeardOutcome("),
+    src.indexOf("async function sendNearMatchChoice("),
+  );
+  assert.match(copy, /misheard:\s*"Misheard, try again"/);
+  assert.match(src, /function landMisheard\(/);
+  assert.match(src, /status === "misheard"/);
+  assert.match(submit, /applyHeardOutcome\([^)]*correlation_id\)/);
+  assert.match(submit, /landVoiceDraft\(heard,\s*correlation_id/);
+  assert.doesNotMatch(submit, /applyHeardOutcome\([^)]*\bcid\b/);
+  assert.match(outcome, /kind === "unclear"[\s\S]*landMisheard\(correlation_id\)/);
+});
+
+test("silent PCM is kept alive, not streamed, until speech energy", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const src = readFileSync(join(here, "../static/app.js"), "utf8");
+  assert.match(src, /function sendStreamKeepAlive\(/);
+  assert.match(src, /type:\s*["']KeepAlive["']/);
+  assert.match(src, /speechHeardRecently/);
+  assert.match(src, /liveConfidenceOk/);
+});
+
+test("DECISIONS records speech-oriented capture, not the Deepgram demo defaults", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const src = readFileSync(join(here, "../DECISIONS.md"), "utf8");
+  assert.match(src, /voiceIsolation/);
+  assert.match(src, /~40ms, not a pause/);
+  assert.doesNotMatch(src, /same as the Deepgram demo/);
 });
