@@ -5,13 +5,38 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::brain::BrainClient;
 use crate::speech_ontology::{self, Channel, LexiconEntry};
 use crate::stt::{self, SttErrorKind, Transcript};
 
 const CATALOG_TTL: Duration = Duration::from_secs(60);
+
+/// `action_ir` present → command (`kind: "voice"`).
+/// A money/worth frame without IR is an incomplete trade, not a question —
+/// `submit_heard` can still wall it as unclear. Only actual questions skip the ledger.
+fn classify_voice_intent(
+    normalized: &speech_ontology::NormalizedUtterance,
+) -> (&'static str, bool) {
+    if normalized.action_ir.is_some() {
+        ("voice", false)
+    } else if speech_ontology::utterance_is_question(&normalized.normalized_text) {
+        ("question", true)
+    } else if speech_ontology::utterance_has_money_frame(&normalized.normalized_text) {
+        ("voice", false)
+    } else {
+        ("question", true)
+    }
+}
+
+fn action_ir_score(normalized: &speech_ontology::NormalizedUtterance) -> u8 {
+    match &normalized.action_ir {
+        Some(ir) if ir.instrument.is_some() => 2,
+        Some(_) => 1,
+        None => 0,
+    }
+}
 
 pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
     let brain = BrainClient::with_timeout(90);
@@ -134,8 +159,9 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
         utterance_id.clone()
     };
 
+    let (send_kind, is_question) = classify_voice_intent(&normalized);
     let send_payload = json!({
-        "kind": "voice",
+        "kind": send_kind,
         "message": normalized.normalized_text,
         "utterance_id": utterance_id,
         "correlation_id": correlation_id,
@@ -158,6 +184,7 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
         "channel": normalized.channel.as_str(),
         "grammar": normalized.grammar.as_str(),
         "action_ir": normalized.action_ir.as_ref().map(|ir| ir.to_json()),
+        "question": is_question,
         "slots": slots,
         "proposals": proposed_confusables,
         "long_note": recorded.get("long_note"),
@@ -210,8 +237,15 @@ fn transcribe_ingest_audio(
         .and_then(Value::as_str)
         .unwrap_or("audio/webm");
     match stt::transcribe(&audio, mime, &keyterms) {
-        Ok(transcript) if !transcript.text.trim().is_empty() => Ok(transcript),
-        Ok(_) => live_fallback_or_err(live_text, "didn't catch any speech"),
+        Ok(mut transcript) => {
+            let chosen = choose_transcript(&transcript.text, live_text);
+            if chosen.is_empty() {
+                live_fallback_or_err(live_text, "didn't catch any speech")
+            } else {
+                transcript.text = chosen;
+                Ok(transcript)
+            }
+        }
         Err(err) => live_fallback_or_err(live_text, &stt_message(err)),
     }
 }
@@ -263,17 +297,29 @@ fn decode_audio(body: &Value) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-#[cfg(test)]
 fn choose_transcript(stt: &str, live_text: Option<&str>) -> String {
     let stt = stt.trim();
-    if !stt.is_empty() {
-        return stt.to_string();
-    }
-    live_text
+    let live = live_text
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(stt)
-        .to_string()
+        .unwrap_or("");
+    if stt.is_empty() {
+        live.to_string()
+    } else if live.is_empty() {
+        stt.to_string()
+    } else {
+        let stt_n = speech_ontology::normalize_utterance(stt, Channel::Speech, &[], &[]);
+        let live_n = speech_ontology::normalize_utterance(live, Channel::Speech, &[], &[]);
+        if action_ir_score(&live_n) > action_ir_score(&stt_n) {
+            live.to_string()
+        } else if !speech_ontology::utterance_has_money_frame(stt)
+            && speech_ontology::utterance_has_money_frame(live)
+        {
+            live.to_string()
+        } else {
+            stt.to_string()
+        }
+    }
 }
 
 struct KeytermCache {
@@ -397,18 +443,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn full_audio_stt_is_not_replaced_by_live_captions() {
+    fn clip_stt_keeps_the_lead_unless_live_heard_a_dollar_frame() {
         assert_eq!(
             choose_transcript("Hi", Some("buy fifty dollars of eth")),
-            "Hi"
+            "buy fifty dollars of eth"
         );
         assert_eq!(
             choose_transcript("buy 51", Some("buy fifty dollars of ether")),
-            "buy 51"
+            "buy fifty dollars of ether"
         );
         assert_eq!(
             choose_transcript("buy fifty dollars of ETH", Some("by 15 of it")),
             "buy fifty dollars of ETH"
+        );
+        assert_eq!(
+            choose_transcript("buy fifty ETH", Some("buy ether")),
+            "buy fifty ETH"
+        );
+        assert_eq!(
+            choose_transcript(
+                "buy fifty dollars worth of ease",
+                Some("buy 550 worth of ETH")
+            ),
+            "buy 550 worth of ETH"
         );
     }
 
@@ -433,6 +490,7 @@ mod tests {
             .expect("transcribe_ingest_audio");
         let transcribe_body = &src[transcribe..];
         assert!(transcribe_body.contains("stt::transcribe"));
+        assert!(transcribe_body.contains("choose_transcript"));
         assert!(transcribe_body.contains("live_fallback_or_err"));
     }
 
@@ -469,6 +527,7 @@ mod tests {
         assert!(lower.iter().any(|t| t == "buy"), "{lower:?}");
         assert!(lower.iter().any(|t| t == "eth"), "{lower:?}");
         assert!(lower.iter().any(|t| t == "sell"), "{lower:?}");
+        assert!(lower.iter().any(|t| t == "dollars worth of"), "{lower:?}");
     }
 
     #[test]
@@ -486,5 +545,63 @@ mod tests {
         );
         assert!(typed.proposals.is_empty());
         assert_eq!(typed.channel, speech_ontology::Channel::Text);
+    }
+
+    #[test]
+    fn no_act_is_a_voice_question() {
+        let out = speech_ontology::normalize_utterance(
+            "how much is my ETH worth",
+            speech_ontology::Channel::Speech,
+            &[],
+            &[],
+        );
+        assert!(out.action_ir.is_none());
+        assert_eq!(classify_voice_intent(&out), ("question", true));
+        let free = speech_ontology::normalize_utterance(
+            "explain the basis trade",
+            speech_ontology::Channel::Speech,
+            &[],
+            &[],
+        );
+        assert!(free.action_ir.is_none());
+        assert_eq!(classify_voice_intent(&free), ("question", true));
+    }
+
+    #[test]
+    fn money_frame_without_ir_is_not_a_voice_question() {
+        let out = speech_ontology::normalize_utterance(
+            "my ETH is worth twenty dollars",
+            speech_ontology::Channel::Speech,
+            &[],
+            &[],
+        );
+        assert!(out.action_ir.is_none(), "{:?}", out.normalized_text);
+        assert_eq!(classify_voice_intent(&out), ("voice", false));
+    }
+
+    #[test]
+    fn act_is_a_voice_command() {
+        let out = speech_ontology::normalize_utterance(
+            "buy fifty dollars of ETH",
+            speech_ontology::Channel::Speech,
+            &[],
+            &[],
+        );
+        assert!(out.action_ir.is_some());
+        assert_eq!(classify_voice_intent(&out), ("voice", false));
+    }
+
+    #[test]
+    fn ingest_voice_exposes_question_flag_on_send_payload() {
+        let src = include_str!("voice.rs");
+        let start = src.find("pub fn ingest_voice").expect("ingest_voice");
+        let rest = &src[start..];
+        let end = rest.find("\nconst MIN_LIVE_AUDIO").unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(body.contains("classify_voice_intent"));
+        assert!(body.contains(r#""kind": send_kind"#));
+        assert!(body.contains(r#""question": is_question"#));
+        assert!(!body.contains(r#""kind": "voice""#));
+        assert!(!body.contains(r#""kind": "question""#));
     }
 }

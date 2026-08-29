@@ -73,6 +73,7 @@ test("empty-account keyterms still include ETH buy and worth", () => {
   assert.ok(lower.includes("eth"), `ETH missing from ${terms.join(",")}`);
   assert.ok(lower.includes("buy"), `buy missing from ${terms.join(",")}`);
   assert.ok(lower.includes("worth"), `worth missing from ${terms.join(",")}`);
+  assert.ok(lower.includes("dollars worth of"), `dollars worth of missing from ${terms.join(",")}`);
   assert.ok(lower.includes("unwind"), `unwind missing from ${terms.join(",")}`);
   assert.ok(lower.includes("leverage up"), `leverage up missing from ${terms.join(",")}`);
   assert.ok(!lower.includes("beef"));

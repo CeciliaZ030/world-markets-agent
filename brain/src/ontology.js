@@ -152,9 +152,9 @@ export function kindRank(kind) {
   const rank = {
     opener: 0,
     act: 0,
-    instrument: 1,
-    order_type: 2,
-    size_frame: 3,
+    size_frame: 1,
+    instrument: 2,
+    order_type: 3,
     size: 4,
     unit: 4,
     product: 5,
@@ -170,7 +170,7 @@ function isBoostToken(term, kind) {
   const words = trimmed.split(/\s+/).filter(Boolean).length;
   if (words === 0 || words > 3) return false;
   if (words > 1) {
-    return kind === "act" || kind === "opener";
+    return kind === "act" || kind === "opener" || kind === "size_frame";
   }
   return true;
 }

@@ -10,6 +10,7 @@ const {
   shouldPaintInterim,
   foldStreamTranscript,
   preferHeardTranscript,
+  liveCaptionIsCommand,
   snapshotPcm,
   encodeWavFromPcm,
   pickHoldAudio,
@@ -172,7 +173,23 @@ test("preferHeardTranscript keeps a longer finalized live sentence", () => {
     preferHeardTranscript("buy fifty dollars of ETH", "by 15 of it"),
     "buy fifty dollars of ETH",
   );
+  assert.equal(
+    preferHeardTranscript("buy fifty ETH", "buy fifty dollars of ether"),
+    "buy fifty dollars of ether",
+  );
   assert.equal(preferHeardTranscript("sell all sol", ""), "sell all sol");
+  assert.equal(
+    preferHeardTranscript("buy fifty dollars worth of ease", "buy 550 worth of ETH."),
+    "buy 550 worth of ETH.",
+  );
+});
+
+test("live buy captions count as commands even when clip STT is garbage", () => {
+  assert.equal(liveCaptionIsCommand("buy 550 worth of ETH."), true);
+  assert.equal(liveCaptionIsCommand("By twenty dollars"), true);
+  assert.equal(liveCaptionIsCommand("A $20 worth"), true);
+  assert.equal(liveCaptionIsCommand("how much is ETH"), false);
+  assert.equal(liveCaptionIsCommand(""), false);
 });
 
 test("snapshotPcm copies buffers so teardown cannot wipe the utterance", () => {
@@ -278,6 +295,9 @@ test("pcmRms distinguishes hush from a spoken-scale frame", () => {
   assert.equal(isSpeechFrame(spoken), true);
   assert.equal(holdHadSpeech([new Float32Array(64), spoken]), true);
   assert.equal(holdHadSpeech([new Float32Array(64), new Float32Array(64)]), false);
+  const quietSpeech = new Float32Array(2048);
+  quietSpeech.fill(0.0032);
+  assert.equal(isSpeechFrame(quietSpeech), true);
 });
 
 test("speechHeardRecently and liveConfidenceOk gate hallucinations", () => {
@@ -328,6 +348,54 @@ test("hold-to-talk shows a wait meter and honest copy while gates run", () => {
   assert.ok(CHIRP_TAIL_MS >= 20 && CHIRP_TAIL_MS <= 50);
 });
 
+test("voice questions skip the ledger and land on SENT", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const src = readFileSync(join(here, "../static/app.js"), "utf8");
+  const copy = readFileSync(join(here, "../static/copy.js"), "utf8");
+  const submit = src.slice(
+    src.indexOf("async function submitVoiceBlob("),
+    src.indexOf("async function commitVoice("),
+  );
+  const sent = src.slice(
+    src.indexOf("function renderSent("),
+    src.indexOf("function renderBlocked("),
+  );
+  assert.match(
+    copy,
+    /askNote:\s*"aomi answers in the thread\. Questions never become ledger records\."/,
+  );
+  assert.match(sent, /C\.sent\.askNote/);
+  assert.match(sent, /s\.question/);
+  assert.match(submit, /out && out\.question/);
+  assert.match(submit, /payload\.kind = "question"/);
+  assert.match(submit, /kind === "cant"/);
+  assert.match(submit, /dropOptimistic\(correlation_id\)/);
+  assert.match(
+    submit,
+    /state\.sent = \{ id: null, kind: "question", message: heard, question: true \}/,
+  );
+  assert.match(submit, /state\.view = "sent"/);
+  assert.match(submit, /\/api\/v1\/mini-app\/compose/);
+  assert.match(submit, /landVoiceDraft\(\s*heard,\s*correlation_id/);
+  assert.match(submit, /unclear_live_command/);
+  assert.match(submit, /question_live_command/);
+  assert.match(submit, /question_trade_attempt/);
+  assert.match(submit, /liveLooksLikeCommand/);
+  assert.match(submit, /landMisheard\(correlation_id\)/);
+  const wallAt = submit.search(/kind === "cant"/);
+  const liveOverrideAt = submit.search(/isQuestion && liveIsCommand/);
+  const questionAt = submit.search(/else if \(isQuestion\) \{/);
+  const draftAt = submit.search(/landVoiceDraft\(\s*heard,\s*correlation_id/);
+  assert.ok(wallAt >= 0 && liveOverrideAt >= 0 && questionAt >= 0 && draftAt >= 0);
+  assert.ok(wallAt < liveOverrideAt, "unclear live-command override precedes the question split");
+  assert.ok(liveOverrideAt < questionAt, "live command captions must not take the SENT question path");
+  assert.ok(questionAt < draftAt, "true questions must not fall through to landVoiceDraft");
+  const questionBranch = submit.slice(questionAt, draftAt);
+  assert.match(questionBranch, /dropOptimistic\(correlation_id\)/);
+  assert.doesNotMatch(questionBranch, /landQueuedTask/);
+  assert.doesNotMatch(questionBranch, /landVoiceDraft/);
+});
+
 test("unclear voice reuses the client row as a grey misheard card", () => {
   const here = dirname(fileURLToPath(import.meta.url));
   const src = readFileSync(join(here, "../static/app.js"), "utf8");
@@ -344,7 +412,7 @@ test("unclear voice reuses the client row as a grey misheard card", () => {
   assert.match(src, /function landMisheard\(/);
   assert.match(src, /status === "misheard"/);
   assert.match(submit, /applyHeardOutcome\([^)]*correlation_id\)/);
-  assert.match(submit, /landVoiceDraft\(heard,\s*correlation_id/);
+  assert.match(submit, /landVoiceDraft\(\s*heard,\s*correlation_id/);
   assert.doesNotMatch(submit, /applyHeardOutcome\([^)]*\bcid\b/);
   assert.match(outcome, /kind === "unclear"[\s\S]*landMisheard\(correlation_id\)/);
 });
@@ -364,4 +432,49 @@ test("DECISIONS records speech-oriented capture, not the Deepgram demo defaults"
   assert.match(src, /voiceIsolation/);
   assert.match(src, /~40ms, not a pause/);
   assert.doesNotMatch(src, /same as the Deepgram demo/);
+});
+
+test("toasts are a corner box sized from the record button, green or red", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const css = readFileSync(join(here, "../static/styles.css"), "utf8");
+  const src = readFileSync(join(here, "../static/app.js"), "utf8");
+  assert.match(css, /--voice-hero:\s*150px/);
+  assert.match(css, /\.toast\s*\{[\s\S]*?width:\s*var\(--voice-hero\)/);
+  assert.match(css, /\.toast\s*\{[\s\S]*?height:\s*calc\(var\(--voice-hero\)\s*\/\s*2\)/);
+  assert.match(css, /\.toast\s*\{[\s\S]*?right:\s*12px/);
+  assert.match(css, /\.toast\s*\{[\s\S]*?bottom:\s*calc\(12px \+ var\(--safe-bot\)\)/);
+  assert.match(css, /\.toast\s*\{[\s\S]*?max-width:\s*calc\(100vw - 24px\)/);
+  assert.match(css, /\.toast\.good\s*\{[\s\S]*?background:\s*var\(--pos\)/);
+  assert.match(css, /\.toast\.bad\s*\{[\s\S]*?background:\s*var\(--neg\)/);
+  assert.match(src, /function toastTone\(/);
+  assert.match(src, /class="toast \$\{kind\}"/);
+  assert.match(src, /showToast\(C\.toasts\.voiceEmpty,\s*"bad"\)/);
+  assert.match(src, /showToast\(C\.toasts\.voiceFailed,\s*"bad"\)/);
+  const submitFail = src.slice(
+    src.indexOf("async function submitVoiceBlob("),
+    src.indexOf("async function commitVoice("),
+  );
+  const catchAt = submitFail.lastIndexOf("} catch");
+  assert.ok(catchAt > 0);
+  const catchBlock = submitFail.slice(catchAt);
+  assert.doesNotMatch(catchBlock, /dropOptimistic/);
+  assert.match(catchBlock, /landQueuedTask\(liveCaption/);
+  assert.match(src, /showToast\(C\.draftRow\.misheard[\s\S]*?"bad"\)/);
+  assert.match(src, /showToast\(fillCopy\(C\.toasts\.voiceHeard,\s*\{ text \}\),\s*"good"\)/);
+  const land = src.slice(
+    src.indexOf("function landMisheard("),
+    src.indexOf("function applyHeardOutcome("),
+  );
+  assert.match(land, /showToast\([\s\S]*?"bad"\)/);
+});
+
+test("optimistic voice rows only yield to a newly appeared ledger sentence", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const src = readFileSync(join(here, "../static/app.js"), "utf8");
+  const refresh = src.slice(
+    src.indexOf("async function refreshLedger("),
+    src.indexOf("function patchLiveClock("),
+  );
+  assert.match(refresh, /!priorById\[led\.instruction_id\]/);
+  assert.match(refresh, /!priorById\[row\.instruction_id\]/);
 });

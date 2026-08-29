@@ -742,7 +742,16 @@ async fn voice_handler(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        if !heard.is_empty() {
+        let is_question = value
+            .get("question")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !heard.is_empty() && is_question {
+            // No act → question: skip submit_heard, the heard: echo, local
+            // dispatch, and compose-as-voice. The client sendData / preview
+            // compose carries kind:"question"; walls never fire on a question.
+            Ok(value)
+        } else if !heard.is_empty() {
             let utterance_id = value
                 .get("utterance_id")
                 .and_then(Value::as_str)
@@ -1291,6 +1300,36 @@ mod tests {
         }
         assert!(src.contains(r#".route("/api/v1/mini-app/share", post(share_handler))"#));
         assert!(src.contains("prepare_introduction"));
+    }
+
+    #[test]
+    fn voice_questions_skip_submit_heard_and_heard_echo() {
+        let src = include_str!("main.rs");
+        let voice = src
+            .split("async fn voice_handler")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn voice_stream_handler").next())
+            .expect("voice_handler body");
+        let question = voice.find("is_question").expect("question flag");
+        let heard = voice
+            .find("submit_heard")
+            .expect("submit_heard for commands");
+        assert!(question < heard, "question branch must skip submit_heard");
+        assert!(
+            voice.contains("if !heard.is_empty() && is_question"),
+            "questions return before the command path"
+        );
+        assert!(
+            voice.contains("heard: {heard}"),
+            "command path still posts the heard: echo"
+        );
+        let echo = voice
+            .find(r#"format!("heard: {heard}")"#)
+            .expect("heard echo");
+        assert!(
+            echo > heard,
+            "heard: echo stays on the command path after submit_heard"
+        );
     }
 
     #[test]

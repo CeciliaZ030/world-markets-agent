@@ -133,7 +133,7 @@ const CHIRP_MS = 180;
 /** After the last oscillator ends — shorter than a perceptible pause. */
 const CHIRP_TAIL_MS = 40;
 /** Same floor as the live level meter — below this, frames are hush not speech. */
-const SPEECH_RMS_FLOOR = 0.004;
+const SPEECH_RMS_FLOOR = 0.002;
 /** Live captions only if speech energy was seen this recently. */
 const SPEECH_RECENT_MS = 1500;
 /** Drop Deepgram alternatives below this when a confidence is present. */
@@ -299,11 +299,41 @@ function liveConfidenceOk(confidence) {
   return c >= LIVE_CONFIDENCE_MIN;
 }
 
+function transcriptHasMoneyFrame(text) {
+  return /\b(dollar|dollars|bucks|worth|notional)\b/i.test(String(text || ""));
+}
+
+function transcriptHasInstrument(text) {
+  return /\b(eth|weth|sol|btc|wbtc|bitcoin|ether|ethereum)\b/i.test(String(text || ""));
+}
+
+function liveCaptionIsCommand(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  const restored =
+    typeof restoreLeadingCommand === "function" ? restoreLeadingCommand(raw) : raw;
+  const t = restored.replace(/[.!?]+$/, "").toLowerCase();
+  if (
+    /^(what|why|how|who|when|where)\b/.test(t) ||
+    t.startsWith("walk me") ||
+    t.startsWith("tell me")
+  ) {
+    return false;
+  }
+  if (/^(buy|sell|long|short|close|unwind|lend|borrow|twap|dca|open|by)\b/.test(t)) {
+    return true;
+  }
+  return transcriptHasMoneyFrame(t) || transcriptHasInstrument(t);
+}
+
 function preferHeardTranscript(stt, live) {
   const heard = String(stt || "").trim();
   const liveText = String(live || "").trim();
   if (!liveText) return heard;
   if (!heard || isPlaceholderTranscript(heard)) return liveText;
+  if (!transcriptHasMoneyFrame(heard) && transcriptHasMoneyFrame(liveText)) return liveText;
+  if (liveCaptionIsCommand(liveText) && !liveCaptionIsCommand(heard)) return liveText;
+  if (transcriptHasInstrument(liveText) && !transcriptHasInstrument(heard)) return liveText;
   const sttWords = heard.split(/\s+/).filter(Boolean).length;
   const liveWords = liveText.split(/\s+/).filter(Boolean).length;
   if (liveWords > sttWords) return liveText;
@@ -324,6 +354,8 @@ if (typeof window !== "undefined") {
   window.joinTranscriptParts = joinTranscriptParts;
   window.foldStreamTranscript = foldStreamTranscript;
   window.preferHeardTranscript = preferHeardTranscript;
+  window.liveCaptionIsCommand = liveCaptionIsCommand;
+  window.transcriptHasInstrument = transcriptHasInstrument;
   window.enqueueStreamPcm = enqueueStreamPcm;
   window.pointInVoiceHit = pointInVoiceHit;
   window.silencePcmChunks = silencePcmChunks;
@@ -362,6 +394,8 @@ if (typeof module !== "undefined" && module.exports) {
     joinTranscriptParts,
     foldStreamTranscript,
     preferHeardTranscript,
+    liveCaptionIsCommand,
+    transcriptHasInstrument,
     isPlaceholderTranscript,
     enqueueStreamPcm,
     pointInVoiceHit,

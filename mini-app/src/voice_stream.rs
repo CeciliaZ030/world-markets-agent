@@ -209,5 +209,7 @@ mod tests {
         assert!(url.contains("replace="));
         assert!(!url.contains("keywords="));
         assert!(!url.contains("ingest"));
+        let money = listen_url(48_000, &["dollars worth of".into()]);
+        assert!(money.contains("dollars%20worth%20of") || money.contains("dollars+worth+of"));
     }
 }

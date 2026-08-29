@@ -12,7 +12,7 @@ import { recordCandidateOutcome, recordFromUtterance } from "./ontology_stats.js
 const EPISODE_GAP_SECS = 90;
 const MAX_UTTERANCES = 400;
 const MAX_CORRECTIONS = 400;
-const MAX_KEYTERMS = 50;
+const MAX_KEYTERMS = 75;
 
 function nowSecs() {
   return Math.floor(Date.now() / 1000);

@@ -1,4 +1,4 @@
-/* global Telegram, LightweightCharts, COPY, fillCopy */
+/* global Telegram, LightweightCharts, COPY, fillCopy, rowStampUnix, fmtLocalDate, fmtLocalTimeWithZone, rowStampLabel, isDoneToday */
 const tg = window.Telegram && window.Telegram.WebApp;
 const reduceMotion =
   window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -54,6 +54,7 @@ const state = {
   products: [],
   productId: "",
   earlierOpen: false,
+  stampPop: null,
   compose: null,
   sent: null,
   blocked: null,
@@ -273,6 +274,9 @@ function landQueuedTask(text, correlation_id, instruction_id, extra = {}) {
       adoptFillUx(existing.instruction_id, instruction_id);
       existing.instruction_id = instruction_id;
     }
+    if (extra.server_correlation_id) {
+      existing.correlation_id = extra.server_correlation_id;
+    }
     existing.updated_at = nowSecs();
     tunePoll();
     return existing;
@@ -284,7 +288,7 @@ function landQueuedTask(text, correlation_id, instruction_id, extra = {}) {
     status: "pending_execute",
     kind: extra.kind || "trade",
     fire_kind: "act",
-    correlation_id,
+    correlation_id: extra.server_correlation_id || correlation_id,
     created_at: now,
     updated_at: now,
     execute_at: now + 3,
@@ -297,7 +301,7 @@ function landQueuedTask(text, correlation_id, instruction_id, extra = {}) {
     state.optimistic.filter((r) => r.instruction_id !== id && r.correlation_id !== correlation_id),
   );
   tunePoll();
-  return row;
+  return existing || row;
 }
 
 function loadDismissed() {
@@ -368,11 +372,7 @@ function zoneOf(row) {
   if (row.status === "misheard") return "queued";
   if (row.status === "watching" || row.status === "paused") return "watch";
   if (row.status === "cant") return "cant";
-  const today = new Date().toISOString().slice(0, 10);
-  const changed = new Date((row.status_changed_at || row.updated_at || 0) * 1000)
-    .toISOString()
-    .slice(0, 10);
-  if (row.status === "done" && changed === today) return "done";
+  if (isDoneToday(row)) return "done";
   return "earlier";
 }
 
@@ -439,7 +439,7 @@ async function cancelInPlace(row) {
     state.sheet = null;
     state.insId = null;
   }
-  showToast(C.toasts.cancelSent);
+  showToast(C.toasts.cancelSent, "good");
   const preview = previewState();
   if (preview && preview !== "dev") return;
   try {
@@ -455,7 +455,7 @@ async function cancelInPlace(row) {
     });
     refreshLedger();
   } catch (_) {
-    showToast(C.toasts.cancelFailed);
+    showToast(C.toasts.cancelFailed, "bad");
   }
 }
 
@@ -478,7 +478,7 @@ async function archiveInPlace(rowOrId) {
     state.sheet = null;
     state.insId = null;
   }
-  showToast(C.toasts.archived);
+  showToast(C.toasts.archived, "good");
   paint();
   const preview = previewState();
   if (preview && preview !== "dev") return;
@@ -495,7 +495,7 @@ async function archiveInPlace(rowOrId) {
     });
     refreshLedger();
   } catch (_) {
-    showToast(C.toasts.archiveFailed);
+    showToast(C.toasts.archiveFailed, "bad");
   }
 }
 
@@ -711,13 +711,45 @@ function bottomHtml() {
   return `<div class="bottom-row"><button type="button" class="bottom-bar" id="bottomBtn">${escapeHtml(label)}</button>${mic}</div>`;
 }
 
-function toastHtml() {
-  if (!state.toast) return "";
-  return `<div class="toast">${escapeHtml(state.toast)}</div>`;
+function toastTone(kind) {
+  return kind === "bad" || kind === "error" ? "bad" : "good";
 }
 
-function showToast(msg) {
-  state.toast = msg;
+function toastHtml() {
+  if (!state.toast) return "";
+  const t =
+    typeof state.toast === "string"
+      ? { text: state.toast, kind: "good" }
+      : state.toast;
+  const kind = toastTone(t.kind);
+  return (
+    `<div class="toast ${kind}" role="status" aria-live="${kind === "bad" ? "assertive" : "polite"}">` +
+    `<span>${escapeHtml(t.text)}</span>` +
+    `</div>`
+  );
+}
+
+function stampPopHtml() {
+  if (!state.stampPop) return "";
+  const row = instructions().find((r) => r.instruction_id === state.stampPop);
+  if (!row) return "";
+  const at = rowStampUnix(row);
+  return (
+    `<div class="stamp-scrim" id="stampScrim"></div>` +
+    `<div class="stamp-pop" role="dialog" aria-label="${escapeHtml(C.stamp.open)}">` +
+    `<div class="fact-card">` +
+    `<div class="k">${escapeHtml(C.stamp.id)}</div><div class="num">${escapeHtml(taskIdOf(row))}</div>` +
+    `<div class="k">${escapeHtml(C.stamp.date)}</div><div>${escapeHtml(fmtLocalDate(at) || "—")}</div>` +
+    `<div class="k">${escapeHtml(C.stamp.time)}</div><div class="num">${escapeHtml(fmtLocalTimeWithZone(at) || "—")}</div>` +
+    `</div>` +
+    `</div>`
+  );
+}
+
+function showToast(msg, kind) {
+  const text = String(msg || "").trim();
+  if (!text) return;
+  state.toast = { text, kind: toastTone(kind) };
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
     state.toast = null;
@@ -732,6 +764,11 @@ function closeToChat() {
 
 function goBack() {
   haptic("impact", "light");
+  if (state.stampPop) {
+    state.stampPop = null;
+    paint();
+    return;
+  }
   if (state.searchOpen) {
     closeSearch();
     return;
@@ -899,6 +936,7 @@ function mainPaintKey() {
     sheet: state.sheet,
     openSwipe: state.openSwipe,
     earlier: state.earlierOpen,
+    stampPop: state.stampPop,
     search: state.searchOpen,
     near: state.nearMatch && state.nearMatch.asked_entity,
     voicePhase: state.voice && state.voice.phase,
@@ -953,7 +991,7 @@ function renderMain() {
   const voiceHome = isVoiceHome();
   const savedScroll = captureLedgerScroll();
   document.body.className = [
-    state.sheet || state.searchOpen ? "locked" : "",
+    state.sheet || state.searchOpen || state.stampPop ? "locked" : "",
     voiceHome ? "home-v7" : "",
   ]
     .filter(Boolean)
@@ -983,6 +1021,7 @@ function renderMain() {
     (voiceHome ? `</div>` : "") +
     searchMenuHtml() +
     (state.sheet ? sheetHtml() : "") +
+    stampPopHtml() +
     toastHtml() +
     bottomHtml();
   bindChrome();
@@ -991,6 +1030,7 @@ function renderMain() {
       haptic("select");
       state.tab = btn.getAttribute("data-tab");
       state.openSwipe = "";
+      state.stampPop = null;
       paint();
     };
   });
@@ -1059,9 +1099,6 @@ function voiceLevelHtml() {
 
 function voiceDockHtml() {
   const phase = state.voice.phase;
-  const nudge = state.voice.nudge
-    ? `<div class="voice-nudge" id="voiceNudge">${escapeHtml(state.voice.nudge)}</div>`
-    : `<div class="voice-nudge" id="voiceNudge" hidden></div>`;
   const words = `<div class="listen-words" id="liveWords"${
     showLiveWords() ? "" : " hidden"
   }>${liveWordsInnerHtml()}</div>`;
@@ -1083,7 +1120,6 @@ function voiceDockHtml() {
     `</div>` +
     `</div>` +
     `<div class="voice-dock ${phase}${phase === "listening" && (!voiceReady || voiceFinalizing) ? " arming" : ""}" id="voiceDock">` +
-    nudge +
     `<div class="voice-hero-wrap">` +
     voiceLevelHtml() +
     `<button type="button" class="voice-hero" id="voiceBtn" aria-label="${escapeHtml(voiceStatusText())}">` +
@@ -1312,12 +1348,17 @@ function zoneRows(rows) {
         .filter(Boolean)
         .join(" ");
       const swipeKind = archiveSwipe ? "archive" : actionSwipe ? "1" : "0";
+      const earlier = zoneOf(row) === "earlier";
+      const stampTxt = rowStampLabel(row, earlier);
+      const stamp = stampTxt
+        ? `<button type="button" class="row-stamp${state.stampPop === row.instruction_id ? " on" : ""}" data-stamp="${escapeHtml(row.instruction_id)}" aria-label="${escapeHtml(C.stamp.open)}" aria-expanded="${state.stampPop === row.instruction_id ? "true" : "false"}">${escapeHtml(stampTxt)}</button>`
+        : "";
       return `<div class="row ${rowCls}" data-row="${escapeHtml(row.instruction_id)}" data-swipe="${swipeKind}" data-phase="${escapeHtml((view && view.phase) || row.status)}">
         ${chips}
         <div class="row-front" style="${open ? `transform:translateX(-${archiveSwipe ? 88 : 140}px)` : ""}">
           <div class="glyph ${g.cls}">${g.spin ? '<div class="spin"></div>' : escapeHtml(g.g)}</div>
           <div class="row-body">
-            <div class="title-row"><div class="title">${escapeHtml(row.sentence)}</div>${value}${canCancel ? `<button type="button" class="row-x" data-cancel="${escapeHtml(row.instruction_id)}" aria-label="${escapeHtml(C.instruction.cancel)}">×</button>` : ""}</div>
+            <div class="title-row"><div class="title">${escapeHtml(row.sentence)}</div>${stamp}${value}${canCancel ? `<button type="button" class="row-x" data-cancel="${escapeHtml(row.instruction_id)}" aria-label="${escapeHtml(C.instruction.cancel)}">×</button>` : ""}</div>
             <div class="sub">${escapeHtml(subLine(row))}</div>
             ${meter}
           </div>
@@ -1351,6 +1392,24 @@ function bindLedger() {
     };
   }
   app.querySelectorAll(".row[data-row]").forEach((el) => bindRowSwipe(el, false));
+  app.querySelectorAll("[data-stamp]").forEach((btn) => {
+    btn.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      const id = btn.getAttribute("data-stamp");
+      haptic("select");
+      state.openSwipe = "";
+      state.stampPop = state.stampPop === id ? null : id;
+      paint();
+    };
+  });
+  const stampScrim = document.getElementById("stampScrim");
+  if (stampScrim) {
+    stampScrim.onclick = () => {
+      state.stampPop = null;
+      paint();
+    };
+  }
   app.querySelectorAll("[data-cancel]").forEach((btn) => {
     btn.addEventListener("pointerdown", (ev) => ev.stopPropagation());
     btn.onclick = (ev) => {
@@ -2165,6 +2224,7 @@ async function openInstruction(id) {
   if (row && row.status === "misheard") return;
   state.insId = id;
   state.sheet = "instruction";
+  state.stampPop = null;
   state.detent = "half";
   paint();
   try {
@@ -2209,7 +2269,8 @@ function renderCompose() {
           : `<button type="button" class="primary-btn" id="sendTap">${escapeHtml(c.button || C.compose.ask)}</button><p class="hint">${escapeHtml(C.compose.tapHint)}</p>`
       }
     </div>` +
-    bottomHtml();
+    bottomHtml() +
+    toastHtml();
   bindChrome();
   const input = document.getElementById("typeInput");
   if (input) {
@@ -2350,7 +2411,8 @@ function renderSent() {
       }
       <button type="button" class="ghost-btn" id="openThread">${escapeHtml(C.sent.openThread)}</button>
     </div>` +
-    bottomHtml();
+    bottomHtml() +
+    toastHtml();
   bindChrome();
   const card = document.getElementById("sentCard");
   if (card) {
@@ -2380,7 +2442,8 @@ function renderBlocked() {
       <button type="button" class="ghost-btn" id="gateAsk">${escapeHtml(C.gate.act)}</button>
       <p class="hint">${escapeHtml(C.gate.footer)}</p>
     </div>` +
-    bottomHtml();
+    bottomHtml() +
+    toastHtml();
   bindChrome();
   const ask = document.getElementById("gateAsk");
   if (ask) {
@@ -2429,7 +2492,6 @@ let voiceCaptureArmed = false;
 let voiceReadyTimer = null;
 let voiceStartedAt = 0;
 let voiceTick = null;
-let voiceNudgeTimer = null;
 let voiceDraftTimer = null;
 const voiceMisheardTimers = new Map();
 const MISHEARD_MS = 3000;
@@ -2466,6 +2528,7 @@ let voiceSpeechAt = 0;
 let voiceKeepAliveAt = 0;
 let voiceWaitAt = 0;
 let voiceFlushAt = 0;
+let voiceUpAt = 0;
 
 function bindVoice() {
   const btn = document.getElementById("voiceBtn");
@@ -2557,22 +2620,8 @@ function onVoiceUp() {
     cancelVoice("short");
     return;
   }
+  voiceUpAt = Date.now();
   commitVoice();
-}
-
-function showNudge(msg) {
-  state.voice.nudge = msg;
-  const el = document.getElementById("voiceNudge");
-  if (el) {
-    el.textContent = msg;
-    el.hidden = false;
-  }
-  clearTimeout(voiceNudgeTimer);
-  voiceNudgeTimer = setTimeout(() => {
-    state.voice.nudge = "";
-    const n = document.getElementById("voiceNudge");
-    if (n) n.hidden = true;
-  }, 2000);
 }
 
 function pulseTypeInstead() {
@@ -2998,15 +3047,22 @@ function paintLiveWords() {
 }
 
 function applyLiveTranscript(text, isFinal, replace, confidence) {
+  const recentFn =
+    typeof window.speechHeardRecently === "function" ? window.speechHeardRecently : null;
+  const recent = recentFn
+    ? recentFn(voiceSpeechAt, Date.now())
+    : Boolean(voiceSpeechAt && Date.now() - voiceSpeechAt < 1500);
+  const confFn = typeof window.liveConfidenceOk === "function" ? window.liveConfidenceOk : null;
+  const confOk = confFn
+    ? confFn(confidence)
+    : !(Number(confidence) > 0 && Number(confidence) < 0.55);
+  let dropReason = "";
   if (!voiceFinalizing) {
-    const recentFn =
-      typeof window.speechHeardRecently === "function" ? window.speechHeardRecently : null;
-    const recent = recentFn
-      ? recentFn(voiceSpeechAt, Date.now())
-      : voiceSpeechAt && Date.now() - voiceSpeechAt < 1500;
-    if (!recent) return;
-    const confFn = typeof window.liveConfidenceOk === "function" ? window.liveConfidenceOk : null;
-    if (confFn ? !confFn(confidence) : Number(confidence) > 0 && Number(confidence) < 0.55) return;
+    if (!recent) dropReason = "not_recent";
+    else if (!confOk) dropReason = "low_confidence";
+  }
+  if (dropReason) {
+    return;
   }
   const raw = String(text || "").trim();
   const paintFn =
@@ -3014,7 +3070,9 @@ function applyLiveTranscript(text, isFinal, replace, confidence) {
   const correct = typeof window.correctLiveTranscript === "function" ? window.correctLiveTranscript : null;
   let display = raw;
   if (replace) {
-    if (paintFn && !paintFn(raw, state.voice.transcriptRaw, false)) return;
+    if (paintFn && !paintFn(raw, state.voice.transcriptRaw, false)) {
+      return;
+    }
     voiceHeardCommitted = "";
   } else if (typeof window.foldStreamTranscript === "function") {
     const folded = window.foldStreamTranscript(
@@ -3023,13 +3081,17 @@ function applyLiveTranscript(text, isFinal, replace, confidence) {
       isFinal,
       state.voice.transcriptRaw,
     );
-    if (paintFn && !paintFn(folded.display, state.voice.transcriptRaw, isFinal)) return;
+    if (paintFn && !paintFn(folded.display, state.voice.transcriptRaw, isFinal)) {
+      return;
+    }
     voiceHeardCommitted = folded.committed;
     display = folded.display;
   } else if (paintFn && !paintFn(raw, state.voice.transcriptRaw, isFinal)) {
     return;
   }
-  if (!display) return;
+  if (!display) {
+    return;
+  }
   state.voice.transcriptRaw = display;
   state.voice.transcript = correct ? correct(display) : display;
   paintLiveWords();
@@ -3471,10 +3533,10 @@ function onMicDenied() {
   state.voice.phase = "idle";
   syncVoiceDom();
   if (isVoiceHome()) {
-    showNudge(C.voice.micDenied);
+    showToast(C.voice.micDenied, "bad");
     pulseTypeInstead();
   } else {
-    showToast(C.toasts.voiceDenied);
+    showToast(C.toasts.voiceDenied, "bad");
   }
 }
 
@@ -3523,8 +3585,8 @@ function cancelVoice(reason) {
   state.voice.transcriptRaw = "";
   voiceHeardCommitted = "";
   syncVoiceDom();
-  if (reason === "slide") showNudge(C.voice.slideOff);
-  else if (reason === "short") showNudge(C.voice.shortTap);
+  if (reason === "slide") showToast(C.voice.slideOff, "bad");
+  else if (reason === "short") showToast(C.voice.shortTap, "bad");
 }
 
 function stopRecorderBlob(recorder, mime, chunks) {
@@ -3547,12 +3609,41 @@ function stopRecorderBlob(recorder, mime, chunks) {
   });
 }
 
+function liveLooksLikeCommand(text) {
+  if (typeof window.liveCaptionIsCommand === "function") {
+    return window.liveCaptionIsCommand(text);
+  }
+  const t = String(text || "")
+    .trim()
+    .replace(/[.!?]+$/, "")
+    .toLowerCase();
+  if (!t) return false;
+  if (
+    /^(what|why|how|who|when|where)\b/.test(t) ||
+    t.startsWith("walk me") ||
+    t.startsWith("tell me")
+  ) {
+    return false;
+  }
+  return (
+    /^(buy|sell|long|short|close|unwind|lend|borrow|twap|dca|open|by)\b/.test(t) ||
+    /\b(dollar|dollars|bucks|worth|notional)\b/.test(t)
+  );
+}
+
+function liveHasInstrument(text) {
+  if (typeof window.transcriptHasInstrument === "function") {
+    return window.transcriptHasInstrument(text);
+  }
+  return /\b(eth|weth|sol|btc|wbtc|bitcoin|ether|ethereum)\b/i.test(String(text || ""));
+}
+
 async function submitVoiceBlob(blob, mime, started, correlation_id, liveCaption) {
   if (!blob || !blob.size) {
     dropOptimistic(correlation_id);
     state.voice.phase = "idle";
     paint();
-    showToast(C.toasts.voiceEmpty);
+    showToast(C.toasts.voiceEmpty, "bad");
     return;
   }
   try {
@@ -3586,8 +3677,13 @@ async function submitVoiceBlob(blob, mime, started, correlation_id, liveCaption)
           correlation_id: (out && out.correlation_id) || correlation_id,
         };
       payload.message = heard;
+      const isQuestion = Boolean(out && out.question);
+      if (isQuestion) payload.kind = "question";
       const inTelegram = tg && tg.initData && typeof tg.sendData === "function";
       const skipSend = out && out.skip_send_data;
+      const liveCmd = String(liveCaption || "").trim();
+      const liveIsCommand = Boolean(liveCmd) && liveLooksLikeCommand(liveCmd);
+      const liveIsFullCommand = liveIsCommand && liveHasInstrument(liveCmd);
       if (inTelegram && !skipSend) {
         try {
           tg.sendData(JSON.stringify(payload));
@@ -3595,11 +3691,58 @@ async function submitVoiceBlob(blob, mime, started, correlation_id, liveCaption)
           /* host may still ingest via webhook */
         }
       }
-      if (kind === "cant" || kind === "unclear" || kind === "near_match") {
+      if (kind === "unclear" && liveIsFullCommand) {
+        landVoiceDraft(liveCmd, correlation_id, (out && out.correlation_id) || correlation_id, {
+          server_correlation_id: out && out.correlation_id,
+        });
+        burstPoll();
+      } else if (kind === "cant" || kind === "unclear" || kind === "near_match") {
         applyHeardOutcome(out.heard_handled || out, heard, correlation_id);
         burstPoll();
+      } else if (isQuestion && liveIsFullCommand) {
+        payload.kind = "voice";
+        payload.message = liveCmd;
+        landVoiceDraft(liveCmd, correlation_id, (out && out.correlation_id) || correlation_id, {
+          server_correlation_id: out && out.correlation_id,
+        });
+        if (!inTelegram || previewState()) {
+          try {
+            await api("/api/v1/mini-app/compose", {
+              method: "POST",
+              body: payload,
+            });
+          } catch (_) {
+            /* keep the local queued row even if compose is down */
+          }
+        }
+        burstPoll();
+      } else if (isQuestion && liveIsCommand) {
+        landMisheard(correlation_id);
+      } else if (isQuestion) {
+        dropOptimistic(correlation_id);
+        if (!inTelegram || previewState()) {
+          try {
+            await api("/api/v1/mini-app/compose", {
+              method: "POST",
+              body: payload,
+            });
+          } catch (_) {
+            /* preview compose is best-effort; SENT still confirms the send */
+          }
+        }
+        state.voice.phase = "idle";
+        state.voice.transcript = "";
+        state.voice.transcriptRaw = "";
+        state.sent = { id: null, kind: "question", message: heard, question: true };
+        state.view = "sent";
+        paint();
       } else {
-        landVoiceDraft(heard, correlation_id, (out && out.instruction_id) || correlation_id);
+        landVoiceDraft(
+          heard,
+          correlation_id,
+          (out && out.instruction_id) || (out && out.correlation_id) || correlation_id,
+          { server_correlation_id: out && out.correlation_id },
+        );
         burstPoll();
       }
     } else if (live_text) {
@@ -3608,11 +3751,13 @@ async function submitVoiceBlob(blob, mime, started, correlation_id, liveCaption)
     } else {
       landMisheard(correlation_id);
     }
-  } catch (_) {
-    dropOptimistic(correlation_id);
+  } catch (err) {
+    if (liveCaption) {
+      landQueuedTask(liveCaption, correlation_id, correlation_id, { voice: true });
+    }
     state.voice.phase = "idle";
     paint();
-    showToast(C.toasts.voiceFailed);
+    showToast(C.toasts.voiceFailed, "bad");
   }
 }
 
@@ -3658,7 +3803,7 @@ async function commitVoice() {
       teardownVoice();
       state.voice.phase = "idle";
       paint();
-      showToast(C.toasts.voiceEmpty);
+      showToast(C.toasts.voiceEmpty, "bad");
       return;
     }
     const liveCaption = String(state.voice.transcript || state.voice.transcriptRaw || "").trim();
@@ -3695,12 +3840,15 @@ async function commitVoice() {
   }
 }
 
-function landVoiceDraft(text, correlation_id, instruction_id) {
-  landQueuedTask(text, correlation_id, instruction_id, { voice: true });
+function landVoiceDraft(text, correlation_id, instruction_id, extra = {}) {
+  landQueuedTask(text, correlation_id, instruction_id, {
+    voice: true,
+    server_correlation_id: extra.server_correlation_id,
+  });
   state.voice.phase = "drafted";
   state.voice.transcript = "";
   state.voice.transcriptRaw = "";
-  paint();
+  showToast(fillCopy(C.toasts.voiceHeard, { text }), "good");
   clearTimeout(voiceDraftTimer);
   voiceDraftTimer = setTimeout(() => {
     if (state.voice.phase === "drafted") {
@@ -3740,7 +3888,7 @@ function landMisheard(correlation_id) {
   state.voice.phase = "idle";
   state.voice.transcript = "";
   state.voice.transcriptRaw = "";
-  paint();
+  showToast(C.draftRow.misheard || C.toasts.voiceEmpty, "bad");
   const id = row.instruction_id || correlation_id;
   const prev = voiceMisheardTimers.get(id);
   if (prev) clearTimeout(prev);
@@ -3859,7 +4007,22 @@ async function api(path, opts) {
   const res = await fetch(path, init);
   if (res.status === 401) throw new Error("unauthorized");
   if (res.status === 404) throw new Error("not_found");
-  if (!res.ok) throw new Error("http");
+  if (!res.ok) {
+    let errKey = "http";
+    let bodyText = "";
+    try {
+      const errBody = await res.json();
+      errKey = (errBody && errBody.error) || "http";
+      bodyText = JSON.stringify(errBody).slice(0, 200);
+    } catch (_) {
+      try {
+        bodyText = (await res.text()).slice(0, 200);
+      } catch (__) {
+        /* ignore */
+      }
+    }
+    throw new Error(errKey);
+  }
   return res.json();
 }
 
@@ -3906,7 +4069,10 @@ async function refreshLedger() {
           (r) =>
             r.instruction_id === row.instruction_id ||
             (r.correlation_id && row.correlation_id && r.correlation_id === row.correlation_id),
-        ) || optimisticBySentence.get(String(row.sentence || "").trim().toLowerCase());
+        ) ||
+        (!priorById[row.instruction_id]
+          ? optimisticBySentence.get(String(row.sentence || "").trim().toLowerCase())
+          : undefined);
       if (opt) {
         adoptFillUx(opt.instruction_id, row.instruction_id);
       }
@@ -3925,8 +4091,10 @@ async function refreshLedger() {
       if (sentence && (r.queued_local || r.voice_draft)) {
         const matched = state.ledger.some((led) => {
           const s = String(led.sentence || "").trim().toLowerCase();
-          return Boolean(s && s === sentence);
+          return Boolean(s && s === sentence && !priorById[led.instruction_id]);
         });
+        if (matched) {
+        }
         return !matched;
       }
       return true;
@@ -3934,13 +4102,13 @@ async function refreshLedger() {
     for (const row of state.ledger) {
       if (state.pending[row.instruction_id] && row.status !== prev[row.instruction_id]) {
         delete state.pending[row.instruction_id];
-        if (row.status === "paused") showToast(C.toasts.paused);
-        if (row.status === "watching") showToast(fillCopy(C.toasts.watching, { date: fmtDate(row.expires_at) }));
+        if (row.status === "paused") showToast(C.toasts.paused, "good");
+        if (row.status === "watching") showToast(fillCopy(C.toasts.watching, { date: fmtDate(row.expires_at) }), "good");
       } else if (prev[row.instruction_id] && prev[row.instruction_id] !== row.status) {
-        if (row.status === "awaiting_confirm") showToast(fillCopy(C.toasts.trigger, { detail: row.sentence }));
+        if (row.status === "awaiting_confirm") showToast(fillCopy(C.toasts.trigger, { detail: row.sentence }), "good");
         if (row.status === "done") {
           const view = queueView(row);
-          if (!view || view.zone !== "queued") showToast(C.toasts.executed);
+          if (!view || view.zone !== "queued") showToast(C.toasts.executed, "good");
         }
       }
     }
@@ -4011,7 +4179,7 @@ function patchLiveClock() {
     const ux = state.fillUx[id];
     if (ux && ux.revealed && !ux.toasted && ux.fillStartedAt && row.status === "done") {
       ux.toasted = true;
-      showToast(C.toasts.executed);
+      showToast(C.toasts.executed, "good");
     }
     if (!shown) return;
     if (shown.phase !== prevPhase) needsPaint = true;
@@ -4213,6 +4381,7 @@ function previewBoot() {
       delay_secs: 3,
       progress_pct: 0,
       remaining_secs: 3,
+      created_at: nowSecs() - 2,
     },
     {
       instruction_id: "fill",
@@ -4226,6 +4395,7 @@ function previewBoot() {
       slice_i: 2,
       slice_n: 5,
       avg_price: "3588.12",
+      created_at: nowSecs() - 900,
     },
     {
       instruction_id: "roll",
@@ -4236,6 +4406,7 @@ function previewBoot() {
       kind: "conditional",
       fire_kind: "act",
       expires_at: nowSecs() + 86400 * 5,
+      created_at: nowSecs() - 3600,
     },
     {
       instruction_id: "perp",
@@ -4248,6 +4419,7 @@ function previewBoot() {
       check_stats: { last_check_at: nowSecs() - 4, checks_7d: 12 },
       expires_at: nowSecs() + 86400 * 18,
       distance: { mark: "3588", pct: 72, near: true },
+      created_at: nowSecs() - 7200,
     },
     {
       instruction_id: "floor",
@@ -4260,6 +4432,7 @@ function previewBoot() {
       check_stats: { last_check_at: nowSecs() - 4, checks_7d: 8 },
       expires_at: nowSecs() + 86400 * 26,
       distance: { mark: "3588", pct: 26, near: false },
+      created_at: nowSecs() - 10800,
     },
     {
       instruction_id: "cant-beef",
@@ -4270,6 +4443,7 @@ function previewBoot() {
       kind: "cant",
       asked_entity: "beef",
       cant_kind: "no_market",
+      created_at: nowSecs() - 20,
       status_changed_at: nowSecs() - 20,
       updated_at: nowSecs() - 20,
     },
@@ -4281,8 +4455,21 @@ function previewBoot() {
       sentence: "Buy 0.05 ETH spot at market",
       kind: "trade",
       receipt: "filled 0.05 ETH",
+      created_at: nowSecs() - 120,
       status_changed_at: nowSecs() - 120,
       updated_at: nowSecs() - 120,
+    },
+    {
+      instruction_id: "old-eth",
+      task_id: "old-eth",
+      status: "done",
+      display_status: "done",
+      sentence: "Buy 0.02 ETH spot at market",
+      kind: "trade",
+      receipt: "filled 0.02 ETH",
+      created_at: nowSecs() - 86400 * 3,
+      status_changed_at: nowSecs() - 86400 * 3,
+      updated_at: nowSecs() - 86400 * 3,
     },
   ];
   state.summary = { holding: 5, needs_you: 1, last_check_at: nowSecs() - 4 };

@@ -209,6 +209,71 @@ function isQueueHot(row, ux, nowMs, opts) {
   return Boolean(view && view.zone === "queued");
 }
 
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function localDayKey(ms) {
+  const d = new Date(ms);
+  return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
+}
+
+function isDoneToday(row, nowMs) {
+  if (!row || row.status !== "done") return false;
+  const at = Number(row.status_changed_at || row.updated_at || 0);
+  if (!Number.isFinite(at) || at <= 0) return false;
+  const now = nowMs != null ? nowMs : Date.now();
+  return localDayKey(at * 1000) === localDayKey(now);
+}
+
+function rowStampUnix(row) {
+  const n = Number((row && (row.created_at || row.status_changed_at || row.updated_at)) || 0);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function fmtLocalTime(unix) {
+  if (!unix) return "";
+  const d = new Date(Number(unix) * 1000);
+  return pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+}
+
+function fmtLocalDate(unix, nowMs) {
+  if (!unix) return "";
+  const d = new Date(Number(unix) * 1000);
+  let out = MONTHS[d.getMonth()] + " " + d.getDate();
+  const now = nowMs != null ? new Date(nowMs) : new Date();
+  if (d.getFullYear() !== now.getFullYear()) out += ", " + d.getFullYear();
+  return out;
+}
+
+function localTzName(unix) {
+  if (!unix) return "";
+  try {
+    const parts = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" }).formatToParts(
+      new Date(Number(unix) * 1000),
+    );
+    const tz = parts.find((p) => p.type === "timeZoneName");
+    return tz && tz.value ? tz.value : "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function fmtLocalTimeWithZone(unix) {
+  const time = fmtLocalTime(unix);
+  if (!time) return "";
+  const tz = localTzName(unix);
+  return tz ? time + " " + tz : time;
+}
+
+function rowStampLabel(row, earlier, nowMs) {
+  const at = rowStampUnix(row);
+  if (!at) return "";
+  return earlier ? fmtLocalDate(at, nowMs) : fmtLocalTime(at);
+}
+
 if (typeof window !== "undefined") {
   window.QUEUE_DELAY_SECS = QUEUE_DELAY_SECS;
   window.FILL_MS = FILL_MS;
@@ -220,6 +285,13 @@ if (typeof window !== "undefined") {
   window.touchFillUx = touchFillUx;
   window.presentQueue = presentQueue;
   window.isQueueHot = isQueueHot;
+  window.rowStampUnix = rowStampUnix;
+  window.fmtLocalTime = fmtLocalTime;
+  window.fmtLocalDate = fmtLocalDate;
+  window.fmtLocalTimeWithZone = fmtLocalTimeWithZone;
+  window.rowStampLabel = rowStampLabel;
+  window.localDayKey = localDayKey;
+  window.isDoneToday = isDoneToday;
 }
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
@@ -234,5 +306,13 @@ if (typeof module !== "undefined" && module.exports) {
     touchFillUx,
     presentQueue,
     isQueueHot,
+    rowStampUnix,
+    fmtLocalTime,
+    fmtLocalDate,
+    fmtLocalTimeWithZone,
+    localTzName,
+    rowStampLabel,
+    localDayKey,
+    isDoneToday,
   };
 }

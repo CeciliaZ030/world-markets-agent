@@ -67,6 +67,12 @@ const COPY = {
     earlier: "EARLIER",
     earlierSub: "expired · kept 90d, then archive",
   },
+  stamp: {
+    id: "id",
+    date: "date",
+    time: "time",
+    open: "request time",
+  },
   sub: {
     withAomi: "sent to thread · awaiting your confirm",
     needsYou: "condition met · confirm waiting in the thread",

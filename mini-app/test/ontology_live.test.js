@@ -30,12 +30,14 @@ test("live transcript maps phonetic ETH/SOL misses only", () => {
     { surface_form: "east", normalized_target: "WETH", kind: "confusable" },
     { surface_form: "eath", normalized_target: "WETH", kind: "confusable" },
     { surface_form: "soul", normalized_target: "SOL", kind: "confusable" },
+    { surface_form: "salt", normalized_target: "SOL", kind: "confusable" },
     { surface_form: "beef", normalized_target: "WETH", kind: "confusable" },
     { surface_form: "it", normalized_target: "WETH", kind: "confusable" },
     { surface_form: "these", normalized_target: "WETH", kind: "confusable" },
   ]);
   assert.equal(correctLiveTranscript("buy one east"), "buy one WETH");
   assert.equal(correctLiveTranscript("sell soul"), "sell SOL");
+  assert.equal(correctLiveTranscript("sell salt"), "sell SOL");
   assert.equal(correctLiveTranscript("buy fifty of beef"), "buy fifty of beef");
   assert.equal(correctLiveTranscript("watch it"), "watch it");
   assert.equal(correctLiveTranscript("buy these"), "buy these");
@@ -47,8 +49,8 @@ test("live transcript does not rewrite order_type tokens", () => {
     { surface_form: "twap", normalized_target: "twap", kind: "order_type" },
     { surface_form: "dca", normalized_target: "dca", kind: "order_type" },
   ]);
-  assert.equal(correctLiveTranscript("buy fifty ETH twap"), "buy fifty WETH twap");
-  assert.equal(correctLiveTranscript("dca buy fifty ETH"), "dca buy fifty WETH");
+  assert.equal(correctLiveTranscript("buy fifty ETH twap"), "buy fifty dollars worth of WETH twap");
+  assert.equal(correctLiveTranscript("dca buy fifty ETH"), "dca buy fifty dollars worth of WETH");
 });
 
 test("setOntologyEntries reloads aliases", () => {
@@ -114,5 +116,38 @@ test("live transcript collapses five-five-eight into buy 5 ETH", () => {
   assert.equal(correctLiveTranscript("buy 5 eight"), "buy 5 WETH");
   assert.equal(correctLiveTranscript("buy 58"), "buy 5 WETH");
   assert.equal(correctLiveTranscript("buy 5 SOL"), "buy 5 SOL");
-  assert.equal(correctLiveTranscript("buy 58 SOL"), "buy 58 SOL");
+  assert.equal(correctLiveTranscript("buy 58 SOL"), "buy 58 dollars worth of SOL");
+});
+
+test("live transcript restores dollars worth of when STT drops the frame", () => {
+  setOntologyEntries([
+    { surface_form: "ETH", normalized_target: "WETH", kind: "instrument" },
+    { surface_form: "ether", normalized_target: "WETH", kind: "instrument" },
+    { surface_form: "wrapped ether", normalized_target: "WETH", kind: "instrument" },
+    { surface_form: "SOL", normalized_target: "SOL", kind: "instrument" },
+    { surface_form: "salt", normalized_target: "SOL", kind: "confusable" },
+    { surface_form: "buy", normalized_target: "buy", kind: "act" },
+    { surface_form: "sell", normalized_target: "sell", kind: "act" },
+  ]);
+  assert.equal(correctLiveTranscript("buy fifty ether"), "buy fifty dollars worth of WETH");
+  assert.equal(correctLiveTranscript("buy 50 ETH"), "buy 50 dollars worth of WETH");
+  assert.equal(correctLiveTranscript("buy 50 of ETH"), "buy 50 dollars worth of WETH");
+  assert.equal(correctLiveTranscript("open 50 ETH long"), "open 50 dollars worth of WETH long");
+  assert.equal(correctLiveTranscript("buy ETH 50"), "buy 50 dollars worth of WETH");
+  assert.equal(correctLiveTranscript("buy ETH with 50"), "buy 50 dollars worth of WETH");
+  assert.equal(correctLiveTranscript("put 50 into ether"), "put 50 dollars worth of WETH");
+  assert.equal(correctLiveTranscript("buy 50 wrapped ether"), "buy 50 dollars worth of WETH");
+  assert.equal(correctLiveTranscript("twap 50 ETH"), "twap 50 dollars worth of WETH");
+  assert.equal(correctLiveTranscript("buy 5 ETH"), "buy 5 WETH");
+  assert.equal(correctLiveTranscript("buy 0.02 ether"), "buy 0.02 WETH");
+  assert.equal(
+    correctLiveTranscript("buy fifty dollars worth of ether"),
+    "buy fifty dollars worth of WETH",
+  );
+  assert.equal(correctLiveTranscript("a 20 yards worth of SOL"), "buy 20 dollars worth of SOL");
+  assert.equal(correctLiveTranscript("by 20 worth of salt"), "buy 20 dollars worth of SOL");
+  assert.equal(correctLiveTranscript("wait 20 worth of SOL"), "buy 20 dollars worth of SOL");
+  assert.equal(correctLiveTranscript("buy 20 worth of SOL"), "buy 20 dollars worth of SOL");
+  assert.equal(correctLiveTranscript("$550 worth of ETH"), "buy fifty dollars worth of WETH");
+  assert.equal(correctLiveTranscript("buy 550 worth of ETH"), "buy fifty dollars worth of WETH");
 });

@@ -7,7 +7,7 @@ use serde_json::Value;
 
 const DEEPGRAM_URL: &str = "https://api.deepgram.com/v1/listen";
 const WHISPER_URL: &str = "https://api.openai.com/v1/audio/transcriptions";
-const MAX_KEYTERMS: usize = 50;
+const MAX_KEYTERMS: usize = 75;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Transcript {
@@ -200,10 +200,20 @@ pub(crate) fn deepgram_stream_query(sample_rate: u32) -> Vec<(&'static str, Stri
 }
 
 /// Exact Deepgram `replace` pairs. "buy 5 eth" is often emitted as "five five eight".
+/// "dollars worth of" is unstressed and lands as Dallas / dollar sword / etc.
 pub(crate) fn deepgram_replace_pairs() -> &'static [(&'static str, &'static str)] {
     &[
         ("five five eight", "buy 5 ETH"),
         ("five eight", "buy 5 ETH"),
+        ("dallas worth of", "dollars worth of"),
+        ("dollar sword of", "dollars worth of"),
+        ("dollars word of", "dollars worth of"),
+        ("dollars worth off", "dollars worth of"),
+        ("dollar worth of", "dollars worth of"),
+        ("yards worth of", "dollars worth of"),
+        ("yards worth", "dollars worth"),
+        ("yard's worth of", "dollars worth of"),
+        ("yard worth of", "dollars worth of"),
     ]
 }
 
@@ -381,7 +391,11 @@ fn content_type_for<'a>(audio: &[u8], mime: &'a str) -> &'a str {
     if let Some(sniffed) = sniff_audio_type(audio) {
         return sniffed;
     }
-    if mime.is_empty() { "audio/webm" } else { mime }
+    if mime.is_empty() {
+        "audio/webm"
+    } else {
+        mime
+    }
 }
 
 fn extension_for(content_type: &str) -> &'static str {
@@ -459,10 +473,9 @@ mod tests {
     #[test]
     fn stream_query_asks_for_interims() {
         let q = deepgram_stream_query(48_000);
-        assert!(
-            q.iter()
-                .any(|(k, v)| *k == "interim_results" && v == "true")
-        );
+        assert!(q
+            .iter()
+            .any(|(k, v)| *k == "interim_results" && v == "true"));
         assert!(q.iter().any(|(k, v)| *k == "model" && v == "nova-3"));
         assert!(q.iter().any(|(k, v)| *k == "encoding" && v == "linear16"));
         assert!(q.iter().any(|(k, v)| *k == "sample_rate" && v == "48000"));
@@ -470,11 +483,15 @@ mod tests {
         assert!(q.iter().any(|(k, v)| *k == "smart_format" && v == "true"));
         assert!(q.iter().any(|(k, v)| *k == "endpointing" && v == "false"));
         assert!(!q.iter().any(|(k, _)| *k == "keywords"));
-        assert!(
-            deepgram_replace_pairs()
-                .iter()
-                .any(|(from, to)| { *from == "five five eight" && *to == "buy 5 ETH" })
-        );
+        assert!(deepgram_replace_pairs()
+            .iter()
+            .any(|(from, to)| { *from == "five five eight" && *to == "buy 5 ETH" }));
+        assert!(deepgram_replace_pairs()
+            .iter()
+            .any(|(from, to)| { *from == "dallas worth of" && *to == "dollars worth of" }));
+        assert!(deepgram_replace_pairs()
+            .iter()
+            .any(|(from, to)| { *from == "yards worth of" && *to == "dollars worth of" }));
     }
 
     #[test]
@@ -557,12 +574,10 @@ mod tests {
         .unwrap();
         assert_eq!(fin, ("buy fifty ether".to_string(), true, 0.91));
         assert!(stream_transcript(&json!({ "type": "Metadata" })).is_none());
-        assert!(
-            stream_transcript(&json!({
-                "type": "Results",
-                "channel": { "alternatives": [{ "transcript": "  " }] }
-            }))
-            .is_none()
-        );
+        assert!(stream_transcript(&json!({
+            "type": "Results",
+            "channel": { "alternatives": [{ "transcript": "  " }] }
+        }))
+        .is_none());
     }
 }

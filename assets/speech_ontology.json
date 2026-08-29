@@ -13,6 +13,8 @@
     { "surface_form": "resume", "normalized_target": "resume", "kind": "act", "confidence": 1.0 },
     { "surface_form": "watch", "normalized_target": "watch", "kind": "act", "confidence": 1.0 },
     { "surface_form": "open", "normalized_target": "open", "kind": "act", "confidence": 1.0 },
+    { "surface_form": "open a long", "normalized_target": "open a long", "kind": "act", "confidence": 1.0 },
+    { "surface_form": "open a short", "normalized_target": "open a short", "kind": "act", "confidence": 1.0 },
     { "surface_form": "unwind", "normalized_target": "unwind", "kind": "act", "confidence": 1.0 },
     { "surface_form": "leverage", "normalized_target": "leverage", "kind": "act", "confidence": 1.0 },
     { "surface_form": "leverage up", "normalized_target": "leverage up", "kind": "act", "confidence": 1.0 },
@@ -27,8 +29,13 @@
     { "surface_form": "list", "normalized_target": "list", "kind": "opener", "confidence": 1.0 },
 
     { "surface_form": "worth", "normalized_target": "worth", "kind": "size_frame", "confidence": 1.0 },
+    { "surface_form": "dollar", "normalized_target": "dollars", "kind": "size_frame", "confidence": 1.0 },
     { "surface_form": "dollars", "normalized_target": "dollars", "kind": "size_frame", "confidence": 1.0 },
+    { "surface_form": "dollars of", "normalized_target": "dollars of", "kind": "size_frame", "confidence": 1.0 },
+    { "surface_form": "dollars worth", "normalized_target": "dollars worth", "kind": "size_frame", "confidence": 1.0 },
+    { "surface_form": "dollars worth of", "normalized_target": "dollars worth of", "kind": "size_frame", "confidence": 1.0 },
     { "surface_form": "bucks", "normalized_target": "bucks", "kind": "size_frame", "confidence": 1.0 },
+    { "surface_form": "bucks worth of", "normalized_target": "bucks worth of", "kind": "size_frame", "confidence": 1.0 },
     { "surface_form": "notional", "normalized_target": "notional", "kind": "size_frame", "confidence": 1.0 },
 
     { "surface_form": "market", "normalized_target": "market", "kind": "order_type", "confidence": 1.0 },
@@ -85,6 +92,7 @@
     { "surface_form": "it", "normalized_target": "WETH", "kind": "confusable", "confidence": 1.0, "channels": ["speech"] },
     { "surface_form": "soul", "normalized_target": "SOL", "kind": "confusable", "confidence": 1.0, "channels": ["speech"] },
     { "surface_form": "sawl", "normalized_target": "SOL", "kind": "confusable", "confidence": 1.0, "channels": ["speech"] },
+    { "surface_form": "salt", "normalized_target": "SOL", "kind": "confusable", "confidence": 1.0, "channels": ["speech"] },
     { "surface_form": "bit coin", "normalized_target": "WBTC", "kind": "confusable", "confidence": 1.0, "channels": ["speech"] },
     { "surface_form": "wrap btc", "normalized_target": "WBTC", "kind": "confusable", "confidence": 1.0, "channels": ["speech"] }
   ],

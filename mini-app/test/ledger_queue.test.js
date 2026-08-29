@@ -10,6 +10,12 @@ const {
   touchFillUx,
   presentQueue,
   isQueueHot,
+  rowStampUnix,
+  fmtLocalTime,
+  fmtLocalDate,
+  fmtLocalTimeWithZone,
+  rowStampLabel,
+  isDoneToday,
 } = require("../static/ledger_queue.js");
 
 const EXECUTE_AT = 1_700_000_003;
@@ -146,4 +152,34 @@ test("reduced motion keeps the 3s sit and skips the 1s hold", () => {
   assert.equal(ux.revealed, true);
   const view = presentQueue(done, ux, EXECUTE_AT * 1000, { reduceMotion: true });
   assert.equal(view.zone, "done");
+});
+
+test("ledger stamps use the machine's local timezone", () => {
+  const local = new Date(2026, 7, 25, 14, 32, 0);
+  const at = Math.floor(local.getTime() / 1000);
+  const row = { created_at: at };
+  const sameYear = new Date(2026, 7, 28, 12, 0, 0).getTime();
+  const nextYear = new Date(2027, 0, 2, 12, 0, 0).getTime();
+  assert.equal(rowStampUnix(row), at);
+  assert.equal(fmtLocalTime(at), "14:32");
+  assert.equal(fmtLocalDate(at, sameYear), "Aug 25");
+  assert.equal(fmtLocalDate(at, nextYear), "Aug 25, 2026");
+  assert.equal(rowStampLabel(row, false), "14:32");
+  assert.equal(rowStampLabel(row, true, sameYear), "Aug 25");
+  assert.equal(rowStampLabel({ status_changed_at: at }, true, sameYear), "Aug 25");
+  assert.equal(rowStampLabel({}, false), "");
+  const zoned = fmtLocalTimeWithZone(at);
+  assert.match(zoned, /^14:32( [A-Z][A-Za-z0-9+_:-]+)?$/);
+});
+
+test("done today is since local midnight, not a rolling 24 hours", () => {
+  const now = new Date(2026, 7, 29, 10, 52, 0);
+  const nowMs = now.getTime();
+  const thisMorning = Math.floor(new Date(2026, 7, 29, 0, 5, 0).getTime() / 1000);
+  const lastNight = Math.floor(new Date(2026, 7, 28, 23, 50, 0).getTime() / 1000);
+  const hours23ago = Math.floor((nowMs - 23 * 3600 * 1000) / 1000);
+  assert.equal(isDoneToday({ status: "done", status_changed_at: thisMorning }, nowMs), true);
+  assert.equal(isDoneToday({ status: "done", status_changed_at: lastNight }, nowMs), false);
+  assert.equal(isDoneToday({ status: "done", status_changed_at: hours23ago }, nowMs), false);
+  assert.equal(isDoneToday({ status: "cant", status_changed_at: thisMorning }, nowMs), false);
 });
