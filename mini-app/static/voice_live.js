@@ -320,7 +320,7 @@ function liveCaptionIsCommand(text) {
   ) {
     return false;
   }
-  if (/^(buy|sell|long|short|close|unwind|lend|borrow|twap|dca|open|by)\b/.test(t)) {
+  if (/^(buy|sell|long|short|close|unwind|lend|borrow|twap|dca|open|by|i have|i've|i’ve|well|cell)\b/.test(t)) {
     return true;
   }
   return transcriptHasMoneyFrame(t) || transcriptHasInstrument(t);

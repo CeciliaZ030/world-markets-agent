@@ -214,6 +214,12 @@ pub(crate) fn deepgram_replace_pairs() -> &'static [(&'static str, &'static str)
         ("yards worth", "dollars worth"),
         ("yard's worth of", "dollars worth of"),
         ("yard worth of", "dollars worth of"),
+        ("well fifty dollars", "sell fifty dollars"),
+        ("cell fifty dollars", "sell fifty dollars"),
+        ("well 50", "sell 50"),
+        ("cell 50", "sell 50"),
+        ("well fifty", "sell fifty"),
+        ("cell fifty", "sell fifty"),
     ]
 }
 
@@ -492,6 +498,9 @@ mod tests {
         assert!(deepgram_replace_pairs()
             .iter()
             .any(|(from, to)| { *from == "yards worth of" && *to == "dollars worth of" }));
+        assert!(deepgram_replace_pairs()
+            .iter()
+            .any(|(from, to)| { *from == "well fifty" && *to == "sell fifty" }));
     }
 
     #[test]

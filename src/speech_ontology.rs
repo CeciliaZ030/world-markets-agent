@@ -1499,7 +1499,7 @@ fn has_named_instrument(tokens: &[String]) -> bool {
 }
 
 /// Nova-3 hears the unstressed "dollars" in "dollars worth of" as "yards",
-/// and "buy" as "by" / "wait". Repair those before restoring the size frame.
+/// "buy" as "by" / "wait" / "I have", and "sell" as "well" / "cell".
 fn repair_speech_dollar_frame(tokens: &mut Vec<String>, channel: Channel) -> Option<UtteranceSlot> {
     if channel != Channel::Speech || tokens.is_empty() {
         return None;
@@ -1507,6 +1507,7 @@ fn repair_speech_dollar_frame(tokens: &mut Vec<String>, channel: Channel) -> Opt
     let before = tokens.join(" ");
     rewrite_yards_worth(tokens);
     rewrite_buy_mishear(tokens);
+    rewrite_sell_mishear(tokens);
     rewrite_salt_in_money_frame(tokens);
     ensure_dollars_before_worth(tokens);
     if tokens.join(" ") == before {
@@ -1531,28 +1532,81 @@ fn rewrite_yards_worth(tokens: &mut [String]) {
     }
 }
 
-fn rewrite_buy_mishear(tokens: &mut [String]) {
-    let first = tokens.first().map(String::as_str).unwrap_or("");
+fn rewrite_buy_mishear(tokens: &mut Vec<String>) {
+    if tokens.is_empty() {
+        return;
+    }
+    let prefix = i_have_prefix_len(tokens);
+    if prefix > 0 {
+        if !looks_like_trade_act_mishear_rest(&tokens[prefix..]) {
+            return;
+        }
+        tokens.drain(..prefix);
+        tokens.insert(0, "buy".to_string());
+        return;
+    }
+    let first = tokens[0].as_str();
     if !matches!(first, "by" | "bye" | "wait") {
         return;
     }
+    if !looks_like_trade_act_mishear_rest(tokens) {
+        return;
+    }
+    tokens[0] = "buy".to_string();
+}
+
+fn rewrite_sell_mishear(tokens: &mut Vec<String>) {
+    if tokens.is_empty() {
+        return;
+    }
+    let prefix = well_prefix_len(tokens);
+    if prefix > 0 {
+        if !looks_like_trade_act_mishear_rest(&tokens[prefix..]) {
+            return;
+        }
+        tokens.drain(..prefix);
+        tokens.insert(0, "sell".to_string());
+        return;
+    }
+    let first = tokens[0].as_str();
+    if !matches!(first, "well" | "cell" | "sale" | "shell") {
+        return;
+    }
+    if !looks_like_trade_act_mishear_rest(tokens) {
+        return;
+    }
+    tokens[0] = "sell".to_string();
+}
+
+fn well_prefix_len(tokens: &[String]) -> usize {
+    match tokens.first().map(String::as_str) {
+        Some("we") if matches!(tokens.get(1).map(String::as_str), Some("ll") | Some("l")) => 2,
+        _ => 0,
+    }
+}
+
+fn i_have_prefix_len(tokens: &[String]) -> usize {
+    match tokens.first().map(String::as_str) {
+        Some("ive") => 1,
+        Some("i") if matches!(tokens.get(1).map(String::as_str), Some("have") | Some("ve")) => 2,
+        _ => 0,
+    }
+}
+
+fn looks_like_trade_act_mishear_rest(tokens: &[String]) -> bool {
     let ont = ontology();
     let has_qty = tokens
         .iter()
         .any(|token| is_number_token(token) || ont.size_words.contains(token));
     if !has_qty {
-        return;
+        return false;
     }
-    let trade_shape = has_money_frame(tokens)
+    has_money_frame(tokens)
         || has_named_instrument(tokens)
         || tokens.iter().any(|token| {
             matches!(token.as_str(), "salt" | "yards" | "yard")
                 || looks_like_instrument_token(token)
-        });
-    if !trade_shape {
-        return;
-    }
-    tokens[0] = "buy".to_string();
+        })
 }
 
 fn rewrite_salt_in_money_frame(tokens: &mut [String]) {
@@ -2502,6 +2556,25 @@ mod tests {
             text("By twenty dollars worth of SOL"),
             "buy twenty dollars worth of SOL"
         );
+        assert_eq!(text("I have 50 ETH"), "buy 50 dollars worth of WETH");
+        assert_eq!(
+            text("I have fifty dollars worth of ETH"),
+            "buy fifty dollars worth of WETH"
+        );
+        assert_eq!(text("I've 50 ETH"), "buy 50 dollars worth of WETH");
+        assert_eq!(text("I have ETH"), "i have WETH");
+        let typed_have = normalize_utterance("I have 50 ETH", Channel::Text, &[], &[]);
+        assert_eq!(typed_have.normalized_text, "i have 50 WETH");
+        assert_eq!(text("well 50 ETH"), "sell 50 dollars worth of WETH");
+        assert_eq!(
+            text("cell fifty dollars worth of ETH"),
+            "sell fifty dollars worth of WETH"
+        );
+        assert_eq!(text("Well 20 worth of SOL"), "sell 20 dollars worth of SOL");
+        assert_eq!(text("We'll 50 ETH"), "sell 50 dollars worth of WETH");
+        assert_eq!(text("sale 50 ETH"), "sell 50 dollars worth of WETH");
+        let typed_well = normalize_utterance("well 50 ETH", Channel::Text, &[], &[]);
+        assert_eq!(typed_well.normalized_text, "well 50 WETH");
         assert_eq!(
             text("open a sol long perp for 100"),
             "open a 100 dollars worth of SOL long perp"

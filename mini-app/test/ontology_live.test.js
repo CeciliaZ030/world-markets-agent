@@ -150,4 +150,15 @@ test("live transcript restores dollars worth of when STT drops the frame", () =>
   assert.equal(correctLiveTranscript("buy 20 worth of SOL"), "buy 20 dollars worth of SOL");
   assert.equal(correctLiveTranscript("$550 worth of ETH"), "buy fifty dollars worth of WETH");
   assert.equal(correctLiveTranscript("buy 550 worth of ETH"), "buy fifty dollars worth of WETH");
+  assert.equal(correctLiveTranscript("I have 50 ETH"), "buy 50 dollars worth of WETH");
+  assert.equal(
+    correctLiveTranscript("I have fifty dollars worth of ether"),
+    "buy fifty dollars worth of WETH",
+  );
+  assert.equal(correctLiveTranscript("I've 50 ETH"), "buy 50 dollars worth of WETH");
+  assert.equal(correctLiveTranscript("well 50 ETH"), "sell 50 dollars worth of WETH");
+  assert.equal(
+    correctLiveTranscript("cell fifty dollars worth of ether"),
+    "sell fifty dollars worth of WETH",
+  );
 });

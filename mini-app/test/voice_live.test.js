@@ -187,6 +187,9 @@ test("preferHeardTranscript keeps a longer finalized live sentence", () => {
 test("live buy captions count as commands even when clip STT is garbage", () => {
   assert.equal(liveCaptionIsCommand("buy 550 worth of ETH."), true);
   assert.equal(liveCaptionIsCommand("By twenty dollars"), true);
+  assert.equal(liveCaptionIsCommand("I have 50 ETH"), true);
+  assert.equal(liveCaptionIsCommand("well 50 ETH"), true);
+  assert.equal(liveCaptionIsCommand("cell fifty dollars"), true);
   assert.equal(liveCaptionIsCommand("A $20 worth"), true);
   assert.equal(liveCaptionIsCommand("how much is ETH"), false);
   assert.equal(liveCaptionIsCommand(""), false);

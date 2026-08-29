@@ -324,19 +324,57 @@ function rewriteYardsWorth(tokens) {
 }
 
 function rewriteBuyMishear(tokens) {
+  const prefix = iHavePrefixLen(tokens);
+  if (prefix > 0) {
+    if (!looksLikeTradeActMishearRest(tokens.slice(prefix))) return;
+    tokens.splice(0, prefix, "buy");
+    return;
+  }
   const first = normalizeKey(stripQty(tokens[0]));
   if (!/^(by|bye|wait)$/.test(first)) return;
+  if (!looksLikeTradeActMishearRest(tokens)) return;
+  tokens[0] = "buy";
+}
+
+function rewriteSellMishear(tokens) {
+  const prefix = wellPrefixLen(tokens);
+  if (prefix > 0) {
+    if (!looksLikeTradeActMishearRest(tokens.slice(prefix))) return;
+    tokens.splice(0, prefix, "sell");
+    return;
+  }
+  const first = normalizeKey(stripQty(tokens[0])).replace(/['’]/g, "");
+  if (!/^(well|cell|sale|shell)$/.test(first)) return;
+  if (!looksLikeTradeActMishearRest(tokens)) return;
+  tokens[0] = "sell";
+}
+
+function wellPrefixLen(tokens) {
+  if (!tokens.length) return 0;
+  const first = normalizeKey(stripQty(tokens[0])).replace(/['’]/g, "");
+  if (first === "we" && tokens[1] && /^(ll|l)$/.test(normalizeKey(stripQty(tokens[1])))) return 2;
+  return 0;
+}
+
+function iHavePrefixLen(tokens) {
+  if (!tokens.length) return 0;
+  const first = normalizeKey(stripQty(tokens[0])).replace(/['’]/g, "");
+  if (first === "ive") return 1;
+  if (first === "i" && tokens[1] && /^(have)$/.test(normalizeKey(stripQty(tokens[1])))) return 2;
+  return 0;
+}
+
+function looksLikeTradeActMishearRest(tokens) {
   const hasQty = tokens.some((token) => isQtyToken(token) || USD_QTY_WORDS.has(normalizeKey(stripQty(token))));
-  if (!hasQty) return;
-  const tradeShape =
+  if (!hasQty) return false;
+  return (
     hasMoneyFrame(tokens) ||
     hasNamedInstrument(tokens) ||
     tokens.some((token) => {
       const key = normalizeKey(stripQty(token));
       return key === "salt" || key === "yards" || key === "yard" || isInstrumentishToken(token);
-    });
-  if (!tradeShape) return;
-  tokens[0] = "buy";
+    })
+  );
 }
 
 function rewriteSaltInMoneyFrame(tokens) {
@@ -377,6 +415,7 @@ function repairSpeechDollarFrame(raw) {
   if (!tokens.length) return original;
   rewriteYardsWorth(tokens);
   rewriteBuyMishear(tokens);
+  rewriteSellMishear(tokens);
   rewriteSaltInMoneyFrame(tokens);
   ensureDollarsBeforeWorth(tokens);
   return tokens.join(" ");

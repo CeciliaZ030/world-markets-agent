@@ -3626,7 +3626,7 @@ function liveLooksLikeCommand(text) {
     return false;
   }
   return (
-    /^(buy|sell|long|short|close|unwind|lend|borrow|twap|dca|open|by)\b/.test(t) ||
+    /^(buy|sell|long|short|close|unwind|lend|borrow|twap|dca|open|by|well|cell)\b/.test(t) ||
     /\b(dollar|dollars|bucks|worth|notional)\b/.test(t)
   );
 }
