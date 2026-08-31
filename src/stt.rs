@@ -220,6 +220,9 @@ pub(crate) fn deepgram_replace_pairs() -> &'static [(&'static str, &'static str)
         ("cell 50", "sell 50"),
         ("well fifty", "sell fifty"),
         ("cell fifty", "sell fifty"),
+        ("so fifty dollars", "sell fifty dollars"),
+        ("so 50", "sell 50"),
+        ("so fifty", "sell fifty"),
     ]
 }
 
@@ -397,11 +400,7 @@ fn content_type_for<'a>(audio: &[u8], mime: &'a str) -> &'a str {
     if let Some(sniffed) = sniff_audio_type(audio) {
         return sniffed;
     }
-    if mime.is_empty() {
-        "audio/webm"
-    } else {
-        mime
-    }
+    if mime.is_empty() { "audio/webm" } else { mime }
 }
 
 fn extension_for(content_type: &str) -> &'static str {
@@ -479,9 +478,10 @@ mod tests {
     #[test]
     fn stream_query_asks_for_interims() {
         let q = deepgram_stream_query(48_000);
-        assert!(q
-            .iter()
-            .any(|(k, v)| *k == "interim_results" && v == "true"));
+        assert!(
+            q.iter()
+                .any(|(k, v)| *k == "interim_results" && v == "true")
+        );
         assert!(q.iter().any(|(k, v)| *k == "model" && v == "nova-3"));
         assert!(q.iter().any(|(k, v)| *k == "encoding" && v == "linear16"));
         assert!(q.iter().any(|(k, v)| *k == "sample_rate" && v == "48000"));
@@ -489,18 +489,31 @@ mod tests {
         assert!(q.iter().any(|(k, v)| *k == "smart_format" && v == "true"));
         assert!(q.iter().any(|(k, v)| *k == "endpointing" && v == "false"));
         assert!(!q.iter().any(|(k, _)| *k == "keywords"));
-        assert!(deepgram_replace_pairs()
-            .iter()
-            .any(|(from, to)| { *from == "five five eight" && *to == "buy 5 ETH" }));
-        assert!(deepgram_replace_pairs()
-            .iter()
-            .any(|(from, to)| { *from == "dallas worth of" && *to == "dollars worth of" }));
-        assert!(deepgram_replace_pairs()
-            .iter()
-            .any(|(from, to)| { *from == "yards worth of" && *to == "dollars worth of" }));
-        assert!(deepgram_replace_pairs()
-            .iter()
-            .any(|(from, to)| { *from == "well fifty" && *to == "sell fifty" }));
+        assert!(
+            deepgram_replace_pairs()
+                .iter()
+                .any(|(from, to)| { *from == "five five eight" && *to == "buy 5 ETH" })
+        );
+        assert!(
+            deepgram_replace_pairs()
+                .iter()
+                .any(|(from, to)| { *from == "dallas worth of" && *to == "dollars worth of" })
+        );
+        assert!(
+            deepgram_replace_pairs()
+                .iter()
+                .any(|(from, to)| { *from == "yards worth of" && *to == "dollars worth of" })
+        );
+        assert!(
+            deepgram_replace_pairs()
+                .iter()
+                .any(|(from, to)| { *from == "well fifty" && *to == "sell fifty" })
+        );
+        assert!(
+            deepgram_replace_pairs()
+                .iter()
+                .any(|(from, to)| { *from == "so fifty" && *to == "sell fifty" })
+        );
     }
 
     #[test]
@@ -583,10 +596,12 @@ mod tests {
         .unwrap();
         assert_eq!(fin, ("buy fifty ether".to_string(), true, 0.91));
         assert!(stream_transcript(&json!({ "type": "Metadata" })).is_none());
-        assert!(stream_transcript(&json!({
-            "type": "Results",
-            "channel": { "alternatives": [{ "transcript": "  " }] }
-        }))
-        .is_none());
+        assert!(
+            stream_transcript(&json!({
+                "type": "Results",
+                "channel": { "alternatives": [{ "transcript": "  " }] }
+            }))
+            .is_none()
+        );
     }
 }

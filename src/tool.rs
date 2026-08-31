@@ -96,6 +96,9 @@ pub(crate) struct RenderLookupArgs {
     #[serde(default)]
     #[schemars(skip)]
     pub(crate) slots: Option<Value>,
+    /// Mini App answer-sheet correlation id. Projects skip_llm replies onto the sheet.
+    #[serde(default)]
+    pub(crate) correlation_id: Option<String>,
 }
 
 pub(crate) struct WarmAccount;
@@ -445,6 +448,58 @@ impl WorldMarketsApp {
     fn kick_prefetch(&self, ctx: &DynToolCallCtx, explicit_id: Option<u64>) {
         self.note_activity(ctx, explicit_id);
         self.warmer.kick_prefetch(self.client.clone());
+    }
+
+    /// Project a skip_llm / composed reply onto the Mini App answer sheet.
+    /// No-ops when no pending question exists. Never a ledger write.
+    fn project_pending_answer(
+        &self,
+        ctx: &DynToolCallCtx,
+        account_id: Option<u64>,
+        correlation_id: Option<&str>,
+        utterance_ref: Option<&str>,
+        value: &Value,
+    ) {
+        let Some(account_id) = Self::account_id(ctx, account_id) else {
+            return;
+        };
+        let message = value
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let Some(message) = message else {
+            return;
+        };
+        let mut cid = correlation_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                utterance_ref
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            });
+        if cid.is_none() {
+            if let Ok(latest) = self.brain.get_answer(account_id, "latest") {
+                cid = latest
+                    .get("correlation_id")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+            }
+        }
+        let Some(cid) = cid else {
+            return;
+        };
+        let _ = self.brain.upsert_answer(&json!({
+            "account_id": account_id,
+            "correlation_id": cid,
+            "answer": message,
+            "status": "answered",
+            "controls": value.get("controls"),
+        }));
     }
 
     fn refresh_after_trade(
@@ -1018,7 +1073,7 @@ impl DynAomiTool for RenderLookup {
     type App = WorldMarketsApp;
     type Args = RenderLookupArgs;
     const NAME: &'static str = "render_lookup";
-    const DESCRIPTION: &'static str = "Whole-message terse lookup (b/p/r/a/d, word forms, ?/commands), cancel task {id}, the non-money share/introduce intent, or an unfulfillable/near-match/unclear heard reply. Host: call on every user message with text=user message; pass utterance_ref and slots from Mini App send_payload when present so the heard path does not re-ingest. If skip_llm, send message (and controls when present) and do not call the LLM. Unmatched messages still prefetch the account. Model: paste message verbatim. Share never executes. Cancel drops a watch — never a trade. Unfulfillable never executes.";
+    const DESCRIPTION: &'static str = "Whole-message terse lookup (b/p/r/a/d, word forms, ?/commands), cancel task {id}, the non-money share/introduce intent, or an unfulfillable/near-match/unclear heard reply. Host: call on every user message with text=user message; pass utterance_ref, correlation_id, and slots from Mini App send_payload when present so the heard path does not re-ingest. If skip_llm, send message (and controls when present) and do not call the LLM. Unmatched messages still prefetch the account. Model: paste message verbatim. Share never executes. Cancel drops a watch — never a trade. Unfulfillable never executes.";
 
     fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
         if let Some(id) = args
@@ -1066,11 +1121,19 @@ impl DynAomiTool for RenderLookup {
                 .filter(|value| !value.is_empty())
             {
                 if let Some(wall) = crate::cant::cant_wall_for(text) {
-                    return Ok(crate::tasks::attach_open_instructions(
+                    let value = crate::tasks::attach_open_instructions(
                         &app.brain,
                         WorldMarketsApp::account_id(&ctx, args.account_id),
                         wall,
-                    ));
+                    );
+                    app.project_pending_answer(
+                        &ctx,
+                        args.account_id,
+                        args.correlation_id.as_deref(),
+                        args.utterance_ref.as_deref(),
+                        &value,
+                    );
+                    return Ok(value);
                 }
                 if let Some(account_id) = WorldMarketsApp::account_id(&ctx, args.account_id) {
                     let extra = match (&args.utterance_ref, &args.slots) {
@@ -1082,11 +1145,19 @@ impl DynAomiTool for RenderLookup {
                         })),
                     };
                     if let Some(value) = crate::cant::try_heard(account_id, text, extra.as_ref()) {
-                        return Ok(crate::tasks::attach_open_instructions(
+                        let value = crate::tasks::attach_open_instructions(
                             &app.brain,
                             Some(account_id),
                             crate::cant::apply_unclear_copy(value),
-                        ));
+                        );
+                        app.project_pending_answer(
+                            &ctx,
+                            args.account_id,
+                            args.correlation_id.as_deref(),
+                            args.utterance_ref.as_deref(),
+                            &value,
+                        );
+                        return Ok(value);
                     }
                 }
             }
@@ -1116,6 +1187,13 @@ impl DynAomiTool for RenderLookup {
             "message": message,
         });
         attach_rpc_trace(&app.client, before, &mut payload);
+        app.project_pending_answer(
+            &ctx,
+            args.account_id,
+            args.correlation_id.as_deref(),
+            args.utterance_ref.as_deref(),
+            &payload,
+        );
         Ok(payload)
     }
 }
@@ -3285,6 +3363,58 @@ impl DynAomiTool for RecordWorldCorrection {
     }
 }
 
+pub(crate) struct ProjectWorldAnswer;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct ProjectWorldAnswerArgs {
+    /// Correlation id from Mini App send_payload / `[world_q id]`.
+    pub(crate) correlation_id: String,
+    /// Exact user-facing answer text. Must match the thread message byte-for-byte.
+    pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub(crate) controls: Option<Value>,
+    /// `answered` (default), `handoff_command`, or `handoff_escalation`.
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+    #[serde(default)]
+    pub(crate) voice_note_url: Option<String>,
+}
+
+impl DynAomiTool for ProjectWorldAnswer {
+    type App = WorldMarketsApp;
+    type Args = ProjectWorldAnswerArgs;
+    const NAME: &'static str = "project_world_answer";
+    const DESCRIPTION: &'static str = "Project a Mini App question's thread answer onto the in-app answer sheet. Pass the exact user-facing message (same bytes as the thread). Never executes. Not a second conversation store.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let account_id = WorldMarketsApp::account_id(&ctx, args.account_id).ok_or_else(|| {
+            "[world-markets] account_id is required to project an answer".to_string()
+        })?;
+        let status = args
+            .status
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("answered");
+        let result = app.brain.upsert_answer(&json!({
+            "account_id": account_id,
+            "correlation_id": args.correlation_id,
+            "answer": args.message,
+            "status": status,
+            "controls": args.controls,
+            "voice_note_url": args.voice_note_url,
+        }))?;
+        Ok(json!({
+            "source": "world-markets-brain",
+            "executable": false,
+            "projected": true,
+            "result": result,
+        }))
+    }
+}
+
 pub(crate) struct SetWorldConsent;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -3833,6 +3963,7 @@ mod tests {
                 wallet_address: None,
                 utterance_ref: None,
                 slots: None,
+                correlation_id: None,
             },
             empty_ctx("render_lookup"),
         )
@@ -3895,6 +4026,7 @@ mod tests {
                 wallet_address: None,
                 utterance_ref: None,
                 slots: None,
+                correlation_id: None,
             },
             empty_ctx("render_lookup"),
         )
@@ -3915,6 +4047,7 @@ mod tests {
                 wallet_address: None,
                 utterance_ref: None,
                 slots: None,
+                correlation_id: None,
             },
             empty_ctx("render_lookup"),
         )
@@ -3934,6 +4067,7 @@ mod tests {
                 wallet_address: None,
                 utterance_ref: None,
                 slots: None,
+                correlation_id: None,
             },
             empty_ctx("render_lookup"),
         )
@@ -3953,6 +4087,7 @@ mod tests {
                 wallet_address: None,
                 utterance_ref: None,
                 slots: None,
+                correlation_id: None,
             },
             empty_ctx("render_lookup"),
         )
@@ -3972,6 +4107,7 @@ mod tests {
                 wallet_address: None,
                 utterance_ref: None,
                 slots: None,
+                correlation_id: None,
             },
             empty_ctx("render_lookup"),
         )
@@ -3996,6 +4132,7 @@ mod tests {
                     wallet_address: None,
                     utterance_ref: None,
                     slots: None,
+                    correlation_id: None,
                 },
                 empty_ctx("render_lookup"),
             )
@@ -4022,6 +4159,7 @@ mod tests {
             wallet_address: None,
             utterance_ref: None,
             slots: None,
+            correlation_id: None,
         }
     }
 

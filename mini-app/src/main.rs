@@ -11,6 +11,7 @@
 //! `POST /api/v1/mini-app/compose` (Telegram sendData ingress), never `/ledger*`.
 //! Voice notes go through `POST /api/v1/mini-app/voice` (not sendData, not
 //! `/ledger*`), then the client sendData's the transcript so the host agent runs.
+//! Question answers are a GET projection: `GET /api/v1/mini-app/answer/{id}`.
 //! Introduction prepare is `POST /api/v1/mini-app/share` (not `/ledger*`; it
 //! mutates nothing the Mini App displays).
 //! Compose `kind: flush_execute` is a server-side backup after the 3s trade delay.
@@ -111,6 +112,7 @@ async fn main() {
         )
         .route("/api/v1/mini-app/ledger/{id}", get(ledger_one_handler))
         .route("/api/v1/mini-app/ledger", get(ledger_handler))
+        .route("/api/v1/mini-app/answer/{id}", get(answer_handler))
         .route("/api/v1/mini-app/compose", post(compose_handler))
         .route("/api/v1/mini-app/voice/live", post(voice_live_handler))
         .route("/api/v1/mini-app/voice/stream", get(voice_stream_handler))
@@ -423,6 +425,30 @@ async fn ledger_one_handler(
     }
 }
 
+async fn answer_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !session_ok(&state, &headers) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let Some(account_id) = state.account_id else {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed");
+    };
+    match spawn_blocking(move || world_markets::mini_app::load_answer(account_id, &id)).await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, "answer fetch failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "answer join failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "fetch_failed")
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ComposeRequest {
     #[serde(default)]
@@ -437,6 +463,10 @@ struct ComposeRequest {
     fire_kind: Option<String>,
     #[serde(default)]
     instrument: Option<String>,
+    #[serde(default)]
+    parent_correlation_id: Option<String>,
+    #[serde(default)]
+    context_ref: Option<Value>,
 }
 
 async fn compose_handler(
@@ -461,6 +491,8 @@ async fn compose_handler(
         "instruction_id": body.instruction_id,
         "fire_kind": body.fire_kind,
         "instrument": body.instrument,
+        "parent_correlation_id": body.parent_correlation_id,
+        "context_ref": body.context_ref,
     });
     match spawn_blocking(move || -> Result<Value, String> {
         if kind == "flush_execute" {
@@ -552,7 +584,39 @@ async fn compose_handler(
             }
         }
         let value = world_markets::mini_app::submit_compose(&payload)?;
-        if chat_id.is_none()
+        if kind == "question" {
+            let cid = payload
+                .get("correlation_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let q = payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let referent = payload
+                .pointer("/context_ref/label")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if !cid.is_empty() && !q.is_empty() {
+                let _ = world_markets::mini_app::open_question_answer(
+                    account_id,
+                    &json!({
+                        "correlation_id": cid,
+                        "question": q,
+                        "heard_echo": q,
+                        "referent": referent,
+                        "status": "working",
+                        "parent_correlation_id": payload.get("parent_correlation_id"),
+                        "context_ref": payload.get("context_ref"),
+                    }),
+                );
+            }
+            if chat_id.is_none() {
+                let _ = dispatch_question_turn(&q, &cid, account_id, referent);
+            }
+        } else if chat_id.is_none()
             && value.get("recorded") == Some(&json!(true))
             && !matches!(
                 kind.as_str(),
@@ -620,6 +684,12 @@ struct VoiceRequest {
     duration_secs: Option<f64>,
     #[serde(default)]
     finalized: Option<bool>,
+    #[serde(default)]
+    correlation_id: Option<String>,
+    #[serde(default)]
+    parent_correlation_id: Option<String>,
+    #[serde(default)]
+    context_ref: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -732,6 +802,9 @@ async fn voice_handler(
         "live_text": body.live_text,
         "duration_secs": body.duration_secs,
         "finalized": body.finalized,
+        "correlation_id": body.correlation_id,
+        "parent_correlation_id": body.parent_correlation_id,
+        "context_ref": body.context_ref,
         "source": "mini_app",
     });
     match spawn_blocking(move || -> Result<Value, String> {
@@ -742,16 +815,36 @@ async fn voice_handler(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let utterance_kind = value
+            .get("utterance_kind")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let is_question = value
             .get("question")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if !heard.is_empty() && is_question {
-            // No act → question: skip submit_heard, the heard: echo, local
-            // dispatch, and compose-as-voice. The client sendData / preview
+        let is_mixed = utterance_kind == "mixed";
+        let is_question_only = utterance_kind == "question" || (is_question && !is_mixed);
+        if !heard.is_empty() && (is_question_only || is_mixed) {
+            open_voice_question(account_id, &mut value);
+        }
+        if !heard.is_empty() && is_question_only {
+            // Question: skip submit_heard, the heard: echo, and compose-as-voice.
+            // Pending projection is already open; client sendData / preview
             // compose carries kind:"question"; walls never fire on a question.
             Ok(value)
         } else if !heard.is_empty() {
+            let command_heard = if is_mixed {
+                value
+                    .get("command_text")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&heard)
+                    .to_string()
+            } else {
+                heard.clone()
+            };
             let utterance_id = value
                 .get("utterance_id")
                 .and_then(Value::as_str)
@@ -767,7 +860,8 @@ async fn voice_handler(
                 "slots": value.get("slots"),
                 "channel": value.get("channel").cloned().unwrap_or(json!("speech")),
             });
-            let handled = world_markets::mini_app::submit_heard(account_id, &heard, Some(&extra));
+            let handled =
+                world_markets::mini_app::submit_heard(account_id, &command_heard, Some(&extra));
             if let Some(handled) = handled {
                 if let Some(obj) = value.as_object_mut() {
                     obj.insert(
@@ -802,7 +896,7 @@ async fn voice_handler(
                             .get("rewritten_text")
                             .or_else(|| handled.get("remaining_text"))
                             .and_then(Value::as_str)
-                            .unwrap_or(&heard);
+                            .unwrap_or(&command_heard);
                         if dispatch_local_agent_turn(text) {
                             if let Some(obj) = value.as_object_mut() {
                                 obj.insert("dispatched".into(), json!(true));
@@ -813,7 +907,7 @@ async fn voice_handler(
                 } else {
                     // Telegram: host render_lookup writes; skip extra heard-echo when we will wall
                     if kind != "cant" && kind != "near_match" && kind != "unclear" {
-                        let line = format!("heard: {heard}");
+                        let line = format!("heard: {command_heard}");
                         if let Some(chat_id) = chat_id {
                             if let Err(err) = world_markets::mini_app::post_chat_lines(
                                 &bot_token,
@@ -827,14 +921,17 @@ async fn voice_handler(
                     Ok(value)
                 }
             } else if let Some(chat_id) = chat_id {
-                let line = format!("heard: {heard}");
+                let line = format!("heard: {command_heard}");
                 if let Err(err) =
                     world_markets::mini_app::post_chat_lines(&bot_token, chat_id, &[line])
                 {
                     tracing::warn!(error = %err, "voice heard-echo failed");
                 }
                 Ok(value)
-            } else if dispatch_local_agent_turn(&prompt_with_ir(&heard, value.get("action_ir"))) {
+            } else if dispatch_local_agent_turn(&prompt_with_ir(
+                &command_heard,
+                value.get("action_ir"),
+            )) {
                 if let Some(obj) = value.as_object_mut() {
                     obj.insert("dispatched".to_string(), json!(true));
                 }
@@ -848,7 +945,7 @@ async fn voice_handler(
                 match world_markets::mini_app::submit_compose(&json!({
                     "account_id": account_id,
                     "kind": "voice",
-                    "message": heard,
+                    "message": command_heard,
                     "correlation_id": correlation_id,
                     "instruction_id": correlation_id,
                 })) {
@@ -927,6 +1024,59 @@ async fn voice_stream_handler(
     ws.on_upgrade(move |socket| voice_stream::proxy(socket, key, sample_rate, keyterms))
 }
 
+fn open_voice_question(account_id: u64, value: &mut Value) {
+    let correlation_id = value
+        .get("correlation_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if correlation_id.is_empty() {
+        return;
+    }
+    let question = value
+        .get("question_text")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("heard_echo").and_then(Value::as_str))
+        .or_else(|| value.get("transcript").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+    let needs_clarify = value
+        .get("needs_clarify")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let referent = value
+        .get("referent")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let chips = if needs_clarify {
+        world_markets::mini_app::clarify_position_chips(account_id)
+    } else {
+        Vec::new()
+    };
+    let status = if needs_clarify { "clarify" } else { "working" };
+    let opened = world_markets::mini_app::open_question_answer(
+        account_id,
+        &json!({
+            "correlation_id": correlation_id,
+            "question": question,
+            "heard_echo": question,
+            "referent": referent,
+            "status": status,
+            "controls": chips,
+            "parent_correlation_id": value.get("parent_correlation_id"),
+            "context_ref": value.get("context_ref"),
+        }),
+    );
+    if let Ok(opened) = opened {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("answer".into(), opened);
+            if needs_clarify {
+                obj.insert("clarify_chips".into(), json!(chips));
+            }
+        }
+    }
+}
+
 fn prompt_with_ir(text: &str, ir: Option<&Value>) -> String {
     let text = text.trim();
     match ir.filter(|value| value.is_object()) {
@@ -987,6 +1137,115 @@ fn dispatch_local_agent_turn(transcript: &str) -> bool {
     });
     tracing::info!(provider, "dispatched local agent turn");
     true
+}
+
+fn dispatch_question_turn(
+    transcript: &str,
+    correlation_id: &str,
+    account_id: u64,
+    referent: Option<String>,
+) -> bool {
+    let transcript = transcript.trim();
+    if transcript.is_empty() {
+        return false;
+    }
+    let Some(plugin) = plugin_lib() else {
+        tracing::warn!("local question skipped: build the plugin (`cargo build`)");
+        return false;
+    };
+    let Some(provider) = local_llm_provider() else {
+        tracing::warn!("local question skipped: set OPENROUTER_API_KEY (or OPENAI/ANTHROPIC)");
+        return false;
+    };
+    let Some(bin) = aomi_run_bin() else {
+        tracing::warn!("local question skipped: aomi-run is not on PATH");
+        return false;
+    };
+    let mut prompt = transcript.to_string();
+    if let Some(ref_label) = referent.filter(|s| !s.is_empty()) {
+        prompt.push_str("\n[world_ref] ");
+        prompt.push_str(&ref_label);
+    }
+    if !correlation_id.is_empty() {
+        prompt.push_str("\n[world_q] ");
+        prompt.push_str(correlation_id);
+    }
+    let env_file = PathBuf::from(".env");
+    let log_path = std::env::temp_dir().join("world-markets-agent.log");
+    let cid = correlation_id.to_string();
+    std::thread::spawn(move || {
+        let mut cmd = Command::new(&bin);
+        cmd.arg(&plugin)
+            .arg("--env-file")
+            .arg(&env_file)
+            .arg("--provider")
+            .arg(provider)
+            .arg("--prompt")
+            .arg(&prompt)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match cmd.output() {
+            Ok(out) => {
+                if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+                    let _ = std::io::Write::write_all(&mut { file }, &out.stdout);
+                    let _ = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&log_path)
+                        .and_then(|mut f| std::io::Write::write_all(&mut f, &out.stderr));
+                }
+                let text = String::from_utf8_lossy(&out.stdout);
+                if let Some(answer) = extract_agent_reply(&text) {
+                    let _ = world_markets::mini_app::upsert_answer(
+                        account_id,
+                        &json!({
+                            "correlation_id": cid,
+                            "answer": answer,
+                            "status": "answered",
+                        }),
+                    );
+                }
+                if out.status.success() {
+                    tracing::info!(prompt = %prompt, "local question turn finished");
+                } else {
+                    tracing::warn!(code = ?out.status.code(), "local question turn exited");
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "local question turn failed to start"),
+        }
+    });
+    tracing::info!(provider, "dispatched local question turn");
+    true
+}
+
+fn extract_agent_reply(stdout: &str) -> Option<String> {
+    let kept: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            if line.is_empty() {
+                return false;
+            }
+            if line.starts_with('[') && line.contains("world-markets") {
+                return false;
+            }
+            if line.starts_with("TRACE")
+                || line.starts_with("DEBUG")
+                || line.starts_with("INFO")
+                || line.starts_with("WARN")
+                || line.starts_with("ERROR")
+            {
+                return false;
+            }
+            if line.starts_with("[world_q]") || line.starts_with("[world_ref]") {
+                return false;
+            }
+            true
+        })
+        .collect();
+    let text = kept.join("\n").trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
 }
 
 fn local_llm_provider() -> Option<&'static str> {
@@ -1191,12 +1450,18 @@ mod tests {
         assert!(src.contains("get(ledger_summary_handler)"));
         assert!(src.contains("get(ledger_one_handler)"));
         assert!(src.contains("get(ledger_handler)"));
+        assert!(src.contains("get(answer_handler)"));
+        assert!(src.contains(r#"/api/v1/mini-app/answer/{id}"#));
         for line in src.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("//") || trimmed.starts_with("//!") {
                 continue;
             }
-            if !trimmed.contains("/api/v1/mini-app/ledger") && !trimmed.contains("ledger_") {
+            if !trimmed.contains("/api/v1/mini-app/ledger")
+                && !trimmed.contains("ledger_")
+                && !trimmed.contains("/api/v1/mini-app/answer")
+                && !trimmed.contains("answer_handler")
+            {
                 continue;
             }
             assert!(
@@ -1204,7 +1469,7 @@ mod tests {
                     && !trimmed.contains("put(")
                     && !trimmed.contains("patch(")
                     && !trimmed.contains("delete("),
-                "ledger route must not mutate: {trimmed}"
+                "ledger/answer route must not mutate: {trimmed}"
             );
         }
     }
@@ -1310,21 +1575,25 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("async fn voice_stream_handler").next())
             .expect("voice_handler body");
-        let question = voice.find("is_question").expect("question flag");
+        let question = voice.find("is_question_only").expect("question-only flag");
         let heard = voice
             .find("submit_heard")
             .expect("submit_heard for commands");
         assert!(question < heard, "question branch must skip submit_heard");
         assert!(
-            voice.contains("if !heard.is_empty() && is_question"),
+            voice.contains("if !heard.is_empty() && is_question_only"),
             "questions return before the command path"
         );
         assert!(
-            voice.contains("heard: {heard}"),
+            voice.contains("open_voice_question"),
+            "questions open the GET projection before returning"
+        );
+        assert!(
+            voice.contains("heard: {command_heard}"),
             "command path still posts the heard: echo"
         );
         let echo = voice
-            .find(r#"format!("heard: {heard}")"#)
+            .find(r#"format!("heard: {command_heard}")"#)
             .expect("heard echo");
         assert!(
             echo > heard,

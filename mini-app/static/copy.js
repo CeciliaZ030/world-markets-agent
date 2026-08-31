@@ -214,6 +214,14 @@ const COPY = {
     askNote: "aomi answers in the thread. Questions never become ledger records.",
     openThread: "Open the thread ↗",
   },
+  answer: {
+    heard_with_ref: 'heard: "{text}" — the {ref}',
+    working: "checking the engine — a moment",
+    footer_thread: "answered in the thread too — full conversation there ↗",
+    handoff_command: "on it — receipt will land here and in the thread",
+    handoff_escalation: "this one needs the thread — your confirm is waiting",
+    clarify: "which one is this — pick a position",
+  },
   gate: {
     label: "POLICY GATE",
     headline: "Blocked",

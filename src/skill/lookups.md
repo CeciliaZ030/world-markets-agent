@@ -53,6 +53,8 @@ Whole-message two tokens `{ticker} {d|w|m}` (or day/week/month) is a candlestick
 
 Whole-message `cancel task {id}` → `render_lookup`, paste `message`; skip the LLM; not a trade.
 
+Mini App questions: after the user-facing answer, call `project_world_answer` with that exact `message` and the turn's `correlation_id` (Mini App send_payload or `[world_q id]`). Never put the token in the pasted reply. Projection is not a second conversation.
+
 Voice or text alone submits a trade — never wait for a Telegram button. Mini App buttons never submit. Open Mini App / speech instructions live in `get_world_tasks.ledger.open_instructions`; call it before acting on confirm / buy / sell / watch.
 
 ## Core formats (`[#]` from tools, every figure in `` ` ``)

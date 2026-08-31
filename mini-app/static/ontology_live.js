@@ -50,6 +50,7 @@ const USD_QTY_WORDS = new Set([
   "hundred",
   "thousand",
 ]);
+const SMALL_QTY_WORDS = new Set(["one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]);
 const TICKERS = new Set([
   "eth",
   "weth",
@@ -331,7 +332,7 @@ function rewriteBuyMishear(tokens) {
     return;
   }
   const first = normalizeKey(stripQty(tokens[0]));
-  if (!/^(by|bye|wait)$/.test(first)) return;
+  if (!/^(about|by|bye|wait)$/.test(first)) return;
   if (!looksLikeTradeActMishearRest(tokens)) return;
   tokens[0] = "buy";
 }
@@ -344,7 +345,7 @@ function rewriteSellMishear(tokens) {
     return;
   }
   const first = normalizeKey(stripQty(tokens[0])).replace(/['’]/g, "");
-  if (!/^(well|cell|sale|shell)$/.test(first)) return;
+  if (!/^(well|cell|sale|shell|so)$/.test(first)) return;
   if (!looksLikeTradeActMishearRest(tokens)) return;
   tokens[0] = "sell";
 }
@@ -365,7 +366,10 @@ function iHavePrefixLen(tokens) {
 }
 
 function looksLikeTradeActMishearRest(tokens) {
-  const hasQty = tokens.some((token) => isQtyToken(token) || USD_QTY_WORDS.has(normalizeKey(stripQty(token))));
+  const hasQty = tokens.some((token) => {
+    const key = normalizeKey(stripQty(token));
+    return isQtyToken(token) || USD_QTY_WORDS.has(key) || SMALL_QTY_WORDS.has(key);
+  });
   if (!hasQty) return false;
   return (
     hasMoneyFrame(tokens) ||

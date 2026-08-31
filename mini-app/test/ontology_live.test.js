@@ -147,6 +147,16 @@ test("live transcript restores dollars worth of when STT drops the frame", () =>
   assert.equal(correctLiveTranscript("a 20 yards worth of SOL"), "buy 20 dollars worth of SOL");
   assert.equal(correctLiveTranscript("by 20 worth of salt"), "buy 20 dollars worth of SOL");
   assert.equal(correctLiveTranscript("wait 20 worth of SOL"), "buy 20 dollars worth of SOL");
+  assert.equal(correctLiveTranscript("about 5 dollars worth"), "buy 5 dollars worth");
+  assert.equal(
+    correctLiveTranscript("about five dollars worth of ether"),
+    "buy five dollars worth of WETH",
+  );
+  assert.equal(correctLiveTranscript("about 50 ETH"), "buy 50 dollars worth of WETH");
+  assert.equal(
+    correctLiveTranscript("what about 5 dollars worth of ether"),
+    "what about 5 dollars worth of WETH",
+  );
   assert.equal(correctLiveTranscript("buy 20 worth of SOL"), "buy 20 dollars worth of SOL");
   assert.equal(correctLiveTranscript("$550 worth of ETH"), "buy fifty dollars worth of WETH");
   assert.equal(correctLiveTranscript("buy 550 worth of ETH"), "buy fifty dollars worth of WETH");
@@ -159,6 +169,11 @@ test("live transcript restores dollars worth of when STT drops the frame", () =>
   assert.equal(correctLiveTranscript("well 50 ETH"), "sell 50 dollars worth of WETH");
   assert.equal(
     correctLiveTranscript("cell fifty dollars worth of ether"),
+    "sell fifty dollars worth of WETH",
+  );
+  assert.equal(correctLiveTranscript("so 50 ETH"), "sell 50 dollars worth of WETH");
+  assert.equal(
+    correctLiveTranscript("so fifty dollars worth of ether"),
     "sell fifty dollars worth of WETH",
   );
 });

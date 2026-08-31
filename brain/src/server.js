@@ -71,6 +71,7 @@ import {
   upsertLexicon,
   voiceContext,
 } from "./voice.js";
+import { getAnswer, latestWorking, upsertAnswer } from "./answers.js";
 import { handleHeard } from "./cant.js";
 import { handleShare } from "./share.js";
 import {
@@ -274,6 +275,27 @@ async function handle(req, res) {
     });
     return;
   }
+  if (req.method === "GET" && url.pathname.startsWith("/v1/answers/")) {
+    const accountId = url.searchParams.get("account_id");
+    const id = decodeURIComponent(url.pathname.slice("/v1/answers/".length));
+    if (!accountId || !id) {
+      send(res, 400, { ok: false, error: "account_id and id are required" });
+      return;
+    }
+    if (id === "latest") {
+      const row = latestWorking(accountId);
+      send(
+        res,
+        200,
+        row
+          ? { ok: true, found: true, ...row }
+          : { ok: true, found: false, correlation_id: null },
+      );
+      return;
+    }
+    send(res, 200, getAnswer(accountId, id));
+    return;
+  }
   if (req.method === "GET" && url.pathname.startsWith("/v1/ledger/")) {
     const accountId = url.searchParams.get("account_id");
     const id = decodeURIComponent(url.pathname.slice("/v1/ledger/".length));
@@ -403,6 +425,9 @@ async function handle(req, res) {
       return;
     case "/v1/voice/episode/close":
       send(res, 200, closeEpisode(accountIdOf(body), body));
+      return;
+    case "/v1/answers":
+      send(res, 200, upsertAnswer(accountIdOf(body), body));
       return;
     case "/v1/heard":
       send(res, 200, handleHeard(accountIdOf(body), body));

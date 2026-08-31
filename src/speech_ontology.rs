@@ -126,6 +126,30 @@ impl GrammarStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UtteranceKind {
+    Command,
+    Question,
+    Mixed,
+}
+
+impl UtteranceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UtteranceKind::Command => "command",
+            UtteranceKind::Question => "question",
+            UtteranceKind::Mixed => "mixed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UtteranceRoute {
+    pub kind: UtteranceKind,
+    pub question_text: Option<String>,
+    pub command_text: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UtteranceSlot {
     pub kind: String,
@@ -1499,7 +1523,7 @@ fn has_named_instrument(tokens: &[String]) -> bool {
 }
 
 /// Nova-3 hears the unstressed "dollars" in "dollars worth of" as "yards",
-/// "buy" as "by" / "wait" / "I have", and "sell" as "well" / "cell".
+/// "buy" as "about" / "by" / "wait" / "I have", and "sell" as "well" / "cell" / "so".
 fn repair_speech_dollar_frame(tokens: &mut Vec<String>, channel: Channel) -> Option<UtteranceSlot> {
     if channel != Channel::Speech || tokens.is_empty() {
         return None;
@@ -1546,7 +1570,7 @@ fn rewrite_buy_mishear(tokens: &mut Vec<String>) {
         return;
     }
     let first = tokens[0].as_str();
-    if !matches!(first, "by" | "bye" | "wait") {
+    if !matches!(first, "about" | "by" | "bye" | "wait") {
         return;
     }
     if !looks_like_trade_act_mishear_rest(tokens) {
@@ -1569,7 +1593,7 @@ fn rewrite_sell_mishear(tokens: &mut Vec<String>) {
         return;
     }
     let first = tokens[0].as_str();
-    if !matches!(first, "well" | "cell" | "sale" | "shell") {
+    if !matches!(first, "well" | "cell" | "sale" | "shell" | "so") {
         return;
     }
     if !looks_like_trade_act_mishear_rest(tokens) {
@@ -1883,6 +1907,100 @@ pub(crate) fn utterance_has_money_frame(raw: &str) -> bool {
 
 pub(crate) fn utterance_is_question(raw: &str) -> bool {
     is_question(raw)
+}
+
+pub(crate) fn utterance_has_unbound_deixis(raw: &str) -> bool {
+    let tokens = tokenize(raw);
+    let deictic = tokens
+        .iter()
+        .any(|t| matches!(t.as_str(), "this" | "that" | "these"));
+    deictic && !has_named_instrument(&tokens)
+}
+
+pub(crate) fn classify_utterance_route(raw: &str, action_ir: Option<&ActionIr>) -> UtteranceRoute {
+    let text = raw.trim();
+    if text.is_empty() {
+        return UtteranceRoute {
+            kind: UtteranceKind::Question,
+            question_text: Some(String::new()),
+            command_text: None,
+        };
+    }
+    if let Some((question, command)) = split_mixed_utterance(text) {
+        if utterance_is_question(&question) && looks_like_command_clause(&command) {
+            return UtteranceRoute {
+                kind: UtteranceKind::Mixed,
+                question_text: Some(question),
+                command_text: Some(command),
+            };
+        }
+    }
+    if action_ir.is_some() {
+        return UtteranceRoute {
+            kind: UtteranceKind::Command,
+            question_text: None,
+            command_text: Some(text.to_string()),
+        };
+    }
+    if utterance_is_question(text) {
+        return UtteranceRoute {
+            kind: UtteranceKind::Question,
+            question_text: Some(text.to_string()),
+            command_text: None,
+        };
+    }
+    if utterance_has_money_frame(text) {
+        return UtteranceRoute {
+            kind: UtteranceKind::Command,
+            question_text: None,
+            command_text: Some(text.to_string()),
+        };
+    }
+    UtteranceRoute {
+        kind: UtteranceKind::Question,
+        question_text: Some(text.to_string()),
+        command_text: None,
+    }
+}
+
+fn split_mixed_utterance(raw: &str) -> Option<(String, String)> {
+    const MARKERS: &[&str] = &[
+        " — and ",
+        " —and ",
+        " — ",
+        " – and ",
+        " – ",
+        ", and if ",
+        " and if ",
+        " and then ",
+        "; and ",
+        ", and ",
+    ];
+    let lower = raw.to_ascii_lowercase();
+    for marker in MARKERS {
+        if let Some(idx) = lower.find(marker) {
+            let question = raw[..idx].trim();
+            let command = raw[idx + marker.len()..].trim();
+            if !question.is_empty() && !command.is_empty() {
+                return Some((question.to_string(), command.to_string()));
+            }
+        }
+    }
+    None
+}
+
+fn looks_like_command_clause(raw: &str) -> bool {
+    let tokens = tokenize(raw);
+    if has_money_frame(&tokens) {
+        return true;
+    }
+    tokens.iter().any(|t| {
+        is_trade_act(t)
+            || matches!(
+                t.as_str(),
+                "watch" | "pause" | "resume" | "cancel" | "if" | "when"
+            )
+    })
 }
 
 fn leading_command_qty(token: &str) -> Option<String> {
@@ -2551,6 +2669,21 @@ mod tests {
             SizeKind::Quote
         );
         assert_eq!(text("wait 20 worth of SOL"), "buy 20 dollars worth of SOL");
+        assert_eq!(
+            text("about 5 dollars worth"),
+            "buy 5 dollars worth"
+        );
+        assert_eq!(
+            text("about five dollars worth of ETH"),
+            "buy five dollars worth of WETH"
+        );
+        assert_eq!(text("about 50 ETH"), "buy 50 dollars worth of WETH");
+        let typed_about = normalize_utterance("about 5 dollars worth", Channel::Text, &[], &[]);
+        assert_eq!(typed_about.normalized_text, "about 5 dollars worth");
+        assert_eq!(
+            text("what about 5 dollars worth of ETH"),
+            "what about 5 dollars worth of WETH"
+        );
         assert_eq!(text("buy 20 worth of SOL"), "buy 20 dollars worth of SOL");
         assert_eq!(
             text("By twenty dollars worth of SOL"),
@@ -2573,6 +2706,13 @@ mod tests {
         assert_eq!(text("Well 20 worth of SOL"), "sell 20 dollars worth of SOL");
         assert_eq!(text("We'll 50 ETH"), "sell 50 dollars worth of WETH");
         assert_eq!(text("sale 50 ETH"), "sell 50 dollars worth of WETH");
+        assert_eq!(text("so 50 ETH"), "sell 50 dollars worth of WETH");
+        assert_eq!(
+            text("so fifty dollars worth of ETH"),
+            "sell fifty dollars worth of WETH"
+        );
+        let typed_so = normalize_utterance("so 50 ETH", Channel::Text, &[], &[]);
+        assert_eq!(typed_so.normalized_text, "so 50 WETH");
         let typed_well = normalize_utterance("well 50 ETH", Channel::Text, &[], &[]);
         assert_eq!(typed_well.normalized_text, "well 50 WETH");
         assert_eq!(
@@ -2587,10 +2727,12 @@ mod tests {
         assert_eq!(typed_salt.normalized_text, "by 20 worth of salt");
         let restored = norm("buy 50 ETH", Channel::Speech);
         assert_eq!(restored.normalized_text, "buy 50 dollars worth of WETH");
-        assert!(restored
-            .slots
-            .iter()
-            .any(|s| s.source == "dollars_worth_rule"));
+        assert!(
+            restored
+                .slots
+                .iter()
+                .any(|s| s.source == "dollars_worth_rule")
+        );
         assert_eq!(
             parse_size(&restored.normalized_text, Some("WETH")).kind,
             SizeKind::Quote
@@ -2717,10 +2859,11 @@ mod tests {
         let out = norm("buy fifty dollars worth of ether", Channel::Text);
         assert_eq!(out.normalized_text, "buy fifty dollars worth of WETH");
         assert!(out.proposals.is_empty());
-        assert!(out
-            .slots
-            .iter()
-            .any(|s| s.kind == "instrument" && s.target == "WETH" && s.source == "alias"));
+        assert!(
+            out.slots
+                .iter()
+                .any(|s| s.kind == "instrument" && s.target == "WETH" && s.source == "alias")
+        );
     }
 
     #[test]
@@ -2746,10 +2889,11 @@ mod tests {
             &lex,
         );
         assert_eq!(out.normalized_text, "buy fifty dollars worth of WETH");
-        assert!(out
-            .slots
-            .iter()
-            .any(|s| s.source == "lexicon" && s.target == "WETH"));
+        assert!(
+            out.slots
+                .iter()
+                .any(|s| s.source == "lexicon" && s.target == "WETH")
+        );
     }
 
     #[test]
@@ -2802,10 +2946,11 @@ mod tests {
     fn size_rule_slot_uses_size_rule_source() {
         let out = norm("buy $550 worth of ETH", Channel::Speech);
         assert_eq!(out.normalized_text, "buy fifty dollars worth of WETH");
-        assert!(out
-            .slots
-            .iter()
-            .any(|s| s.kind == "size" && s.source == "size_rule" && s.target == "fifty"));
+        assert!(
+            out.slots
+                .iter()
+                .any(|s| s.kind == "size" && s.source == "size_rule" && s.target == "fifty")
+        );
     }
 
     #[test]
@@ -2869,5 +3014,25 @@ mod tests {
         assert_eq!(noun, "beef");
         assert!(unfulfillable_kind("buy $50", &[]).is_none());
         assert!(unfulfillable_kind("my favourite colour is teal", &[]).is_none());
+    }
+
+    #[test]
+    fn mixed_question_and_command_splits() {
+        let route =
+            classify_utterance_route("what's funding at — and if it's positive close half", None);
+        assert_eq!(route.kind, UtteranceKind::Mixed);
+        assert_eq!(route.question_text.as_deref(), Some("what's funding at"));
+        assert_eq!(
+            route.command_text.as_deref(),
+            Some("if it's positive close half")
+        );
+        let q = classify_utterance_route("what's my liquidation on this?", None);
+        assert_eq!(q.kind, UtteranceKind::Question);
+        assert!(utterance_has_unbound_deixis(
+            "what's my liquidation on this?"
+        ));
+        assert!(!utterance_has_unbound_deixis("what's my ETH liquidation"));
+        let cmd = classify_utterance_route("buy fifty dollars of ETH", None);
+        assert_eq!(cmd.kind, UtteranceKind::Command);
     }
 }

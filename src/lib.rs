@@ -78,6 +78,7 @@ dyn_aomi_app!(
         tool::ResumeWorldWatch,
         tool::DrainWorldOutbound,
         tool::RecordWorldCorrection,
+        tool::ProjectWorldAnswer,
         tool::SetWorldConsent,
         tool::CloseWorldEpisode,
     ],

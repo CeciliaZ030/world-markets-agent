@@ -87,6 +87,7 @@ const state = {
     typePulse: false,
   },
   nearMatch: null,
+  answer: null,
 };
 
 function applyFlags(flags) {
@@ -773,6 +774,10 @@ function goBack() {
     closeSearch();
     return;
   }
+  if (state.sheet === "answer") {
+    closeAnswerSheet();
+    return;
+  }
   if (state.sheet === "picker") {
     state.sheet = state.productId ? "product" : "position";
     paint();
@@ -934,6 +939,11 @@ function mainPaintKey() {
     needs: state.summary && state.summary.needs_you,
     toast: state.toast,
     sheet: state.sheet,
+    answer: state.answer && state.answer.exchanges && state.answer.exchanges.map((ex) => [
+      ex.correlationId,
+      ex.status,
+      ex.answer && String(ex.answer).length,
+    ]),
     openSwipe: state.openSwipe,
     earlier: state.earlierOpen,
     stampPop: state.stampPop,
@@ -1099,16 +1109,22 @@ function voiceLevelHtml() {
 
 function voiceDockHtml() {
   const phase = state.voice.phase;
-  const words = `<div class="listen-words" id="liveWords"${
-    showLiveWords() ? "" : " hidden"
+  const onAnswer = state.sheet === "answer";
+  const words = `<div class="listen-words" id="${onAnswer ? "liveWordsHome" : "liveWords"}"${
+    showLiveWords() && !onAnswer ? "" : " hidden"
   }>${liveWordsInnerHtml()}</div>`;
   const typePulse = state.voice.typePulse ? " type-pulse" : "";
+  const btnId = onAnswer ? "voiceBtnHome" : "voiceBtn";
+  const dockId = onAnswer ? "voiceDockHome" : "voiceDock";
+  const scrimId = onAnswer ? "listenScrimHome" : "listenScrim";
+  const waitId = onAnswer ? "voiceWaitMeterHome" : "voiceWaitMeter";
+  const statusId = onAnswer ? "voiceStatusHome" : "voiceStatus";
   return (
     `<div class="home-ledger-wrap">` +
     `<div class="home-ledger${state.voice.phase === "listening" && !voiceFinalizing ? " dim" : ""}" id="homeLedger">` +
     ledgerZonesHtml() +
     `</div>` +
-    `<div class="listen-scrim${state.voice.phase === "listening" && !voiceFinalizing ? " on" : ""}" id="listenScrim">` +
+    `<div class="listen-scrim${state.voice.phase === "listening" && !voiceFinalizing && !onAnswer ? " on" : ""}" id="${scrimId}">` +
     `<div class="listen-lab">${escapeHtml(
       voiceFinalizing
         ? C.listening.finalizing || C.listening.label
@@ -1119,10 +1135,10 @@ function voiceDockHtml() {
     words +
     `</div>` +
     `</div>` +
-    `<div class="voice-dock ${phase}${phase === "listening" && (!voiceReady || voiceFinalizing) ? " arming" : ""}" id="voiceDock">` +
+    `<div class="voice-dock ${phase}${phase === "listening" && (!voiceReady || voiceFinalizing) ? " arming" : ""}" id="${dockId}">` +
     `<div class="voice-hero-wrap">` +
     voiceLevelHtml() +
-    `<button type="button" class="voice-hero" id="voiceBtn" aria-label="${escapeHtml(voiceStatusText())}">` +
+    `<button type="button" class="voice-hero" id="${btnId}" aria-label="${escapeHtml(voiceStatusText())}">` +
     `<div class="voice-halo"></div>` +
     `<div class="voice-arm" aria-hidden="true"><i></i></div>` +
     `<div class="rip"></div><div class="rip d2"></div>` +
@@ -1133,8 +1149,8 @@ function voiceDockHtml() {
     `</button>` +
     voiceLevelHtml() +
     `</div>` +
-    `<div class="meter queue-fill voice-wait" id="voiceWaitMeter" hidden><span></span></div>` +
-    `<div class="voice-status" id="voiceStatus">${escapeHtml(voiceStatusText())}</div>` +
+    `<div class="meter queue-fill voice-wait" id="${waitId}" hidden><span></span></div>` +
+    `<div class="voice-status" id="${statusId}">${escapeHtml(voiceStatusText())}</div>` +
     `</div>` +
     nearMatchHtml() +
     `<div class="home-acts">` +
@@ -1770,12 +1786,435 @@ function sheetBackHtml() {
 }
 
 function sheetHtml() {
-  const half = state.sheet === "position" || state.sheet === "product" ? 280 : state.sheet === "instruction" ? 260 : 0;
-  const y = state.sheet === "pick" || state.sheet === "picker" ? 0 : state.detent === "full" ? 0 : half;
+  const half =
+    state.sheet === "answer"
+      ? 0
+      : state.sheet === "position" || state.sheet === "product"
+        ? 280
+        : state.sheet === "instruction"
+          ? 260
+          : 0;
+  const y = state.sheet === "pick" || state.sheet === "picker" || state.sheet === "answer" ? 0 : state.detent === "full" ? 0 : half;
+  if (state.sheet === "answer") return answerSheet(y);
   if (state.sheet === "position" || (state.sheet === "picker" && !state.productId)) return positionSheet(y);
   if (state.sheet === "product" || (state.sheet === "picker" && state.productId)) return productSheet(y);
   if (state.sheet === "instruction") return instructionSheet(y);
   return "";
+}
+
+function positionReferentLabel(p) {
+  if (!p) return "";
+  if (p.side) return `${p.symbol} ${p.side}`;
+  if (p.asset_type === "perp") return `${p.symbol} perp`;
+  return p.symbol || "";
+}
+
+function currentContextRefFromView() {
+  if (state.answer && state.answer.contextRef && state.sheet === "answer") {
+    return state.answer.contextRef;
+  }
+  if (state.sheet === "position" || (state.sheet === "picker" && !state.productId)) {
+    const p = (state.portfolio.positions || [])[state.posIdx];
+    if (p) {
+      return {
+        view: "position",
+        symbol: p.symbol,
+        side: p.side || "",
+        asset_type: p.asset_type,
+        label: positionReferentLabel(p),
+      };
+    }
+  }
+  if (state.sheet === "product" || (state.sheet === "picker" && state.productId)) {
+    const p = findProduct(state.productId);
+    if (p) return { view: "product", symbol: p.symbol, product: p.product, label: p.symbol };
+  }
+  if (state.sheet === "instruction") {
+    const row = instructions().find((r) => r.instruction_id === state.insId);
+    if (row) {
+      return {
+        view: "instruction",
+        instruction_id: row.instruction_id,
+        label: row.sentence,
+      };
+    }
+  }
+  return { view: state.tab || "ledger" };
+}
+
+function heardEchoLine(text, ref) {
+  if (ref) return fillCopy(C.answer.heard_with_ref, { text, ref });
+  return `heard: "${text}"`;
+}
+
+function lastAnswerExchange() {
+  const list = state.answer && state.answer.exchanges;
+  return list && list.length ? list[list.length - 1] : null;
+}
+
+function openAnswerSheet({ heard, referent, correlationId, chips, under: underArg, contextRef: ctxArg }) {
+  const contextRef = ctxArg || currentContextRefFromView();
+  const under =
+    underArg ||
+    (state.answer && state.answer.under) || {
+      sheet: state.sheet === "answer" ? null : state.sheet,
+      detent: state.detent,
+      insId: state.insId,
+      posIdx: state.posIdx,
+      productId: state.productId,
+      scroll: captureLedgerScroll(),
+      view: state.view === "compose" || state.view === "sent" ? "main" : state.view,
+      tab: state.tab,
+    };
+  const exchange = {
+    correlationId,
+    heard: heard || "",
+    referent: referent || "",
+    status: chips && chips.length ? "clarify" : "working",
+    answer: "",
+    controls: chips || [],
+    voiceNoteUrl: "",
+    openedAt: Date.now(),
+  };
+  if (state.sheet === "answer" && state.answer) {
+    state.answer.exchanges.push(exchange);
+  } else {
+    state.answer = {
+      exchanges: [exchange],
+      rootId: correlationId,
+      contextRef,
+      under,
+    };
+  }
+  if (state.view === "sent" || state.view === "compose") state.view = "main";
+  state.sheet = "answer";
+  state.detent = "full";
+  paint();
+  startAnswerPoll();
+  scheduleAnswerWorkingPaint();
+}
+
+function closeAnswerSheet() {
+  stopAnswerPoll();
+  const under = state.answer && state.answer.under;
+  state.answer = null;
+  if (under) {
+    state.view = under.view || "main";
+    state.tab = under.tab || state.tab;
+    state.sheet = under.sheet || null;
+    state.detent = under.detent || "half";
+    state.insId = under.insId || state.insId;
+    state.posIdx = under.posIdx != null ? under.posIdx : state.posIdx;
+    state.productId = under.productId || "";
+    paint();
+    if (under.scroll) restoreLedgerScroll(under.scroll);
+    return;
+  }
+  state.sheet = null;
+  paint();
+}
+
+function dismissCurrentSheet() {
+  if (state.sheet === "answer") {
+    closeAnswerSheet();
+    return;
+  }
+  state.sheet = null;
+  state.productId = "";
+  paint();
+}
+
+let answerPollTimer = null;
+let answerPollInFlight = false;
+let answerWorkingTimer = null;
+
+function stopAnswerPoll() {
+  clearInterval(answerPollTimer);
+  answerPollTimer = null;
+  clearTimeout(answerWorkingTimer);
+  answerWorkingTimer = null;
+}
+
+function scheduleAnswerWorkingPaint() {
+  clearTimeout(answerWorkingTimer);
+  answerWorkingTimer = null;
+  if (!state.answer || state.sheet !== "answer") return;
+  const working = (state.answer.exchanges || []).find(
+    (ex) => ex.status === "working" && !ex.answer,
+  );
+  if (!working) return;
+  const wait = Math.max(0, 3000 - (Date.now() - (working.openedAt || Date.now())) + 40);
+  answerWorkingTimer = setTimeout(() => {
+    if (state.sheet === "answer" && !(state.voice && state.voice.phase === "listening" && !voiceFinalizing)) {
+      paint();
+    }
+    scheduleAnswerWorkingPaint();
+  }, wait);
+}
+
+function startAnswerPoll() {
+  stopAnswerPoll();
+  scheduleAnswerWorkingPaint();
+  pollAnswerSheet();
+  answerPollTimer = setInterval(pollAnswerSheet, 400);
+}
+
+function answerRowIsEscalation(row) {
+  if (!row) return false;
+  const st = String(row.status || "").toLowerCase();
+  return (
+    st === "with_aomi" ||
+    st === "awaiting_confirm" ||
+    st === "triggered" ||
+    st === "needs_you"
+  );
+}
+
+function syncAnswerHandoffFromLedger() {
+  if (!state.answer || state.sheet !== "answer") return false;
+  const rows = instructions();
+  let changed = false;
+  for (const ex of state.answer.exchanges || []) {
+    if (ex.status !== "handoff_command") continue;
+    const row = rows.find(
+      (r) =>
+        (ex.correlationId &&
+          (r.correlation_id === ex.correlationId || r.instruction_id === ex.correlationId)) ||
+        (ex.heard && String(r.sentence || "").trim() === String(ex.heard).trim()),
+    );
+    if (answerRowIsEscalation(row)) {
+      ex.status = "handoff_escalation";
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+async function pollAnswerSheet() {
+  if (!state.answer || state.sheet !== "answer") {
+    stopAnswerPoll();
+    return;
+  }
+  if (answerPollInFlight) return;
+  const pending = state.answer.exchanges.filter(
+    (ex) =>
+      ex.status === "working" ||
+      ex.status === "clarify" ||
+      ex.status === "handoff_command",
+  );
+  if (!pending.length) {
+    const allDone = state.answer.exchanges.every(
+      (ex) => ex.status !== "working" && ex.status !== "handoff_command",
+    );
+    if (allDone) stopAnswerPoll();
+    return;
+  }
+  answerPollInFlight = true;
+  try {
+    let changed = false;
+    for (const ex of pending) {
+      if (!ex.correlationId) continue;
+      let data = null;
+      try {
+        data = await api("/api/v1/mini-app/answer/" + encodeURIComponent(ex.correlationId));
+      } catch (_) {
+        continue;
+      }
+      if (!data || !data.found) continue;
+      if (data.answer && data.answer !== ex.answer) {
+        ex.answer = data.answer;
+        changed = true;
+      }
+      if (data.status && data.status !== ex.status) {
+        ex.status = data.status;
+        changed = true;
+      }
+      if (Array.isArray(data.controls) && data.controls.length) {
+        ex.controls = data.controls;
+        changed = true;
+      }
+      if (data.voice_note_url && data.voice_note_url !== ex.voiceNoteUrl) {
+        ex.voiceNoteUrl = data.voice_note_url;
+        changed = true;
+      }
+      if (data.referent && !ex.referent) {
+        ex.referent = data.referent;
+        changed = true;
+      }
+    }
+    if (syncAnswerHandoffFromLedger()) changed = true;
+    if (changed && !(state.voice && state.voice.phase === "listening" && !voiceFinalizing)) {
+      paint();
+    }
+    scheduleAnswerWorkingPaint();
+  } finally {
+    answerPollInFlight = false;
+  }
+}
+
+function answerSheet(y) {
+  const a = state.answer;
+  if (!a) return "";
+  const exchanges = (a.exchanges || [])
+    .map((ex, i) => answerExchangeHtml(ex, i))
+    .join("");
+  const listening = state.voice.phase === "listening" && !voiceFinalizing;
+  const words = `<div class="listen-words" id="liveWords"${showLiveWords() ? "" : " hidden"}>${liveWordsInnerHtml()}</div>`;
+  return `<div class="scrim" id="scrim"></div>
+    <div class="sheet answer" id="sheet" style="transform:translateY(${y}px)">
+      <div class="handle" id="handle"></div>
+      <div class="sheet-h">${sheetBackHtml()}<h2>aomi</h2></div>
+      <div class="sheet-body" id="answerBody">
+        ${exchanges}
+        <p class="answer-footer">${escapeHtml(C.answer.footer_thread)}</p>
+      </div>
+      <div class="listen-scrim${listening ? " on" : ""}" id="listenScrim">
+        <div class="listen-lab">${escapeHtml(C.listening.label)}</div>
+        ${words}
+      </div>
+      <div class="answer-voice" id="voiceDock">
+        <button type="button" class="voice-hero compact" id="voiceBtn" aria-label="${escapeHtml(voiceStatusText())}">
+          ${micSvg()}
+        </button>
+        <div class="meter queue-fill voice-wait" id="voiceWaitMeter" hidden><span></span></div>
+        <div class="voice-status" id="voiceStatus">${escapeHtml(voiceStatusText())}</div>
+      </div>
+    </div>`;
+}
+
+function answerExchangeHtml(ex, idx) {
+  const heard = heardEchoLine(ex.heard, ex.referent);
+  const age = Date.now() - (ex.openedAt || Date.now());
+  const showWorkingLine = ex.status === "working" && age > 3000;
+  let body = "";
+  if (ex.status === "handoff_command") {
+    body = `<p class="answer-handoff">${escapeHtml(C.answer.handoff_command)}</p>`;
+  } else if (ex.status === "handoff_escalation") {
+    body =
+      `<p class="answer-handoff">${escapeHtml(C.answer.handoff_escalation)}</p>` +
+      `<button type="button" class="ghost-btn" id="answerOpenThread">${escapeHtml(C.instruction.openThread)}</button>`;
+  } else if (ex.status === "clarify") {
+    const chips = (ex.controls || [])
+      .map(
+        (label) =>
+          `<button type="button" class="near-chip" data-answer-chip="${escapeHtml(String(label))}">${escapeHtml(String(label))}</button>`,
+      )
+      .join("");
+    body = `<p class="answer-text">${escapeHtml(C.answer.clarify)}</p><div class="near-match-chips">${chips}</div>`;
+  } else if (ex.answer) {
+    const note = ex.voiceNoteUrl
+      ? `<a class="answer-play" href="${escapeHtml(ex.voiceNoteUrl)}">▶</a>`
+      : "";
+    body = `<p class="answer-text">${escapeHtml(ex.answer)}${note}</p>`;
+  } else {
+    body =
+      `<div class="skel"></div><div class="skel" style="width:70%"></div>` +
+      (showWorkingLine ? `<p class="answer-working">${escapeHtml(C.answer.working)}</p>` : "");
+  }
+  return `<div class="answer-ex" data-ex="${idx}">
+    <p class="answer-heard">${escapeHtml(heard)}</p>
+    ${body}
+  </div>`;
+}
+
+function bindAnswerSheet() {
+  app.querySelectorAll("[data-answer-chip]").forEach((btn) => {
+    btn.onclick = () => {
+      const label = btn.getAttribute("data-answer-chip") || "";
+      if (label) sendAnswerClarify(label);
+    };
+  });
+  const open = document.getElementById("answerOpenThread");
+  if (open) open.onclick = () => openThreadLink();
+  const body = document.getElementById("answerBody");
+  if (body) body.scrollTop = body.scrollHeight;
+}
+
+async function sendAnswerClarify(label) {
+  haptic("select");
+  const ex = lastAnswerExchange();
+  if (!ex) return;
+  ex.referent = label;
+  ex.status = "working";
+  ex.controls = [];
+  if (state.answer) state.answer.contextRef = { view: "position", label };
+  paint();
+  const payload = {
+    correlation_id: ex.correlationId,
+    kind: "question",
+    message: ex.heard,
+    context_ref: state.answer.contextRef,
+  };
+  const inTelegram = tg && tg.initData && typeof tg.sendData === "function";
+  if (inTelegram) {
+    try {
+      tg.sendData(JSON.stringify(payload));
+    } catch (_) {
+      /* host may still ingest */
+    }
+  }
+  if (!inTelegram || previewState()) {
+    try {
+      await api("/api/v1/mini-app/compose", { method: "POST", body: payload });
+    } catch (_) {
+      /* keep the sheet */
+    }
+  }
+  startAnswerPoll();
+}
+
+function handoffAnswerCommand(kind) {
+  const ex = lastAnswerExchange();
+  if (!ex) return;
+  ex.status = kind === "escalation" ? "handoff_escalation" : "handoff_command";
+  if (state.sheet === "answer") paint();
+  if (ex.status === "handoff_command") startAnswerPoll();
+}
+
+function applyInSheetHeard(handled, heard, correlation_id) {
+  dropOptimistic(correlation_id);
+  state.voice.phase = "idle";
+  state.voice.transcript = "";
+  state.voice.transcriptRaw = "";
+  const kind = handled && (handled.kind || handled.voice_kind);
+  const message =
+    (handled && handled.message) ||
+    (kind === "unclear" ? C.draftRow.misheard || C.toasts.voiceEmpty : "") ||
+    C.toasts.voiceEmpty;
+  const chips = Array.isArray(handled && handled.controls) ? handled.controls : [];
+  const exchange = {
+    correlationId: correlation_id,
+    heard: heard || "",
+    referent: "",
+    status: kind === "near_match" ? "clarify" : "answered",
+    answer: kind === "near_match" ? "" : message,
+    controls: kind === "near_match" ? chips : [],
+    voiceNoteUrl: "",
+    openedAt: Date.now(),
+  };
+  if (state.sheet === "answer" && state.answer) {
+    const existing = (state.answer.exchanges || []).find(
+      (row) => row.correlationId === correlation_id,
+    );
+    if (existing) Object.assign(existing, exchange);
+    else state.answer.exchanges.push(exchange);
+    paint();
+    if (kind === "near_match") startAnswerPoll();
+    return;
+  }
+  openAnswerSheet({
+    heard,
+    correlationId: correlation_id,
+    chips: kind === "near_match" ? chips : [],
+  });
+  if (kind !== "near_match") {
+    const ex = lastAnswerExchange();
+    if (ex) {
+      ex.status = "answered";
+      ex.answer = message;
+    }
+    paint();
+  }
 }
 
 function positionSheet(y) {
@@ -2025,17 +2464,21 @@ function bindSheet() {
   const sheet = document.getElementById("sheet");
   const handle = document.getElementById("handle");
   const x = document.getElementById("sheetX");
-  if (scrim) scrim.onclick = () => { state.sheet = null; state.productId = ""; paint(); };
+  if (scrim) {
+    scrim.onclick = () => dismissCurrentSheet();
+  }
   if (x) {
     x.onclick = () => {
-      if (state.sheet === "picker") state.sheet = state.productId ? "product" : "position";
+      if (state.sheet === "answer") closeAnswerSheet();
+      else if (state.sheet === "picker") state.sheet = state.productId ? "product" : "position";
       else {
         state.sheet = null;
         state.productId = "";
       }
-      paint();
+      if (state.sheet !== "answer") paint();
     };
   }
+  if (state.sheet === "answer") bindAnswerSheet();
   const primary = document.getElementById("primaryAct");
   if (primary) {
     primary.onclick = () => {
@@ -2154,8 +2597,9 @@ function bindSheet() {
 
 function bindSheetDrag(sheet, handle) {
   const kind = state.sheet;
-  const half = kind === "position" || kind === "product" ? 280 : kind === "instruction" ? 260 : 0;
-  const container = kind === "position" ? 620 : kind === "instruction" ? 640 : 400;
+  const half =
+    kind === "answer" ? 0 : kind === "position" || kind === "product" ? 280 : kind === "instruction" ? 260 : 0;
+  const container = kind === "answer" ? 640 : kind === "position" ? 620 : kind === "instruction" ? 640 : 400;
   if (kind === "picker") {
     if (handle) handle.onclick = () => {};
     return;
@@ -2192,9 +2636,7 @@ function bindSheetDrag(sheet, handle) {
     const vel = (y - start) / dt;
     sheet.style.transition = "transform 240ms cubic-bezier(.2,.8,.3,1)";
     if (vel > 0.8 || y > half + 130) {
-      state.sheet = null;
-      state.productId = "";
-      paint();
+      dismissCurrentSheet();
       return;
     }
     if (y < half * 0.55 || vel < -0.6) {
@@ -2242,6 +2684,17 @@ async function openInstruction(id) {
 }
 
 function openCompose(payload) {
+  payload.context_ref = payload.context_ref || currentContextRefFromView();
+  payload.under = {
+    sheet: state.sheet,
+    detent: state.detent,
+    insId: state.insId,
+    posIdx: state.posIdx,
+    productId: state.productId,
+    scroll: captureLedgerScroll(),
+    view: "main",
+    tab: state.tab,
+  };
   state.compose = payload;
   state.view = "compose";
   state.sheet = null;
@@ -2340,6 +2793,8 @@ async function doSend() {
     instruction_id: c.instruction_id || undefined,
     fire_kind: c.fire_kind,
     instrument: c.instrument,
+    context_ref: c.context_ref,
+    parent_correlation_id: state.answer && state.answer.rootId,
   };
   const inTelegram = tg && tg.initData && typeof tg.sendData === "function";
   if (inTelegram) {
@@ -2386,11 +2841,17 @@ async function doSend() {
       correlation_id;
     landQueuedTask(c.message, correlation_id, id, { kind: c.kind || "trade" });
     state.sent = { id, kind: c.kind, message: c.message, question: false };
+    state.view = "sent";
+    paint();
   } else {
-    state.sent = { id: null, kind: c.kind, message: c.message, question: true };
+    openAnswerSheet({
+      heard: c.message,
+      referent: (c.context_ref && c.context_ref.label) || "",
+      correlationId: correlation_id,
+      under: c.under,
+      contextRef: c.context_ref,
+    });
   }
-  state.view = "sent";
-  paint();
   refreshLedger();
 }
 
@@ -2528,7 +2989,6 @@ let voiceSpeechAt = 0;
 let voiceKeepAliveAt = 0;
 let voiceWaitAt = 0;
 let voiceFlushAt = 0;
-let voiceUpAt = 0;
 
 function bindVoice() {
   const btn = document.getElementById("voiceBtn");
@@ -2620,7 +3080,6 @@ function onVoiceUp() {
     cancelVoice("short");
     return;
   }
-  voiceUpAt = Date.now();
   commitVoice();
 }
 
@@ -3056,14 +3515,7 @@ function applyLiveTranscript(text, isFinal, replace, confidence) {
   const confOk = confFn
     ? confFn(confidence)
     : !(Number(confidence) > 0 && Number(confidence) < 0.55);
-  let dropReason = "";
-  if (!voiceFinalizing) {
-    if (!recent) dropReason = "not_recent";
-    else if (!confOk) dropReason = "low_confidence";
-  }
-  if (dropReason) {
-    return;
-  }
+  if (!voiceFinalizing && (!recent || !confOk)) return;
   const raw = String(text || "").trim();
   const paintFn =
     typeof window.shouldPaintInterim === "function" ? window.shouldPaintInterim : null;
@@ -3663,6 +4115,9 @@ async function submitVoiceBlob(blob, mime, started, correlation_id, liveCaption)
         mime: blob.type || mime,
         duration_secs,
         live_text,
+        correlation_id,
+        context_ref: currentContextRefFromView(),
+        parent_correlation_id: state.answer && state.answer.rootId,
       },
     });
     const heard = String((out && (out.transcript || out.heard_echo)) || "").trim();
@@ -3677,14 +4132,24 @@ async function submitVoiceBlob(blob, mime, started, correlation_id, liveCaption)
           correlation_id: (out && out.correlation_id) || correlation_id,
         };
       payload.message = heard;
+      const isMixed = (out && out.utterance_kind) === "mixed";
       const isQuestion = Boolean(out && out.question);
-      if (isQuestion) payload.kind = "question";
+      const needsClarify = Boolean(out && out.needs_clarify);
+      const questionText = String((out && out.question_text) || heard).trim();
+      const commandText = String((out && out.command_text) || "").trim();
+      const cid = (out && out.correlation_id) || correlation_id;
+      const referent = String((out && out.referent) || "").trim();
+      const chips =
+        (out && (out.clarify_chips || (out.answer && out.answer.controls))) || [];
+      if (isQuestion && !isMixed) payload.kind = "question";
+      payload.context_ref = currentContextRefFromView();
+      payload.parent_correlation_id = state.answer && state.answer.rootId;
       const inTelegram = tg && tg.initData && typeof tg.sendData === "function";
       const skipSend = out && out.skip_send_data;
       const liveCmd = String(liveCaption || "").trim();
       const liveIsCommand = Boolean(liveCmd) && liveLooksLikeCommand(liveCmd);
       const liveIsFullCommand = liveIsCommand && liveHasInstrument(liveCmd);
-      if (inTelegram && !skipSend) {
+      if (inTelegram && !skipSend && !needsClarify) {
         try {
           tg.sendData(JSON.stringify(payload));
         } catch (_) {
@@ -3697,7 +4162,14 @@ async function submitVoiceBlob(blob, mime, started, correlation_id, liveCaption)
         });
         burstPoll();
       } else if (kind === "cant" || kind === "unclear" || kind === "near_match") {
-        applyHeardOutcome(out.heard_handled || out, heard, correlation_id);
+        if (state.sheet === "answer") {
+          applyInSheetHeard(out.heard_handled || out, heard, correlation_id);
+          if (kind === "cant" && !isQuestion) {
+            applyHeardOutcome(out.heard_handled || out, heard, correlation_id);
+          }
+        } else {
+          applyHeardOutcome(out.heard_handled || out, heard, correlation_id);
+        }
         burstPoll();
       } else if (isQuestion && liveIsFullCommand) {
         payload.kind = "voice";
@@ -3716,27 +4188,79 @@ async function submitVoiceBlob(blob, mime, started, correlation_id, liveCaption)
           }
         }
         burstPoll();
-      } else if (isQuestion && liveIsCommand) {
+      } else if (isQuestion && liveIsCommand && !isMixed) {
         landMisheard(correlation_id);
+      } else if (isMixed) {
+        dropOptimistic(correlation_id);
+        if (commandText) {
+          landVoiceDraft(commandText, correlation_id, cid, {
+            server_correlation_id: out && out.correlation_id,
+          });
+          if (!inTelegram || previewState()) {
+            try {
+              await api("/api/v1/mini-app/compose", {
+                method: "POST",
+                body: {
+                  kind: "voice",
+                  message: commandText,
+                  correlation_id: cid,
+                  context_ref: payload.context_ref,
+                },
+              });
+            } catch (_) {
+              /* keep the local queued row */
+            }
+          }
+        }
+        if (!needsClarify && (!inTelegram || previewState())) {
+          try {
+            await api("/api/v1/mini-app/compose", {
+              method: "POST",
+              body: {
+                kind: "question",
+                message: questionText,
+                correlation_id: cid,
+                context_ref: payload.context_ref,
+                parent_correlation_id: payload.parent_correlation_id,
+              },
+            });
+          } catch (_) {
+            /* sheet still opens */
+          }
+        }
+        state.voice.phase = "idle";
+        state.voice.transcript = "";
+        state.voice.transcriptRaw = "";
+        openAnswerSheet({
+          heard: questionText,
+          referent,
+          correlationId: cid,
+          chips: needsClarify ? chips : [],
+        });
+        burstPoll();
       } else if (isQuestion) {
         dropOptimistic(correlation_id);
-        if (!inTelegram || previewState()) {
+        if (!needsClarify && (!inTelegram || previewState())) {
           try {
             await api("/api/v1/mini-app/compose", {
               method: "POST",
               body: payload,
             });
           } catch (_) {
-            /* preview compose is best-effort; SENT still confirms the send */
+            /* preview compose is best-effort; the sheet still opens */
           }
         }
         state.voice.phase = "idle";
         state.voice.transcript = "";
         state.voice.transcriptRaw = "";
-        state.sent = { id: null, kind: "question", message: heard, question: true };
-        state.view = "sent";
-        paint();
+        openAnswerSheet({
+          heard: questionText,
+          referent,
+          correlationId: cid,
+          chips: needsClarify ? chips : [],
+        });
       } else {
+        if (state.sheet === "answer") handoffAnswerCommand("command");
         landVoiceDraft(
           heard,
           correlation_id,
@@ -4009,17 +4533,11 @@ async function api(path, opts) {
   if (res.status === 404) throw new Error("not_found");
   if (!res.ok) {
     let errKey = "http";
-    let bodyText = "";
     try {
       const errBody = await res.json();
       errKey = (errBody && errBody.error) || "http";
-      bodyText = JSON.stringify(errBody).slice(0, 200);
     } catch (_) {
-      try {
-        bodyText = (await res.text()).slice(0, 200);
-      } catch (__) {
-        /* ignore */
-      }
+      /* ignore */
     }
     throw new Error(errKey);
   }
@@ -4116,6 +4634,7 @@ async function refreshLedger() {
     for (const id of Object.keys(state.fillUx)) {
       if (!liveIds.has(id)) delete state.fillUx[id];
     }
+    syncAnswerHandoffFromLedger();
     if (
       (state.view === "main" || state.view === "sent") &&
       !(state.voice.phase === "listening" && !voiceFinalizing)

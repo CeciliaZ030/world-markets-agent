@@ -1382,6 +1382,57 @@ body.home-v7 .header.with-search {
   40% { box-shadow: 0 0 0 6px rgba(77, 163, 255, 0.22); }
 }
 
+.sheet.answer { height: min(85dvh, 680px); }
+.sheet.answer .sheet-body { padding-bottom: 8px; }
+.answer-ex { margin-bottom: 18px; }
+.answer-heard {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--mute);
+  margin: 0 0 10px;
+  white-space: pre-wrap;
+}
+.answer-text {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+.answer-working,
+.answer-handoff {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--mute);
+  margin: 8px 0 0;
+}
+.answer-footer {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--faint);
+  margin: 16px 0 0;
+}
+.answer-play {
+  margin-left: 8px;
+  color: var(--accent);
+  text-decoration: none;
+}
+.answer-voice {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 16px calc(12px + var(--safe-bot));
+}
+.voice-hero.compact {
+  width: 72px;
+  height: 72px;
+}
+.sheet.answer .listen-scrim {
+  z-index: 2;
+  border-radius: 16px 16px 0 0;
+}
+
 .heartbeat .dot { animation: pulse-dot 2.4s infinite; }
 @media (prefers-reduced-motion: reduce) {
   .toast, .voice-halo, .rip, .wave i, .listen-lab, .listen-caret, .heartbeat .dot,

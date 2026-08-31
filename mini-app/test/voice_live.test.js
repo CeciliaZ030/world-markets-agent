@@ -186,10 +186,12 @@ test("preferHeardTranscript keeps a longer finalized live sentence", () => {
 
 test("live buy captions count as commands even when clip STT is garbage", () => {
   assert.equal(liveCaptionIsCommand("buy 550 worth of ETH."), true);
+  assert.equal(liveCaptionIsCommand("about 5 dollars worth"), true);
   assert.equal(liveCaptionIsCommand("By twenty dollars"), true);
   assert.equal(liveCaptionIsCommand("I have 50 ETH"), true);
   assert.equal(liveCaptionIsCommand("well 50 ETH"), true);
   assert.equal(liveCaptionIsCommand("cell fifty dollars"), true);
+  assert.equal(liveCaptionIsCommand("A $20 worth"), true);
   assert.equal(liveCaptionIsCommand("A $20 worth"), true);
   assert.equal(liveCaptionIsCommand("how much is ETH"), false);
   assert.equal(liveCaptionIsCommand(""), false);
@@ -351,7 +353,7 @@ test("hold-to-talk shows a wait meter and honest copy while gates run", () => {
   assert.ok(CHIRP_TAIL_MS >= 20 && CHIRP_TAIL_MS <= 50);
 });
 
-test("voice questions skip the ledger and land on SENT", () => {
+test("voice questions skip the ledger and open the answer sheet", () => {
   const here = dirname(fileURLToPath(import.meta.url));
   const src = readFileSync(join(here, "../static/app.js"), "utf8");
   const copy = readFileSync(join(here, "../static/copy.js"), "utf8");
@@ -359,44 +361,63 @@ test("voice questions skip the ledger and land on SENT", () => {
     src.indexOf("async function submitVoiceBlob("),
     src.indexOf("async function commitVoice("),
   );
-  const sent = src.slice(
-    src.indexOf("function renderSent("),
-    src.indexOf("function renderBlocked("),
-  );
-  assert.match(
-    copy,
-    /askNote:\s*"aomi answers in the thread\. Questions never become ledger records\."/,
-  );
-  assert.match(sent, /C\.sent\.askNote/);
-  assert.match(sent, /s\.question/);
+  assert.match(copy, /heard_with_ref:\s*'heard: "\{text\}" — the \{ref\}'/);
+  assert.match(copy, /working:\s*"checking the engine — a moment"/);
+  assert.match(copy, /footer_thread:/);
+  assert.match(copy, /handoff_command:/);
+  assert.match(copy, /handoff_escalation:/);
+  assert.match(src, /function openAnswerSheet\(/);
+  assert.match(src, /function closeAnswerSheet\(/);
+  assert.match(src, /\/api\/v1\/mini-app\/answer\//);
+  assert.match(submit, /context_ref: currentContextRefFromView\(\)/);
   assert.match(submit, /out && out\.question/);
-  assert.match(submit, /payload\.kind = "question"/);
+  assert.match(submit, /utterance_kind/);
   assert.match(submit, /kind === "cant"/);
   assert.match(submit, /dropOptimistic\(correlation_id\)/);
-  assert.match(
-    submit,
-    /state\.sent = \{ id: null, kind: "question", message: heard, question: true \}/,
-  );
-  assert.match(submit, /state\.view = "sent"/);
+  assert.match(submit, /openAnswerSheet\(/);
+  assert.doesNotMatch(submit, /state\.view = "sent"/);
   assert.match(submit, /\/api\/v1\/mini-app\/compose/);
   assert.match(submit, /landVoiceDraft\(\s*heard,\s*correlation_id/);
-  assert.match(submit, /unclear_live_command/);
-  assert.match(submit, /question_live_command/);
-  assert.match(submit, /question_trade_attempt/);
   assert.match(submit, /liveLooksLikeCommand/);
   assert.match(submit, /landMisheard\(correlation_id\)/);
   const wallAt = submit.search(/kind === "cant"/);
   const liveOverrideAt = submit.search(/isQuestion && liveIsCommand/);
+  const mixedAt = submit.search(/else if \(isMixed\) \{/);
   const questionAt = submit.search(/else if \(isQuestion\) \{/);
   const draftAt = submit.search(/landVoiceDraft\(\s*heard,\s*correlation_id/);
-  assert.ok(wallAt >= 0 && liveOverrideAt >= 0 && questionAt >= 0 && draftAt >= 0);
+  assert.ok(wallAt >= 0 && liveOverrideAt >= 0 && mixedAt >= 0 && questionAt >= 0 && draftAt >= 0);
   assert.ok(wallAt < liveOverrideAt, "unclear live-command override precedes the question split");
-  assert.ok(liveOverrideAt < questionAt, "live command captions must not take the SENT question path");
+  assert.ok(liveOverrideAt < mixedAt, "live command captions must not take the question sheet path");
+  assert.ok(mixedAt < questionAt, "mixed utterances split before the question-only sheet");
   assert.ok(questionAt < draftAt, "true questions must not fall through to landVoiceDraft");
   const questionBranch = submit.slice(questionAt, draftAt);
   assert.match(questionBranch, /dropOptimistic\(correlation_id\)/);
+  assert.match(questionBranch, /openAnswerSheet\(/);
   assert.doesNotMatch(questionBranch, /landQueuedTask/);
   assert.doesNotMatch(questionBranch, /landVoiceDraft/);
+  assert.doesNotMatch(questionBranch, /openThreadLink/);
+  const sheet = src.slice(
+    src.indexOf("function openAnswerSheet("),
+    src.indexOf("function closeAnswerSheet("),
+  );
+  const bind = src.slice(
+    src.indexOf("function bindAnswerSheet("),
+    src.indexOf("async function sendAnswerClarify("),
+  );
+  assert.equal(
+    bind.split("openThreadLink(").length - 1,
+    1,
+    "question path may redirect to the thread only on escalation handoff",
+  );
+  assert.match(bind, /answerOpenThread/);
+  assert.match(sheet, /function openAnswerSheet\(/);
+  assert.match(src, /function scheduleAnswerWorkingPaint\(/);
+  assert.match(src, /function syncAnswerHandoffFromLedger\(/);
+  assert.match(src, /function applyInSheetHeard\(/);
+  assert.match(src, /ex.status === "handoff_command"/);
+  const wallBranch = submit.slice(wallAt, liveOverrideAt);
+  assert.match(wallBranch, /state.sheet === "answer"/);
+  assert.match(wallBranch, /applyInSheetHeard/);
 });
 
 test("unclear voice reuses the client row as a grey misheard card", () => {

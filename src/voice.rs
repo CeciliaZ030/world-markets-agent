@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::brain::BrainClient;
 use crate::speech_ontology::{self, Channel, LexiconEntry};
@@ -16,17 +16,21 @@ const CATALOG_TTL: Duration = Duration::from_secs(60);
 /// `action_ir` present → command (`kind: "voice"`).
 /// A money/worth frame without IR is an incomplete trade, not a question —
 /// `submit_heard` can still wall it as unclear. Only actual questions skip the ledger.
+/// Mixed utterances keep both parts: question never writes a ledger row.
 fn classify_voice_intent(
     normalized: &speech_ontology::NormalizedUtterance,
-) -> (&'static str, bool) {
-    if normalized.action_ir.is_some() {
-        ("voice", false)
-    } else if speech_ontology::utterance_is_question(&normalized.normalized_text) {
-        ("question", true)
-    } else if speech_ontology::utterance_has_money_frame(&normalized.normalized_text) {
-        ("voice", false)
-    } else {
-        ("question", true)
+) -> speech_ontology::UtteranceRoute {
+    speech_ontology::classify_utterance_route(
+        &normalized.normalized_text,
+        normalized.action_ir.as_ref(),
+    )
+}
+
+fn send_kind_of(route: &speech_ontology::UtteranceRoute) -> &'static str {
+    match route.kind {
+        speech_ontology::UtteranceKind::Command => "voice",
+        speech_ontology::UtteranceKind::Question => "question",
+        speech_ontology::UtteranceKind::Mixed => "mixed",
     }
 }
 
@@ -147,19 +151,44 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
         .pointer("/episode/id")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let correlation_id = if utterance_id.is_empty() {
-        format!(
-            "voice-{account_id}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-        )
-    } else {
-        utterance_id.clone()
-    };
+    let correlation_id = body
+        .get("correlation_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if utterance_id.is_empty() {
+                format!(
+                    "voice-{account_id}-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0)
+                )
+            } else {
+                utterance_id.clone()
+            }
+        });
 
-    let (send_kind, is_question) = classify_voice_intent(&normalized);
+    let route = classify_voice_intent(&normalized);
+    let send_kind = send_kind_of(&route);
+    let is_question = route.kind != speech_ontology::UtteranceKind::Command;
+    let question_text = route
+        .question_text
+        .clone()
+        .unwrap_or_else(|| normalized.normalized_text.clone());
+    let command_text = route.command_text.clone();
+    let context_ref = body.get("context_ref").cloned();
+    let referent = context_ref
+        .as_ref()
+        .and_then(|value| value.get("label"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let unbound = speech_ontology::utterance_has_unbound_deixis(&question_text);
+    let needs_clarify = is_question && unbound && referent.is_none();
     let send_payload = json!({
         "kind": send_kind,
         "message": normalized.normalized_text,
@@ -170,6 +199,10 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
         "action_ir": normalized.action_ir.as_ref().map(|ir| ir.to_json()),
         "slots": slots,
         "channel": normalized.channel.as_str(),
+        "question_text": route.question_text,
+        "command_text": route.command_text,
+        "context_ref": context_ref,
+        "parent_correlation_id": body.get("parent_correlation_id"),
     });
 
     Ok(json!({
@@ -185,6 +218,13 @@ pub fn ingest_voice(account_id: u64, body: &Value) -> Result<Value, String> {
         "grammar": normalized.grammar.as_str(),
         "action_ir": normalized.action_ir.as_ref().map(|ir| ir.to_json()),
         "question": is_question,
+        "utterance_kind": route.kind.as_str(),
+        "question_text": route.question_text,
+        "command_text": command_text,
+        "referent": referent,
+        "needs_clarify": needs_clarify,
+        "context_ref": context_ref,
+        "parent_correlation_id": body.get("parent_correlation_id"),
         "slots": slots,
         "proposals": proposed_confusables,
         "long_note": recorded.get("long_note"),
@@ -556,7 +596,10 @@ mod tests {
             &[],
         );
         assert!(out.action_ir.is_none());
-        assert_eq!(classify_voice_intent(&out), ("question", true));
+        assert_eq!(
+            classify_voice_intent(&out).kind,
+            speech_ontology::UtteranceKind::Question
+        );
         let free = speech_ontology::normalize_utterance(
             "explain the basis trade",
             speech_ontology::Channel::Speech,
@@ -564,7 +607,10 @@ mod tests {
             &[],
         );
         assert!(free.action_ir.is_none());
-        assert_eq!(classify_voice_intent(&free), ("question", true));
+        assert_eq!(
+            classify_voice_intent(&free).kind,
+            speech_ontology::UtteranceKind::Question
+        );
     }
 
     #[test]
@@ -576,7 +622,10 @@ mod tests {
             &[],
         );
         assert!(out.action_ir.is_none(), "{:?}", out.normalized_text);
-        assert_eq!(classify_voice_intent(&out), ("voice", false));
+        assert_eq!(
+            classify_voice_intent(&out).kind,
+            speech_ontology::UtteranceKind::Command
+        );
     }
 
     #[test]
@@ -588,7 +637,23 @@ mod tests {
             &[],
         );
         assert!(out.action_ir.is_some());
-        assert_eq!(classify_voice_intent(&out), ("voice", false));
+        assert_eq!(
+            classify_voice_intent(&out).kind,
+            speech_ontology::UtteranceKind::Command
+        );
+    }
+
+    #[test]
+    fn mixed_utterance_is_not_question_only() {
+        let out = speech_ontology::normalize_utterance(
+            "what's funding at — and if it's positive close half",
+            speech_ontology::Channel::Speech,
+            &[],
+            &[],
+        );
+        let route = classify_voice_intent(&out);
+        assert_eq!(route.kind, speech_ontology::UtteranceKind::Mixed);
+        assert_eq!(send_kind_of(&route), "mixed");
     }
 
     #[test]
@@ -601,6 +666,7 @@ mod tests {
         assert!(body.contains("classify_voice_intent"));
         assert!(body.contains(r#""kind": send_kind"#));
         assert!(body.contains(r#""question": is_question"#));
+        assert!(body.contains(r#""utterance_kind""#));
         assert!(!body.contains(r#""kind": "voice""#));
         assert!(!body.contains(r#""kind": "question""#));
     }

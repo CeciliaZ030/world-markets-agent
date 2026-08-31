@@ -311,6 +311,28 @@ impl BrainClient {
         self.post("/v1/voice/episode/close", body)
     }
 
+    pub(crate) fn get_answer(
+        &self,
+        account_id: u64,
+        correlation_id: &str,
+    ) -> Result<Value, String> {
+        let encoded: String = correlation_id
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect();
+        self.get(&format!("/v1/answers/{encoded}?account_id={account_id}"))
+    }
+
+    pub(crate) fn upsert_answer(&self, body: &Value) -> Result<Value, String> {
+        self.post("/v1/answers", body)
+    }
+
     pub(crate) fn heard(&self, body: &Value) -> Result<Value, String> {
         self.post("/v1/heard", body)
     }

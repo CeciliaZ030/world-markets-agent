@@ -781,6 +781,52 @@ pub fn ingest_voice_note(account_id: u64, body: &Value) -> Result<Value, String>
     crate::voice::ingest_voice(account_id, body)
 }
 
+pub fn load_answer(account_id: u64, correlation_id: &str) -> Result<Value, String> {
+    BrainClient::from_env().get_answer(account_id, correlation_id)
+}
+
+pub fn upsert_answer(account_id: u64, body: &Value) -> Result<Value, String> {
+    let mut payload = body.clone();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("account_id".to_string(), json!(account_id));
+    }
+    BrainClient::from_env().upsert_answer(&payload)
+}
+
+/// Open a working (or clarify) projection for a question. Never a ledger row.
+pub fn open_question_answer(account_id: u64, body: &Value) -> Result<Value, String> {
+    let mut payload = body.clone();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("account_id".to_string(), json!(account_id));
+        if obj.get("status").and_then(Value::as_str).is_none() {
+            obj.insert("status".to_string(), json!("working"));
+        }
+    }
+    BrainClient::from_env().upsert_answer(&payload)
+}
+
+pub fn position_referent_label(symbol: &str, side: Option<&str>, asset_type: &str) -> String {
+    match (side.filter(|s| !s.is_empty()), asset_type) {
+        (Some(side), _) => format!("{symbol} {side}"),
+        (None, "perp") => format!("{symbol} perp"),
+        _ => symbol.to_string(),
+    }
+}
+
+pub fn clarify_position_chips(account_id: u64) -> Vec<String> {
+    load_portfolio(account_id)
+        .map(|portfolio| {
+            portfolio
+                .positions
+                .into_iter()
+                .map(|row| {
+                    position_referent_label(&row.symbol, row.side.as_deref(), &row.asset_type)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Live captions while holding Record. Transcribes only; does not ingest.
 pub fn transcribe_live(account_id: u64, body: &Value) -> Result<Value, String> {
     crate::voice::transcribe_live(account_id, body)
