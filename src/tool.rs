@@ -27,6 +27,16 @@ pub(crate) const MARKET_DATA_API_KEY: Secret = Secret::new(
     "Optional market-data vendor API key. Unused by the default Yahoo feed.",
     false,
 );
+pub(crate) const TELEGRAM_BOT_TOKEN: Secret = Secret::new(
+    "TELEGRAM_BOT_TOKEN",
+    "BotFather token. Plugin attaches Mini App web_app buttons and chart photos when the Telegram host does not.",
+    false,
+);
+pub(crate) const WORLD_MINI_APP_URL: Secret = Secret::new(
+    "WORLD_MINI_APP_URL",
+    "Public HTTPS origin of world-mini-app, used for menu-button and inline web_app URLs.",
+    false,
+);
 
 #[derive(Clone, Default)]
 pub(crate) struct WorldMarketsApp {
@@ -1178,6 +1188,12 @@ impl DynAomiTool for RenderLookup {
             "message": message,
         });
         attach_rpc_trace(&app.client, before, &mut payload);
+        crate::mini_app::attach_lookup_chrome(kind.token(), &mut payload);
+        maybe_deliver_lookup_chrome(
+            &ctx,
+            kind.token(),
+            payload.get("message").and_then(Value::as_str),
+        );
         app.project_pending_answer(
             &ctx,
             args.account_id,
@@ -1806,6 +1822,74 @@ fn resolve_preview_qty(
         mark,
     )
     .map(|r| r.base_qty)
+}
+
+fn telegram_chat_id(ctx: &DynToolCallCtx) -> Option<u64> {
+    ctx.attribute_u64(&["telegram", "chat", "id"])
+        .or_else(|| ctx.attribute_u64(&["telegram", "user", "id"]))
+        .or_else(|| ctx.attribute_u64(&["chat", "id"]))
+}
+
+fn ctx_secret(ctx: &DynToolCallCtx, name: &str) -> Option<String> {
+    resolve_secret_value(ctx, None, name, "")
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn maybe_deliver_lookup_chrome(ctx: &DynToolCallCtx, token: &str, message: Option<&str>) {
+    if token != "b" && token != "p" {
+        return;
+    }
+    let Some(chat_id) = telegram_chat_id(ctx) else {
+        return;
+    };
+    let Some(bot_token) = ctx_secret(ctx, TELEGRAM_BOT_TOKEN.name) else {
+        return;
+    };
+    let origin = ctx_secret(ctx, WORLD_MINI_APP_URL.name);
+    let text = message.unwrap_or("View portfolio");
+    let _ = crate::mini_app::post_web_app_button_at(
+        &bot_token,
+        chat_id,
+        text,
+        "View portfolio",
+        "/",
+        origin.as_deref(),
+    );
+}
+
+fn maybe_deliver_chart(ctx: &DynToolCallCtx, value: &Value) {
+    let Some(chat_id) = telegram_chat_id(ctx) else {
+        return;
+    };
+    let Some(bot_token) = ctx_secret(ctx, TELEGRAM_BOT_TOKEN.name) else {
+        return;
+    };
+    let origin = ctx_secret(ctx, WORLD_MINI_APP_URL.name);
+    let caption = value.get("caption").and_then(Value::as_str).unwrap_or("");
+    let web_path = value
+        .pointer("/mini_app/path")
+        .and_then(Value::as_str)
+        .unwrap_or("/");
+    if let Some(image_path) = value.get("image_path").and_then(Value::as_str) {
+        let _ = crate::mini_app::post_chart_photo_at(
+            &bot_token,
+            chat_id,
+            image_path,
+            caption,
+            web_path,
+            origin.as_deref(),
+        );
+        return;
+    }
+    let _ = crate::mini_app::post_web_app_button_at(
+        &bot_token,
+        chat_id,
+        caption,
+        "Open chart",
+        web_path,
+        origin.as_deref(),
+    );
 }
 
 fn preview_effect_for_receipt(
@@ -2756,12 +2840,10 @@ impl DynAomiTool for RenderMarketChart {
     const NAME: &'static str = "render_market_chart";
     const DESCRIPTION: &'static str = "Render a candlestick chart for a ticker over d/w/m. Send `caption` verbatim. Never invent last or change. Never executes.";
 
-    fn run(
-        _app: &WorldMarketsApp,
-        args: Self::Args,
-        _ctx: DynToolCallCtx,
-    ) -> Result<Value, String> {
-        crate::marketdata::render_chart_tool(&args.ticker, &args.period)
+    fn run(_app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let value = crate::marketdata::render_chart_tool(&args.ticker, &args.period)?;
+        maybe_deliver_chart(&ctx, &value);
+        Ok(value)
     }
 }
 
@@ -3974,6 +4056,8 @@ mod tests {
         assert_eq!(index["reply_verbatim"], true);
         assert_eq!(index["token"], "index");
         assert_eq!(index["message"], crate::lookups::INDEX_LINE);
+        assert!(index.get("mini_app").is_none());
+        assert!(index.get("controls").is_none());
 
         let dp = RenderLookup::run(
             &app,

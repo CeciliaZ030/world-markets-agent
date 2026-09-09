@@ -81,7 +81,11 @@ dyn_aomi_app!(
         tool::SetWorldConsent,
         tool::CloseWorldEpisode,
     ],
-    secrets = [tool::MARKET_DATA_API_KEY],
+    secrets = [
+        tool::MARKET_DATA_API_KEY,
+        tool::TELEGRAM_BOT_TOKEN,
+        tool::WORLD_MINI_APP_URL,
+    ],
     namespaces = ["evm-core"],
     skill = {
         id: "world-markets/trading",
