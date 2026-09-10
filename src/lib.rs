@@ -138,11 +138,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manifest_preamble_fits_backend_input_cap() {
+    fn manifest_preamble_reserves_space_for_backend_harness() {
         let manifest = tool::WorldMarketsApp::default().manifest();
-        // aomi-service SDK 5 runtime exposure contract: bytes, not tokens.
+        // The 32 KB cap applies AFTER compose_preamble adds the harness, EVM
+        // account context and provider profile. Reserve 20 KB for that host text;
+        // comparing the raw manifest to 32 KB missed a real startup failure.
         assert!(
-            manifest.preamble.len() <= 32_000,
+            manifest.preamble.len() + 20_000 <= 32_000,
             "preamble is {} bytes",
             manifest.preamble.len()
         );
@@ -270,58 +272,33 @@ mod tests {
     }
 
     #[test]
-    fn composed_preamble_includes_lookup_rules() {
-        let header = preamble::ROLE_HEADER_FOR_TEST;
-        assert!(
-            header.contains("precise financial operator"),
-            "role header must name the operator"
-        );
-        assert!(
-            header.contains("turn contract"),
-            "role header must point at the turn contract"
-        );
-        assert!(
-            !header.contains("Terse lookups")
-                && !header.contains("render_lookup")
-                && !header.contains("render_market_chart")
-                && !header.contains("clear_market_charts"),
-            "role header must not carry tool names or token-dispatch rules"
-        );
-
-        let lookups = include_str!("skill/lookups.md");
-        assert!(
-            preamble::COMPOSED.contains(lookups),
-            "composed preamble must embed lookups.md after the role header"
-        );
-        assert!(
-            lookups.contains("whole-message match only") || lookups.contains("whole intent"),
-            "lookups.md must carry the terse-token dispatch"
-        );
-        assert!(
-            lookups.contains("cancel task") && lookups.contains("Lone `d` is dollarpower"),
-            "lookups.md must carry the relocated chart/cancel dispatch"
-        );
-        assert!(
-            preamble::COMPOSED.contains("Portfolio"),
-            "composed preamble must include balance lookup format"
-        );
-        assert!(
-            preamble::COMPOSED.contains("open_instructions"),
-            "composed preamble must tell the agent to load ledger open_instructions"
-        );
-        assert!(
-            preamble::COMPOSED.contains("exemplars.md")
-                || preamble::COMPOSED.contains("# Exemplars"),
-            "composed preamble must include exemplars"
-        );
-        assert!(
-            preamble::COMPOSED.contains("# Turn contract"),
-            "composed preamble must include the turn contract"
-        );
-        assert!(
-            preamble::COMPOSED.len() > preamble::ROLE_LEN + 5000,
-            "composed preamble must embed skill sections for aomi-run"
-        );
+    fn preamble_keeps_safety_and_routes_detailed_operating_rules() {
+        assert!(preamble::ROLE_HEADER_FOR_TEST.contains("precise financial operator"));
+        let skills = tool::WorldMarketsApp::default().skills();
+        for name in ["instructions", "lookups", "action_rules", "exemplars"] {
+            let section = skills
+                .iter()
+                .flat_map(|skill| &skill.sections)
+                .find(|section| section.name == name)
+                .expect("operating rules remain available");
+            assert!(
+                !preamble::COMPOSED.contains(&section.content),
+                "detailed rules must not consume the startup preamble budget"
+            );
+        }
+        for content in [
+            include_str!("skill/safety.md"),
+            include_str!("skill/guest.md"),
+            include_str!("skill/share.md"),
+        ] {
+            assert!(
+                preamble::COMPOSED.contains(content),
+                "always-active policy missing"
+            );
+        }
+        assert!(preamble::COMPOSED.contains("Before any World tool call"));
+        assert!(preamble::COMPOSED.contains("Skill activation precedes"));
+        assert!(preamble::COMPOSED.contains("again each serve cycle"));
     }
 
     #[test]
@@ -354,10 +331,6 @@ mod tests {
             preamble::COMPOSED.trim_end().ends_with(contract),
             "turn-contract.md must be the final section of COMPOSED"
         );
-        assert!(
-            preamble::COMPOSED.contains(include_str!("skill/exemplars.md")),
-            "COMPOSED must include exemplars.md after action-rules"
-        );
     }
 
     #[test]
@@ -379,24 +352,11 @@ mod tests {
         for skill in &skills {
             assert!(skill.guard.is_none());
             assert!(skill.hooks.is_empty());
-            if matches!(
-                skill.id.as_str(),
-                "world-markets/trading" | "world-markets/reporting"
-            ) {
-                for section in &skill.sections {
-                    assert!(
-                        preamble::COMPOSED.contains(&section.content),
-                        "always-active policy missing {}",
-                        section.name
-                    );
-                }
-            } else {
-                assert!(
-                    preamble::COMPOSED.contains(&skill.id),
-                    "preamble must route detailed work to {}",
-                    skill.id
-                );
-            }
+            assert!(
+                preamble::COMPOSED.contains(&skill.id),
+                "preamble must route detailed work to {}",
+                skill.id
+            );
         }
     }
 }

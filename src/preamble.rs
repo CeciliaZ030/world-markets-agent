@@ -1,6 +1,6 @@
-//! Always-active World policy and response contract. Detailed workflows and
-//! reference material live in SDK 5 skills so the preamble fits the backend
-//! 32 KB input limit without discarding operational instructions.
+//! Always-active safety and response contract. Detailed operating instructions
+//! live in SDK 5 skills. The app fragment must leave room within the backend
+//! 32 KB cap for the shared harness, chain context, and model instructions.
 
 const SEP: &str = "\n\n---\n\n";
 
@@ -67,19 +67,11 @@ pub(crate) const HOSTED_SKILL_SECTION_NAMES: &[&str] = &[
 
 /// Always-active prompt. SDK 5 skill activation supplies detailed workflows.
 ///
-/// Order: role and skill routing, core policy (exemplars after action-rules),
+/// Order: role and skill routing, safety,
 /// guest, share, turn-contract LAST (static recency for the behavioral kernel).
 pub(crate) const COMPOSED: &str = concat!(
     role_header!(),
-    "\n\nDetailed workflows and reference material are available through the host skill engine. Before handling execution, trade amendments or order management, activate world-markets/execution. Before watches, health, research, voice or recurring tasks, activate world-markets/monitoring. Before venue, account-model, risk or product explanations, activate world-markets/reference. Follow those instructions before using the relevant tools; never invent an omitted workflow. Core policy and the turn contract below remain active on every turn.",
-    "\n\n---\n\n",
-    include_str!("skill/instructions.md"),
-    "\n\n---\n\n",
-    include_str!("skill/lookups.md"),
-    "\n\n---\n\n",
-    include_str!("skill/action-rules.md"),
-    "\n\n---\n\n",
-    include_str!("skill/exemplars.md"),
+    "\n\nBefore any World tool call, activate world-markets/trading and world-markets/reporting to load account rules, lookup dispatch, action rules and response templates. Skill activation precedes the turn contract's first business-tool call. Before handling execution, trade amendments or order management, also activate world-markets/execution. Before watches, health, research, voice or recurring tasks, activate world-markets/monitoring. Before venue, account-model, risk or product explanations, activate world-markets/reference. Follow those instructions before using the relevant tools; never invent an omitted workflow. Safety, guest and share handling, and the turn contract below remain active on every turn. Activate the relevant skills again each serve cycle; never infer omitted rules from memory.",
     "\n\n---\n\n",
     include_str!("skill/safety.md"),
     "\n\n---\n\n",
@@ -89,9 +81,6 @@ pub(crate) const COMPOSED: &str = concat!(
     "\n\n---\n\n",
     include_str!("skill/turn-contract.md"),
 );
-
-#[cfg(test)]
-pub(crate) const ROLE_LEN: usize = ROLE_HEADER_FOR_TEST.len();
 
 #[allow(dead_code)]
 const _SEP: &str = SEP;
