@@ -87,31 +87,94 @@ dyn_aomi_app!(
         tool::WORLD_MINI_APP_URL,
     ],
     namespaces = ["evm-core"],
-    skill = {
-        id: "world-markets/trading",
-        sections: {
-            instructions: "skill/instructions.md",
-            lookups: "skill/lookups.md",
-            workflows: "skill/workflows.md",
-            action_rules: "skill/action-rules.md",
-            exemplars: "skill/exemplars.md",
-            safety: "skill/safety.md",
-            atlas: "skill/reference/atlas.md",
-            products: "skill/reference/products.md",
-            account_model: "skill/reference/account-model.md",
-            venue: "skill/reference/venue.md",
-            dollarpower: "skill/reference/dollarpower.md",
-            guardian: "skill/reference/guardian.md",
-            notifications: "skill/reference/notifications.md",
-            strategy_brain: "skill/reference/strategy-brain.md",
-            turn_contract: "skill/turn-contract.md",
+    skills = [
+        {
+            id: "world-markets/trading",
+            description: "World Markets account context, mandate-aware trading rules, and terse lookups.",
+            sections: {
+                instructions: "skill/instructions.md",
+                lookups: "skill/lookups.md",
+            },
         },
-    }
+        {
+            id: "world-markets/execution",
+            description: "World order previews, atomic execution, receipts, blocks, guardian and carry workflows.",
+            sections: { workflows: "skill/workflows.md" },
+        },
+        {
+            id: "world-markets/monitoring",
+            description: "World standing instructions, health, research, watches, tasks, and advisory workflows.",
+            sections: { workflows_monitoring: "skill/workflows-monitoring.md" },
+        },
+        {
+            id: "world-markets/reporting",
+            description: "World response formats, action rules, examples, and trading safety requirements.",
+            sections: {
+                action_rules: "skill/action-rules.md",
+                exemplars: "skill/exemplars.md",
+                safety: "skill/safety.md",
+            },
+        },
+        {
+            id: "world-markets/reference",
+            description: "World venue, account and risk concepts, notifications, and the final turn contract.",
+            sections: {
+                atlas: "skill/reference/atlas.md",
+                products: "skill/reference/products.md",
+                account_model: "skill/reference/account-model.md",
+                venue: "skill/reference/venue.md",
+                dollarpower: "skill/reference/dollarpower.md",
+                guardian: "skill/reference/guardian.md",
+                notifications: "skill/reference/notifications.md",
+                strategy_brain: "skill/reference/strategy-brain.md",
+                turn_contract: "skill/turn-contract.md",
+            },
+        },
+    ]
 );
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_tool_schema_has_explicit_object_properties() {
+        fn check(schema: &serde_json::Value, path: &str) {
+            match schema {
+                serde_json::Value::Object(fields) => {
+                    if fields.get("type").is_some_and(|kind| {
+                        kind == "object"
+                            || kind
+                                .as_array()
+                                .is_some_and(|types| types.iter().any(|kind| kind == "object"))
+                    }) {
+                        assert!(
+                            fields
+                                .get("properties")
+                                .is_some_and(|value| value.is_object()),
+                            "provider-facing object schema needs properties: {path}"
+                        );
+                    }
+                    for (name, value) in fields {
+                        check(value, &format!("{path}/{name}"));
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for (index, value) in values.iter().enumerate() {
+                        check(value, &format!("{path}/{index}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let manifest = tool::WorldMarketsApp::default().manifest();
+        assert_eq!(manifest.sdk_version, "5.0.0");
+        assert!(!manifest.tools.is_empty());
+        for tool in manifest.tools {
+            check(&tool.parameters_schema, &tool.name);
+        }
+    }
 
     #[test]
     fn composed_preamble_includes_lookup_rules() {
@@ -175,12 +238,10 @@ mod tests {
         // - guest.md / share.md: COMPOSED-only; hosted omits them (pre-existing).
         //   Flag: Telegram is where start=g_/start=ref_ guests arrive — owner to
         //   confirm whether guest copy is composed elsewhere hosted-side.
-        let skill = tool::WorldMarketsApp::default()
-            .skill()
-            .expect("World Markets must ship its app-scoped skill");
-        let hosted: Vec<&str> = skill
-            .sections
+        let skills = tool::WorldMarketsApp::default().skills();
+        let hosted: Vec<&str> = skills
             .iter()
+            .flat_map(|skill| &skill.sections)
             .map(|section| section.name.as_str())
             .collect();
         assert_eq!(hosted.as_slice(), preamble::HOSTED_SKILL_SECTION_NAMES);
@@ -208,35 +269,28 @@ mod tests {
 
     #[test]
     fn app_skill_is_valid_and_mandate_aware() {
-        let skill = tool::WorldMarketsApp::default()
-            .skill()
-            .expect("World Markets must ship its app-scoped skill");
+        let skills = tool::WorldMarketsApp::default().skills();
 
-        assert_eq!(skill.id, "world-markets/trading");
+        assert_eq!(skills.len(), 5);
+        assert_eq!(skills[0].id, "world-markets/trading");
         assert_eq!(
-            skill
-                .sections
+            skills
                 .iter()
+                .flat_map(|skill| &skill.sections)
                 .map(|section| section.name.as_str())
                 .collect::<Vec<_>>(),
             preamble::HOSTED_SKILL_SECTION_NAMES.to_vec()
         );
-        assert!(skill.guard.is_none());
-        assert!(skill.hooks.is_empty());
-        // aomi-sdk 4.0.0 caps app skills at 8000 tokens (chars/4). The
-        // design-agent payload already exceeds that on workflows.md alone;
-        // adding exemplars + turn-contract is required (P0) and widens the
-        // overrun. Other validate errors still fail the test. See
-        // design-review/TICKETS-adherence-P2.md P2-7 and the PR "For the
-        // design agent" note.
-        match skill.validate("world-markets") {
-            Ok(()) => {}
-            Err(errors) => {
+        aomi_sdk::validate_app_skills("world-markets", &skills)
+            .expect("all shipped skills must pass the same validation as the backend loader");
+        for skill in &skills {
+            assert!(skill.guard.is_none());
+            assert!(skill.hooks.is_empty());
+            for section in &skill.sections {
                 assert!(
-                    errors
-                        .iter()
-                        .all(|e| e.contains("over the") && e.contains("budget")),
-                    "unexpected skill validation errors: {errors:?}"
+                    preamble::COMPOSED.contains(&section.content),
+                    "hosted section {} must preserve the composed instructions",
+                    section.name
                 );
             }
         }
