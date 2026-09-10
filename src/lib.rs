@@ -138,6 +138,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_tool_schema_is_openai_strict_compatible() {
+        /// Does this node declare itself an object? `["object", "null"]` is the
+        /// nullable spelling and carries the same obligations.
+        fn is_object(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+            let declared = match object.get("type") {
+                Some(serde_json::Value::String(name)) => name == "object",
+                Some(serde_json::Value::Array(names)) => {
+                    names.iter().any(|name| name.as_str() == Some("object"))
+                }
+                _ => false,
+            };
+            declared || object.contains_key("properties")
+        }
+
+        fn walk(node: &serde_json::Value, path: &str, offenses: &mut Vec<String>) {
+            let Some(object) = node.as_object() else {
+                // A bare `true` is JSON Schema's "anything" — the other
+                // rendering of an untyped field, and equally rejected.
+                if node.is_boolean() && !path.ends_with("additionalProperties") {
+                    offenses.push(format!("{path}: bare boolean schema"));
+                }
+                return;
+            };
+
+            let typed = ["type", "$ref", "anyOf", "oneOf", "allOf"]
+                .iter()
+                .any(|key| object.contains_key(*key));
+            if !path.is_empty() && !typed {
+                offenses.push(format!("{path}: no `type` (declare the field's shape)"));
+            }
+
+            // Absent is fine — `rig` fills in `false`. Anything else is sent
+            // as-is and strict mode rejects it.
+            if is_object(object)
+                && let Some(extra) = object.get("additionalProperties")
+                && extra != &serde_json::Value::Bool(false)
+            {
+                offenses.push(format!(
+                    "{path}.additionalProperties: {extra} (strict mode admits only `false`; \
+                     name the fields instead of using a map)"
+                ));
+            }
+
+            for (key, value) in object {
+                let child = |segment: &str| {
+                    if path.is_empty() {
+                        segment.to_string()
+                    } else {
+                        format!("{path}.{segment}")
+                    }
+                };
+                match key.as_str() {
+                    "properties" | "$defs" | "definitions" => {
+                        for (name, entry) in value.as_object().into_iter().flatten() {
+                            walk(entry, &child(&format!("{key}.{name}")), offenses);
+                        }
+                    }
+                    "items" | "additionalProperties" => walk(value, &child(key), offenses),
+                    "anyOf" | "oneOf" | "allOf" => {
+                        for (index, entry) in value.as_array().into_iter().flatten().enumerate() {
+                            walk(entry, &child(&format!("{key}[{index}]")), offenses);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let app = tool::WorldMarketsApp::default();
+        for tool in app.tools() {
+            let mut offenses = Vec::new();
+            walk(&tool.parameters_schema, "", &mut offenses);
+            assert!(
+                offenses.is_empty(),
+                "{} is not strict-compatible:\n  {}",
+                tool.name,
+                offenses.join("\n  ")
+            );
+        }
+    }
+
+    #[test]
     fn every_tool_schema_has_explicit_object_properties() {
         fn check(schema: &serde_json::Value, path: &str) {
             match schema {
