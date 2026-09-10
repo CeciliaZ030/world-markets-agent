@@ -138,6 +138,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn manifest_preamble_fits_backend_input_cap() {
+        let manifest = tool::WorldMarketsApp::default().manifest();
+        // aomi-service SDK 5 runtime exposure contract: bytes, not tokens.
+        assert!(
+            manifest.preamble.len() <= 32_000,
+            "preamble is {} bytes",
+            manifest.preamble.len()
+        );
+    }
+
+    #[test]
     fn every_tool_schema_is_openai_strict_compatible() {
         /// Does this node declare itself an object? `["object", "null"]` is the
         /// nullable spelling and carries the same obligations.
@@ -330,7 +341,7 @@ mod tests {
         assert_eq!(
             &hosted[..hosted.len() - 1],
             preamble::SHARED_CORE_SECTION_NAMES,
-            "hosted core must match COMPOSED's shared core (instructions…strategy_brain)"
+            "all detailed workflow and reference sections must remain in the skill catalog"
         );
         assert_eq!(
             hosted.last().copied(),
@@ -368,11 +379,22 @@ mod tests {
         for skill in &skills {
             assert!(skill.guard.is_none());
             assert!(skill.hooks.is_empty());
-            for section in &skill.sections {
+            if matches!(
+                skill.id.as_str(),
+                "world-markets/trading" | "world-markets/reporting"
+            ) {
+                for section in &skill.sections {
+                    assert!(
+                        preamble::COMPOSED.contains(&section.content),
+                        "always-active policy missing {}",
+                        section.name
+                    );
+                }
+            } else {
                 assert!(
-                    preamble::COMPOSED.contains(&section.content),
-                    "hosted section {} must preserve the composed instructions",
-                    section.name
+                    preamble::COMPOSED.contains(&skill.id),
+                    "preamble must route detailed work to {}",
+                    skill.id
                 );
             }
         }

@@ -1,8 +1,6 @@
-//! Composed system prompt for LLM runtimes that read only [`DynManifest::preamble`].
-//!
-//! The full preamble preserves existing instruction order. SDK 5 additionally
-//! exposes these instructions as bounded, described entries in `manifest.skills`
-//! for explicit activation by the host skill engine.
+//! Always-active World policy and response contract. Detailed workflows and
+//! reference material live in SDK 5 skills so the preamble fits the backend
+//! 32 KB input limit without discarding operational instructions.
 
 const SEP: &str = "\n\n---\n\n";
 
@@ -21,8 +19,8 @@ The turn contract at the end of this prompt is the last word on every message: c
 #[cfg(test)]
 pub(crate) const ROLE_HEADER_FOR_TEST: &str = role_header!();
 
-/// Shared core section names, in compose order, shared by `COMPOSED` and the hosted
-/// `skills = [...]` list. `turn_contract` is last in both runtimes.
+/// Complete skill section order, including details omitted from `COMPOSED`.
+/// The turn contract remains last in both the preamble and the skill list.
 ///
 /// Allowed differences (documented here so the parity test does not paper over them):
 /// - role header: COMPOSED-only (`ROLE_HEADER`)
@@ -67,41 +65,23 @@ pub(crate) const HOSTED_SKILL_SECTION_NAMES: &[&str] = &[
     "turn_contract",
 ];
 
-/// Full prompt for `aomi-run` and any runtime that skips `manifest.skills`.
+/// Always-active prompt. SDK 5 skill activation supplies detailed workflows.
 ///
-/// Order: role header, shared core (exemplars after action-rules, before safety),
+/// Order: role and skill routing, core policy (exemplars after action-rules),
 /// guest, share, turn-contract LAST (static recency for the behavioral kernel).
 pub(crate) const COMPOSED: &str = concat!(
     role_header!(),
+    "\n\nDetailed workflows and reference material are available through the host skill engine. Before handling execution, trade amendments or order management, activate world-markets/execution. Before watches, health, research, voice or recurring tasks, activate world-markets/monitoring. Before venue, account-model, risk or product explanations, activate world-markets/reference. Follow those instructions before using the relevant tools; never invent an omitted workflow. Core policy and the turn contract below remain active on every turn.",
     "\n\n---\n\n",
     include_str!("skill/instructions.md"),
     "\n\n---\n\n",
     include_str!("skill/lookups.md"),
-    "\n\n---\n\n",
-    include_str!("skill/workflows.md"),
-    include_str!("skill/workflows-monitoring.md"),
     "\n\n---\n\n",
     include_str!("skill/action-rules.md"),
     "\n\n---\n\n",
     include_str!("skill/exemplars.md"),
     "\n\n---\n\n",
     include_str!("skill/safety.md"),
-    "\n\n---\n\n",
-    include_str!("skill/reference/atlas.md"),
-    "\n\n---\n\n",
-    include_str!("skill/reference/products.md"),
-    "\n\n---\n\n",
-    include_str!("skill/reference/account-model.md"),
-    "\n\n---\n\n",
-    include_str!("skill/reference/venue.md"),
-    "\n\n---\n\n",
-    include_str!("skill/reference/dollarpower.md"),
-    "\n\n---\n\n",
-    include_str!("skill/reference/guardian.md"),
-    "\n\n---\n\n",
-    include_str!("skill/reference/notifications.md"),
-    "\n\n---\n\n",
-    include_str!("skill/reference/strategy-brain.md"),
     "\n\n---\n\n",
     include_str!("skill/guest.md"),
     "\n\n---\n\n",
