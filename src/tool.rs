@@ -62,8 +62,26 @@ struct LiveVerdictInput<'a> {
 
 pub(crate) struct ListWorldAssets;
 
-#[derive(Debug, Deserialize, JsonSchema)]
-pub(crate) struct ListWorldAssetsArgs {}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NoArgs {}
+
+impl JsonSchema for NoArgs {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "NoArgs".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        })
+        .try_into()
+        .expect("empty tool argument schema")
+    }
+}
 
 pub(crate) struct GetWorldAccount;
 
@@ -1025,7 +1043,7 @@ impl WorldMarketsApp {
 
 impl DynAomiTool for ListWorldAssets {
     type App = WorldMarketsApp;
-    type Args = ListWorldAssetsArgs;
+    type Args = NoArgs;
     const NAME: &'static str = "list_world_assets";
     const DESCRIPTION: &'static str = "List live World Markets assets and their token IDs, symbols, addresses, decimals, and risk parameters.";
 
@@ -2849,12 +2867,9 @@ impl DynAomiTool for RenderMarketChart {
 
 pub(crate) struct RefreshMarketUniverse;
 
-#[derive(Debug, Deserialize, JsonSchema)]
-pub(crate) struct RefreshMarketUniverseArgs {}
-
 impl DynAomiTool for RefreshMarketUniverse {
     type App = WorldMarketsApp;
-    type Args = RefreshMarketUniverseArgs;
+    type Args = NoArgs;
     const NAME: &'static str = "refresh_market_universe";
     const DESCRIPTION: &'static str =
         "Rebuild the cached market-data asset universe from the configured feed. Never executes.";
@@ -2870,12 +2885,9 @@ impl DynAomiTool for RefreshMarketUniverse {
 
 pub(crate) struct ClearMarketCharts;
 
-#[derive(Debug, Deserialize, JsonSchema)]
-pub(crate) struct ClearMarketChartsArgs {}
-
 impl DynAomiTool for ClearMarketCharts {
     type App = WorldMarketsApp;
-    type Args = ClearMarketChartsArgs;
+    type Args = NoArgs;
     const NAME: &'static str = "clear_market_charts";
     const DESCRIPTION: &'static str =
         "Delete stored candlestick PNG files. Send `caption` verbatim. Never executes.";

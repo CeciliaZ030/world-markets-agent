@@ -1,9 +1,8 @@
 //! Composed system prompt for LLM runtimes that read only [`DynManifest::preamble`].
 //!
-//! `aomi-run` (aomi-sdk 4.0.0) does **not** fold `manifest.skill` sections into the
-//! agent prompt — only this string is sent. The hosted Aomi backend composes
-//! skill sections separately, so we keep the `skill = { ... }` block in `lib.rs`
-//! for release validation and staging.
+//! The full preamble preserves existing instruction order. SDK 5 additionally
+//! exposes these instructions as bounded, described entries in `manifest.skills`
+//! for explicit activation by the host skill engine.
 
 const SEP: &str = "\n\n---\n\n";
 
@@ -23,7 +22,7 @@ The turn contract at the end of this prompt is the last word on every message: c
 pub(crate) const ROLE_HEADER_FOR_TEST: &str = role_header!();
 
 /// Shared core section names, in compose order, shared by `COMPOSED` and the hosted
-/// `skill = { ... }` list. `turn_contract` is last in both runtimes.
+/// `skills = [...]` list. `turn_contract` is last in both runtimes.
 ///
 /// Allowed differences (documented here so the parity test does not paper over them):
 /// - role header: COMPOSED-only (`ROLE_HEADER`)
@@ -33,6 +32,7 @@ pub(crate) const SHARED_CORE_SECTION_NAMES: &[&str] = &[
     "instructions",
     "lookups",
     "workflows",
+    "workflows_monitoring",
     "action_rules",
     "exemplars",
     "safety",
@@ -46,12 +46,13 @@ pub(crate) const SHARED_CORE_SECTION_NAMES: &[&str] = &[
     "strategy_brain",
 ];
 
-/// Hosted `skill.sections` names in compose order. `turn_contract` is last.
+/// Hosted `skills` section names in compose order. `turn_contract` is last.
 #[cfg(test)]
 pub(crate) const HOSTED_SKILL_SECTION_NAMES: &[&str] = &[
     "instructions",
     "lookups",
     "workflows",
+    "workflows_monitoring",
     "action_rules",
     "exemplars",
     "safety",
@@ -66,7 +67,7 @@ pub(crate) const HOSTED_SKILL_SECTION_NAMES: &[&str] = &[
     "turn_contract",
 ];
 
-/// Full prompt for `aomi-run` and any runtime that skips `manifest.skill`.
+/// Full prompt for `aomi-run` and any runtime that skips `manifest.skills`.
 ///
 /// Order: role header, shared core (exemplars after action-rules, before safety),
 /// guest, share, turn-contract LAST (static recency for the behavioral kernel).
@@ -78,6 +79,7 @@ pub(crate) const COMPOSED: &str = concat!(
     include_str!("skill/lookups.md"),
     "\n\n---\n\n",
     include_str!("skill/workflows.md"),
+    include_str!("skill/workflows-monitoring.md"),
     "\n\n---\n\n",
     include_str!("skill/action-rules.md"),
     "\n\n---\n\n",
