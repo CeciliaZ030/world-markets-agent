@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Talk to the hosted World Markets agent (same plugin Telegram uses).
+# Talk to the hosted World Markets agent (the same app the hosted bot runs).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
