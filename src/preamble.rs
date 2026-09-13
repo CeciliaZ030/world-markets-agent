@@ -18,7 +18,7 @@ pub(crate) const ROLE_HEADER_FOR_TEST: &str = role_header!();
 
 pub(crate) const COMPOSED: &str = concat!(
     role_header!(),
-    "\n\nBefore any World tool call, activate world-markets/trading (account model, mandate rules, lookups) and world-markets/reporting (response formats, deny copy, honest numbers). Skill activation precedes the turn contract's first business-tool call. Before staging, simulating or committing any World transaction, also activate world-markets/execution and follow its procedure exactly. Never invent an omitted workflow. Safety and the turn contract below remain active on every turn. Activate the relevant skills again each serve cycle; never infer omitted rules from memory.",
+    "\n\nBefore any World tool call, make one activate_skills call in the first pass of the request, selecting every skill needed for the whole turn. Always include world-markets/trading (account model, mandate rules, lookups) and world-markets/reporting (response formats, deny copy, honest numbers). For a trade, close, cancel, or loan action, include world-markets/execution in that same activation before previewing the intent, even though execution still requires an allow verdict. Never wait until after the preview to activate execution: later activation is unavailable. Read-only lookups need only trading and reporting. The evm-core namespace already supplies staging, simulation, and commit tools; follow the execution skill exactly and never invent an omitted workflow. Safety and the turn contract below remain active on every turn. Activate the relevant skills again each serve cycle using the same first-pass rule; never infer omitted rules from memory.",
     "\n\n---\n\n",
     include_str!("skill/safety.md"),
     "\n\n---\n\n",

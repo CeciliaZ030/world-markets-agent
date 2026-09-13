@@ -44,7 +44,7 @@ dyn_aomi_app!(
         },
         {
             id: "world-markets/execution",
-            description: "World order execution procedure: allow verdict → resolve book → pack order word → evm_stage_tx → simulate_batch → evm_commit_txs, guarded to the exchange contract.",
+            description: "Activate together with trading and reporting in the first pass for every World action, before preview. Procedure: allow verdict → resolve book → pack order word → evm_stage_tx → simulate_batch → evm_commit_txs, guarded to the exchange contract.",
             sections: { workflow: "skill/execution.md" },
             guard: "skill/guard.json",
         },
@@ -218,6 +218,9 @@ mod tests {
             "turn-contract.md must be the final section of COMPOSED"
         );
         assert!(preamble::COMPOSED.contains("Before any World tool call"));
+        assert!(preamble::COMPOSED.contains("one activate_skills call in the first pass"));
+        assert!(preamble::COMPOSED.contains("before previewing the intent"));
+        assert!(!preamble::COMPOSED.contains("also activate"));
         assert!(preamble::COMPOSED.contains("again each serve cycle"));
         for banned in ["Telegram", "sidecar", "Mini App", "render_lookup"] {
             assert!(
