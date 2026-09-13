@@ -214,6 +214,14 @@ impl Default for WorldClient {
 }
 
 impl WorldClient {
+    #[cfg(test)]
+    pub(crate) fn with_rpc(rpc: RpcTransport) -> Self {
+        Self {
+            rpc,
+            exchange: DEFAULT_EXCHANGE.parse().unwrap(),
+        }
+    }
+
     pub(crate) fn exchange(&self) -> String {
         format!("{:#x}", self.exchange)
     }

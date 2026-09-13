@@ -308,9 +308,9 @@ impl WorldMarketsApp {
                 })
             })
         };
-        explicit
-            .or_else(|| from_value(ctx.attribute_path(&["handover", "account_ref"])))
+        from_value(ctx.attribute_path(&["handover", "account_ref"]))
             .or_else(|| from_value(ctx.attribute_path(&["handover", "mandate", "account", "id"])))
+            .or(explicit)
             .or_else(Self::local_account_id)
     }
 
@@ -332,7 +332,9 @@ impl WorldMarketsApp {
     /// The client for this call: the host's chain must be the World chain,
     /// and a handover may pin the exchange address it was issued against.
     fn client_for(&self, ctx: &DynToolCallCtx) -> Result<WorldClient, String> {
-        if let Some(chain_id) = ctx.attribute_u64(&["domain", "evm", "chain_id"])
+        if let Some(chain_id) = ctx
+            .attribute_u64(&["handover", "chain_id"])
+            .or_else(|| ctx.attribute_u64(&["domain", "evm", "chain_id"]))
             && chain_id != self.client.chain_id()
         {
             return Err(format!(
@@ -359,9 +361,12 @@ impl WorldMarketsApp {
         ctx: &DynToolCallCtx,
     ) -> Result<AccountAccess, String> {
         let account_id = Self::account_id(ctx, account_id);
-        let owner_wallet = wallet_address
-            .map(ToString::to_string)
-            .or_else(|| ctx.attribute_string(&["handover", "owner_address"]));
+        // A host-verified handover fixes the account and owner. Model arguments
+        // are lookup hints only when no such binding exists; they cannot replace
+        // it with the managed signer or another user's account.
+        let owner_wallet = ctx
+            .attribute_string(&["handover", "owner_address"])
+            .or_else(|| wallet_address.map(ToString::to_string));
         // World grants the OperatingAccount because that is the address which
         // calls the venue under AA. The Para agent in domain.evm is only the
         // OperatingAccount owner/signature authority and must never be treated
@@ -899,12 +904,76 @@ mod tests {
     }
 
     #[test]
+    fn handover_identity_overrides_model_wallet_and_account_arguments() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Venue(AtomicUsize, bool);
+        impl crate::rpc::RpcExecutor for Venue {
+            fn post_json(&self, body: &Value) -> Result<Value, String> {
+                assert_eq!(body["method"], "eth_call");
+                assert!(
+                    body["params"][0]["data"]
+                        .as_str()
+                        .unwrap()
+                        .ends_with(&format!("{:064x}", 21))
+                );
+                let result = match self.0.fetch_add(1, Ordering::SeqCst) {
+                    0 => format!("0x{:0>64}", "1111111111111111111111111111111111111111"),
+                    1 if self.1 => format!(
+                        "0x{:064x}{:064x}{:0>64}",
+                        32, 1, "2222222222222222222222222222222222222222"
+                    ),
+                    1 => format!("0x{:064x}{:064x}", 32, 0),
+                    _ => panic!("unexpected venue read"),
+                };
+                Ok(json!({"jsonrpc":"2.0", "id":body["id"], "result":result}))
+            }
+        }
+        let client = WorldClient::with_rpc(crate::rpc::RpcTransport::with_executor(Arc::new(
+            Venue(AtomicUsize::new(0), true),
+        )));
+        let app = WorldMarketsApp::default();
+        let ctx = ctx_with(json!({
+            "domain": { "evm": { "address": "0x3333333333333333333333333333333333333333", "chain_id": 1 } },
+            "handover": {
+                "account_ref": "21", "chain_id": 2092151908u64,
+                "owner_address": "0x1111111111111111111111111111111111111111",
+                "operating_address": "0x2222222222222222222222222222222222222222"
+            }
+        }));
+        assert!(app.client_for(&ctx).is_ok());
+        let access = app
+            .access(
+                &client,
+                Some(99),
+                Some("0x3333333333333333333333333333333333333333"),
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(access.account_id, 21);
+        assert_eq!(access.owner, "0x1111111111111111111111111111111111111111");
+        assert_eq!(access.actor, "0x2222222222222222222222222222222222222222");
+        assert_eq!(access.authorization, "delegated_trader");
+        let revoked = WorldClient::with_rpc(crate::rpc::RpcTransport::with_executor(Arc::new(
+            Venue(AtomicUsize::new(0), false),
+        )));
+        let error = app.access(&revoked, None, None, &ctx).unwrap_err();
+        assert!(error.contains("neither the owner"), "{error}");
+    }
+
+    #[test]
     fn account_id_prefers_handover_account_ref_then_mandate_account() {
         let both = ctx_with(json!({
             "handover": { "account_ref": "world-1234", "mandate": mandate_json(Some(99)) }
         }));
         assert_eq!(WorldMarketsApp::account_id(&both, None), Some(1234));
-        assert_eq!(WorldMarketsApp::account_id(&both, Some(7)), Some(7));
+        assert_eq!(WorldMarketsApp::account_id(&both, Some(7)), Some(1234));
+        assert_eq!(
+            WorldMarketsApp::account_id(&ctx_with(json!({})), Some(7)),
+            Some(7)
+        );
 
         let numeric = ctx_with(json!({ "handover": { "account_ref": 55 } }));
         assert_eq!(WorldMarketsApp::account_id(&numeric, None), Some(55));
