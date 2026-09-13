@@ -44,7 +44,7 @@ dyn_aomi_app!(
         },
         {
             id: "world-markets/execution",
-            description: "Activate together with trading and reporting in the first pass for every World action, before preview. Procedure: allow verdict → resolve book → pack order word → evm_stage_tx → simulate_batch → evm_commit_txs, guarded to the exchange contract.",
+            description: "Activate together with trading in the first pass for every World action, before preview; omit reporting to fit the shared activation budget. Procedure: allow verdict → resolve book → pack order word → evm_stage_tx → simulate_batch → evm_commit_txs, guarded to the exchange contract.",
             sections: { workflow: "skill/execution.md" },
             guard: "skill/guard.json",
         },
@@ -255,6 +255,41 @@ mod tests {
         );
         assert!(app.secrets().is_none(), "the app declares no secrets");
         assert_eq!(app.namespaces(), Some(vec!["evm-core".to_string()]));
+    }
+
+    #[test]
+    fn routed_skill_pairs_fit_host_activation_budget() {
+        let skills = tool::WorldMarketsApp::default().skills();
+        for pair in [
+            ["world-markets/trading", "world-markets/execution"],
+            ["world-markets/trading", "world-markets/reporting"],
+        ] {
+            // Match aomi-skills::estimate_activation_tokens: app skills have
+            // no Tools metadata and use render_sections as instruction_md.
+            let tokens: usize = pair
+                .iter()
+                .map(|id| {
+                    let skill = skills.iter().find(|skill| skill.id == *id).unwrap();
+                    format!(
+                        "## Skill: {}\n\n{}",
+                        skill.id,
+                        skill.render_sections().trim_end()
+                    )
+                    .chars()
+                    .count()
+                    .div_ceil(4)
+                })
+                .sum();
+            assert!(tokens <= 4000, "{pair:?} uses {tokens} activation tokens");
+        }
+        assert!(
+            preamble::COMPOSED
+                .contains("select exactly world-markets/trading and world-markets/execution")
+        );
+        assert!(
+            preamble::COMPOSED
+                .contains("select exactly world-markets/trading and world-markets/reporting")
+        );
     }
 
     #[test]
