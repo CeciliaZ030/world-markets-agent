@@ -517,7 +517,7 @@ impl WorldClient {
     pub(crate) fn assets(&self) -> Result<Vec<Asset>, String> {
         let returns = self.call(&bulkReadTokenConfigs_3423260018Call {})?;
         let mut assets = Vec::new();
-        for chunk in returns.configs.chunks_exact(3) {
+        for chunk in returns.configs.as_chunks::<3>().0 {
             if chunk[0].is_zero() {
                 break;
             }

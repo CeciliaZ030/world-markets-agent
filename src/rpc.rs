@@ -212,7 +212,7 @@ impl RpcTransport {
         let fetched = self.post_batch(&pending)?;
         {
             let mut cache = self.lock();
-            for ((i, _), value) in pending.iter().zip(fetched.into_iter()) {
+            for ((i, _), value) in pending.iter().zip(fetched) {
                 let (key, method, ttl, _) = &items[*i];
                 match extract_result(method, value) {
                     Ok(result) => {
