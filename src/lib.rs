@@ -187,7 +187,7 @@ mod tests {
         }
 
         let manifest = tool::WorldMarketsApp::default().manifest();
-        assert_eq!(manifest.sdk_version, "5.0.1");
+        assert_eq!(manifest.sdk_version, "5.1.0");
         assert!(!manifest.tools.is_empty());
         for tool in manifest.tools {
             check(&tool.parameters_schema, &tool.name);

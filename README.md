@@ -86,7 +86,7 @@ live from the contract.
 
 ## Deploy
 
-This app requires Aomi SDK 5.0.1 in both `Cargo.toml` and `Cargo.lock` (5.0.0 hashes app-skill guard tables differently from the host).
+This app requires Aomi SDK 5.1.0 in both `Cargo.toml` and `Cargo.lock`, matching the current backend host ABI and app-skill guard contract.
 Its hosted instructions are the three SDK 5 skills in `src/skill/`; each must
 pass the 4,000-token validation limit. `cargo test --locked` checks the skills,
 the guard table, and every provider-facing tool schema before publication.
