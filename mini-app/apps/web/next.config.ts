@@ -2,8 +2,9 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
-  // A production phone smoke can build while the local development server stays up.
-  distDir: process.env.NODE_ENV === "production" ? ".next-production" : ".next",
+  // A local production phone smoke can build while the development server stays
+  // up; Vercel expects the default `.next`.
+  distDir: process.env.NODE_ENV === "production" && !process.env.VERCEL ? ".next-production" : ".next",
   // Admit only the configured mini-app tunnel to development assets/HMR.
   ...(process.env.PUBLIC_WEB_URL ? { allowedDevOrigins: [new URL(process.env.PUBLIC_WEB_URL).hostname] } : {}),
   // Workspace packages and the partner SDK are TypeScript sources; Next compiles them.
