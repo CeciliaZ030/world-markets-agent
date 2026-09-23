@@ -130,6 +130,16 @@ impl Account {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct AgentPermission {
+    pub(crate) account_id: u64,
+    pub(crate) owner: String,
+    pub(crate) actor: String,
+    pub(crate) authorized: bool,
+    pub(crate) authorization: String,
+    pub(crate) permitted_traders: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct AccountAccess {
     pub(crate) account_id: u64,
     pub(crate) owner: String,
@@ -547,6 +557,43 @@ impl WorldClient {
         Ok(self
             .call(&bulkTraders_5523718714Call { userId: account_id })?
             .traders)
+    }
+
+    /// Whether `actor` may trade `account_id` right now: the owner, an
+    /// on-chain permitted trader, or nobody. Read fresh on every call, so a
+    /// revocation shows on the next check.
+    pub(crate) fn agent_permission(
+        &self,
+        account_id: u64,
+        actor: &str,
+    ) -> Result<AgentPermission, String> {
+        let actor = Address::from_str(actor)
+            .map_err(|e| format!("[world-markets] invalid actor address: {e}"))?;
+        let owner = self.owner_for(account_id)?;
+        if owner.is_zero() {
+            return Err(format!(
+                "[world-markets] World account {account_id} does not exist"
+            ));
+        }
+        let traders = self.traders_for(account_id)?;
+        let authorization = if actor == owner {
+            "owner"
+        } else if traders.contains(&actor) {
+            "delegated_trader"
+        } else {
+            "none"
+        };
+        Ok(AgentPermission {
+            account_id,
+            owner: format!("{owner:#x}"),
+            actor: format!("{actor:#x}"),
+            authorized: authorization != "none",
+            authorization: authorization.to_string(),
+            permitted_traders: traders
+                .into_iter()
+                .map(|address| format!("{address:#x}"))
+                .collect(),
+        })
     }
 
     #[cfg(test)]

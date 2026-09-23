@@ -89,7 +89,6 @@ impl Verdict {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn is_allow(&self) -> bool {
         self.status == "allow"
     }

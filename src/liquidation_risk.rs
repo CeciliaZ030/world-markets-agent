@@ -99,6 +99,9 @@ pub(crate) struct PostTradeProjection {
     /// contract RAPV, never a contract read. Only returned once the ATLAS
     /// risk-multiplier search over the projected state converges.
     pub(crate) rapv: Decimal,
+    /// Post-trade 0–10 liquidation score from the same risk search, one
+    /// decimal, the figure a simulation preview shows as "after".
+    pub(crate) liquidation_risk: String,
 }
 
 pub(crate) fn project_post_trade(
@@ -178,10 +181,13 @@ fn project_from_account(
     // The projected state must be solvable by the same risk search the live
     // score uses; a search that cannot converge leaves the post-trade RAPV
     // unproven and the mandate fails closed.
-    calculate_liquidation_risk(nav, post_rapv, val_at_max, |multiplier| {
+    let risk = calculate_liquidation_risk(nav, post_rapv, val_at_max, |multiplier| {
         evaluate(&projected_state, assets, quote_asset, multiplier)
     })?;
-    Ok(PostTradeProjection { rapv: post_rapv })
+    Ok(PostTradeProjection {
+        rapv: post_rapv,
+        liquidation_risk: format_risk_score(risk),
+    })
 }
 
 fn apply_intent(
@@ -519,7 +525,7 @@ fn risk_band(score: f64) -> &'static str {
     }
 }
 
-fn format_risk_score(score: f64) -> String {
+pub(crate) fn format_risk_score(score: f64) -> String {
     format!("{:.1}", score.clamp(0.0, MAX_SCORE))
 }
 

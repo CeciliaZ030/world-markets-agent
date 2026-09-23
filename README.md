@@ -1,7 +1,18 @@
 # World Markets Agent
 
 An Aomi app for live World Markets context and mandate-gated execution on the
-UniFi testnet (chain ID 2092151908).
+UniFi testnet (chain ID 2092151908), plus the World Mini App it pairs with.
+
+## Layout
+
+- `src/`, `tests/` — the Rust Aomi app (this README). Deployed through Aomi Build.
+- `mini-app/` — the World Mini App and deterministic command renders
+  (`b`, `p`, `r`, …): a pnpm workspace with a Next.js app deployed on Vercel.
+  See [mini-app/README.md](mini-app/README.md) and
+  [mini-app/docs/deploy.md](mini-app/docs/deploy.md).
+
+The two share a repository so World's assets ship together; they build and
+deploy independently (`cargo` at the root, `pnpm` inside `mini-app/`).
 
 The app reads the World exchange contract directly over its own RPC path,
 evaluates every trade intent against the signed mandate (ATLAS post-trade
@@ -13,32 +24,40 @@ Reads (never execute):
 - `list_world_assets`
 - `get_world_account`
 - `get_health_snapshot` (account card + PnL)
+- `get_world_agent_permission` (owner · delegated trader · revoked)
 - `get_world_market`
 - `get_world_rates`
 - `get_world_loans`
 - `get_world_open_orders`
 - `get_world_pnl`
 
-Verdicts (never execute):
+Verdicts and simulations (never execute):
 
 - `preview_world_trade` — resolved size, book, mark, limit price, and the
   deterministic mandate verdict under `preview.verdict`
 - `check_world_mandate` — same body as the preview
+- `preview_account_effect` — before/after exposure, available-to-deploy, and
+  0–10 risk for a hypothetical, derived in Rust from live state
 - `compute_resize` — the one number a block cites: the signed RAPV floor
 
-Execution helpers (pure computation / read-only; the host stages, simulates,
-and commits):
+Actions (the app encodes the venue call; the host stages, simulates, and
+commits it atomically through a routed tool return):
 
-- `world_resolve_book` — the order-book contract for a product and pair
-- `world_pack_order` — the packed `uint256` order word a
-  `new*Order(address,uint256)` call takes
+- `execute_world_order` — same arguments as the preview; evaluates the mandate
+  itself and, on allow, packs the order word and encodes `new*Order`
+- `cancel_world_order` — reads the resting order by id and encodes
+  `cancel*Order`
+- `renew_world_loan` / `pay_world_loan_interest` — one borrower loan per call,
+  gated on a bound mandate, the floor, and liquidation eligibility
 
-The execution skill (`src/skill/execution.md`) is the only path to the chain:
-allow verdict → `world_resolve_book` → `world_pack_order` → one `evm_stage_tx`
-(Encode mode, `to` = the exchange) → one `simulate_batch` → one
-`evm_commit_txs`. `src/skill/guard.json` restricts staged calls to the exchange
-contract and the fourteen trading selectors (six `new*Order`, six
-`cancel*Order`, `renewLoan`, `payInterestAndFees`) on chain 2092151908.
+Each action tool returns `staged` (signature, args, calldata) and a route the
+host follows: one `evm_stage_tx` with that exact calldata, then an enforced
+`simulate_batch` and `evm_commit_txs` that stop on any failure. The model
+never types a selector, an order word, or a number between tools.
+`src/skill/guard.json` restricts staged calls to the exchange contract and the
+fourteen trading selectors (six `new*Order`, six `cancel*Order`, `renewLoan`,
+`payInterestAndFees`) on chain 2092151908; placing or cancelling lend/borrow
+orders has no action tool yet.
 
 The mandate fails closed: without a bound handover mandate every verdict is
 `missing_mandate` and nothing is staged. The bound account comes from
@@ -87,7 +106,7 @@ live from the contract.
 ## Deploy
 
 This app requires Aomi SDK 5.1.0 in both `Cargo.toml` and `Cargo.lock`, matching the current backend host ABI and app-skill guard contract.
-Its hosted instructions are the three SDK 5 skills in `src/skill/`; each must
+Its hosted instructions are the two SDK 5 skills in `src/skill/` (trading + execution, reporting); each must
 pass the 4,000-token validation limit. `cargo test --locked` checks the skills,
 the guard table, and every provider-facing tool schema before publication.
 

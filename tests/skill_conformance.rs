@@ -32,9 +32,9 @@ fn no_banned_vocabulary() {
         "render_lookup",
         "brain",
         "plugin",
-        "execute_world_order",
+        "world_pack_order",
+        "world_resolve_book",
         "get_world_tasks",
-        "preview_account_effect",
         "get_dollarpower",
         "guardian",
         "amazing opportunity",
@@ -67,16 +67,20 @@ fn every_kept_tool_is_named_in_the_skills() {
         "list_world_assets",
         "get_world_account",
         "get_health_snapshot",
+        "get_world_agent_permission",
         "get_world_market",
         "get_world_rates",
         "get_world_loans",
         "get_world_open_orders",
         "preview_world_trade",
         "check_world_mandate",
+        "preview_account_effect",
         "get_world_pnl",
         "compute_resize",
-        "world_pack_order",
-        "world_resolve_book",
+        "execute_world_order",
+        "cancel_world_order",
+        "renew_world_loan",
+        "pay_world_loan_interest",
     ] {
         assert!(text.contains(tool), "skills must name `{tool}`");
     }
@@ -107,6 +111,9 @@ fn deny_codes_have_copy() {
         "invalid_mandate",
         "unsupported_mandate_version",
         "expired_mandate",
+        "no_such_order",
+        "no_such_loan",
+        "position_id_unavailable",
     ] {
         assert!(reporting.contains(rule), "reporting.md must cover `{rule}`");
     }
@@ -116,7 +123,7 @@ fn deny_codes_have_copy() {
 }
 
 #[test]
-fn execution_procedure_is_in_order_and_names_the_exchange() {
+fn execution_procedure_is_one_action_tool_then_the_host_chain() {
     let execution = skill("execution.md");
     let procedure = &execution[execution
         .find("## New order")
@@ -127,16 +134,21 @@ fn execution_procedure_is_in_order_and_names_the_exchange() {
             .unwrap_or_else(|| panic!("execution.md must contain {needle:?}"))
     };
     assert!(execution.contains("0xf6b54e033bb45a583aa642924bcef78b804588ae"));
-    assert!(execution.contains("newSpotSellOrder(address,uint256)"));
-    assert!(execution.contains("`[book, word]`") || execution.contains("[book, word]"));
-    let verdict = pos("`preview_world_trade");
-    let book = pos("`world_resolve_book");
-    let word = pos("`world_pack_order");
-    let stage = pos("`evm_stage_tx");
-    let simulate = pos("`simulate_batch");
-    let commit = pos("`evm_commit_txs");
-    assert!(verdict < book && book < word && word < stage && stage < simulate && simulate < commit);
-    for forbidden in ["batchCommands", "liquidate"] {
+    assert!(execution.contains("Do not preview first"));
+    let execute = pos("`execute_world_order`");
+    let stage = pos("`evm_stage_tx`");
+    let simulate = pos("`simulate_batch`");
+    let commit = pos("`evm_commit_txs`");
+    assert!(execute < stage && stage < simulate && simulate < commit);
+    let cancel = pos("`cancel_world_order`");
+    assert!(pos("`get_world_open_orders`") < cancel);
+    assert!(pos("`renew_world_loan") > cancel);
+    assert!(pos("`pay_world_loan_interest") > cancel);
+    for forbidden in [
+        "batchCommands",
+        "liquidate",
+        "evm_stage_tx` with data you typed",
+    ] {
         let line = execution
             .lines()
             .find(|line| line.contains(forbidden))
@@ -165,6 +177,13 @@ fn skills_stay_inside_the_app_skill_budget() {
             "{path} exceeds ~3,000 words"
         );
     }
+    // trading.md and execution.md ship as one skill.
+    let trading = skill("trading.md").chars().count() + skill("execution.md").chars().count();
+    assert!(
+        trading.div_ceil(4) <= 4_000,
+        "trading + execution estimate {} tokens",
+        trading.div_ceil(4)
+    );
 }
 
 #[test]
@@ -173,10 +192,13 @@ fn honest_numbers_law_and_lookups_stated() {
     let reporting = skill("reporting.md");
     assert!(reporting.contains("You never write a number"));
     assert!(reporting.contains("I've left it out rather than guess"));
+    assert!(reporting.contains("## ADVISORY-SIM"));
+    assert!(reporting.contains("## CORRECTION"));
     assert!(trading.contains("Blocked means blocked"));
     assert!(trading.contains("Allowed means allowed"));
     assert!(trading.contains("`lookups.portfolio_value`"));
     assert!(trading.contains("`lookups.positions`"));
     assert!(trading.contains("`metrics.liquidation_risk`"));
     assert!(trading.contains("handover.account_ref"));
+    assert!(trading.contains("do not preview first"));
 }

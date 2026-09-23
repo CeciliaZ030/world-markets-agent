@@ -1,6 +1,5 @@
 use aomi_sdk::*;
 
-mod book;
 mod client;
 mod liquidation_risk;
 mod loans;
@@ -11,8 +10,10 @@ mod order_word;
 mod pnl;
 mod preamble;
 mod rates;
+mod reporting;
 mod rpc;
 mod size;
+mod staging;
 mod tool;
 
 dyn_aomi_app!(
@@ -24,33 +25,35 @@ dyn_aomi_app!(
         tool::ListWorldAssets,
         tool::GetWorldAccount,
         tool::GetHealthSnapshot,
+        tool::GetWorldAgentPermission,
         tool::GetWorldMarket,
         tool::GetWorldRates,
         tool::GetWorldLoans,
         tool::GetWorldOpenOrders,
         tool::PreviewWorldTrade,
         tool::CheckWorldMandate,
+        tool::PreviewAccountEffect,
         tool::GetWorldPnl,
         tool::ComputeResize,
-        tool::WorldPackOrder,
-        tool::WorldResolveBook,
+        tool::ExecuteWorldOrder,
+        tool::CancelWorldOrder,
+        tool::RenewWorldLoan,
+        tool::PayWorldLoanInterest,
     ],
     namespaces = ["evm-core"],
     skills = [
         {
             id: "world-markets/trading",
-            description: "World Markets account model, mandate rules, and terse lookups as ordinary tool calls.",
-            sections: { trading: "skill/trading.md" },
-        },
-        {
-            id: "world-markets/execution",
-            description: "Activate together with trading in the first pass for every World action, before preview; omit reporting to fit the shared activation budget. Procedure: allow verdict → resolve book → pack order word → evm_stage_tx → simulate_batch → evm_commit_txs, guarded to the exchange contract.",
-            sections: { workflow: "skill/execution.md" },
+            description: "World Markets account model, mandate rules, terse lookups, and the one-call execution procedure: each trade, cancel, or loan action is its own tool, which evaluates the mandate and stages the venue call the host simulates and commits. Guarded to the exchange contract.",
+            sections: {
+                trading: "skill/trading.md",
+                execution: "skill/execution.md",
+            },
             guard: "skill/guard.json",
         },
         {
             id: "world-markets/reporting",
-            description: "World response formats: honest numbers, deny copy per rule, the mandate-absent handshake, and trading safety.",
+            description: "World response formats: honest numbers, previews, receipts, simulations, deny copy per rule, the mandate-absent handshake, and trading safety.",
             sections: { reporting: "skill/reporting.md" },
         },
     ]
@@ -195,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn preamble_keeps_safety_and_routes_to_the_three_skills() {
+    fn preamble_keeps_safety_and_routes_to_the_two_skills() {
         assert!(preamble::ROLE_HEADER_FOR_TEST.contains("precise financial operator"));
         let app = tool::WorldMarketsApp::default();
         for skill in app.skills() {
@@ -219,10 +222,22 @@ mod tests {
         );
         assert!(preamble::COMPOSED.contains("Before any World tool call"));
         assert!(preamble::COMPOSED.contains("one activate_skills call in the first pass"));
-        assert!(preamble::COMPOSED.contains("before previewing the intent"));
+        assert!(
+            preamble::COMPOSED
+                .contains("selecting world-markets/trading and world-markets/reporting together")
+        );
+        assert!(preamble::COMPOSED.contains("one call to its action tool"));
+        assert!(preamble::COMPOSED.contains("never call evm_stage_tx with data you typed"));
         assert!(!preamble::COMPOSED.contains("also activate"));
+        assert!(!preamble::COMPOSED.contains("world-markets/execution"));
         assert!(preamble::COMPOSED.contains("again each serve cycle"));
-        for banned in ["Telegram", "sidecar", "Mini App", "render_lookup"] {
+        for banned in [
+            "Telegram",
+            "sidecar",
+            "Mini App",
+            "render_lookup",
+            "world_pack_order",
+        ] {
             assert!(
                 !preamble::COMPOSED.contains(banned),
                 "preamble must not mention {banned}"
@@ -231,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_lists_the_thirteen_tools_without_secrets() {
+    fn manifest_lists_the_seventeen_tools_without_secrets() {
         let app = tool::WorldMarketsApp::default();
         let manifest = app.manifest();
         let names: Vec<&str> = manifest.tools.iter().map(|t| t.name.as_str()).collect();
@@ -241,16 +256,20 @@ mod tests {
                 "list_world_assets",
                 "get_world_account",
                 "get_health_snapshot",
+                "get_world_agent_permission",
                 "get_world_market",
                 "get_world_rates",
                 "get_world_loans",
                 "get_world_open_orders",
                 "preview_world_trade",
                 "check_world_mandate",
+                "preview_account_effect",
                 "get_world_pnl",
                 "compute_resize",
-                "world_pack_order",
-                "world_resolve_book",
+                "execute_world_order",
+                "cancel_world_order",
+                "renew_world_loan",
+                "pay_world_loan_interest",
             ]
         );
         assert!(app.secrets().is_none(), "the app declares no secrets");
@@ -258,52 +277,34 @@ mod tests {
     }
 
     #[test]
-    fn routed_skill_pairs_fit_host_activation_budget() {
+    fn the_skill_pair_fits_host_activation_budget() {
         let skills = tool::WorldMarketsApp::default().skills();
-        for pair in [
-            ["world-markets/trading", "world-markets/execution"],
-            ["world-markets/trading", "world-markets/reporting"],
-        ] {
-            // Match aomi-skills::estimate_activation_tokens: app skills have
-            // no Tools metadata and use render_sections as instruction_md.
-            let tokens: usize = pair
-                .iter()
-                .map(|id| {
-                    let skill = skills.iter().find(|skill| skill.id == *id).unwrap();
-                    format!(
-                        "## Skill: {}\n\n{}",
-                        skill.id,
-                        skill.render_sections().trim_end()
-                    )
-                    .chars()
-                    .count()
-                    .div_ceil(4)
-                })
-                .sum();
-            assert!(tokens <= 4000, "{pair:?} uses {tokens} activation tokens");
-        }
+        // Match aomi-skills::estimate_activation_tokens: app skills have no
+        // Tools metadata and use render_sections as instruction_md.
+        let tokens: usize = skills
+            .iter()
+            .map(|skill| {
+                format!(
+                    "## Skill: {}\n\n{}",
+                    skill.id,
+                    skill.render_sections().trim_end()
+                )
+                .chars()
+                .count()
+                .div_ceil(4)
+            })
+            .sum();
         assert!(
-            preamble::COMPOSED
-                .contains("select exactly world-markets/trading and world-markets/execution")
-        );
-        assert!(
-            preamble::COMPOSED
-                .contains("select exactly world-markets/trading and world-markets/reporting")
+            tokens <= 4000,
+            "trading + reporting use {tokens} activation tokens"
         );
     }
 
     #[test]
-    fn app_skills_are_valid_and_only_execution_carries_the_guard() {
+    fn app_skills_are_valid_and_only_trading_carries_the_guard() {
         let skills = tool::WorldMarketsApp::default().skills();
         let ids: Vec<&str> = skills.iter().map(|skill| skill.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            [
-                "world-markets/trading",
-                "world-markets/execution",
-                "world-markets/reporting"
-            ]
-        );
+        assert_eq!(ids, ["world-markets/trading", "world-markets/reporting"]);
         aomi_sdk::validate_app_skills("world-markets", &skills)
             .expect("all shipped skills must pass the same validation as the backend loader");
         for skill in &skills {
@@ -314,24 +315,30 @@ mod tests {
                 skill.id,
                 skill.est_tokens()
             );
-            assert_eq!(skill.sections.len(), 1);
             assert_eq!(
                 skill.guard.is_some(),
-                skill.id == "world-markets/execution",
-                "only the execution skill carries a guard table"
+                skill.id == "world-markets/trading",
+                "the always-active trading skill carries the guard table"
             );
         }
+        let sections: Vec<&str> = skills[0]
+            .sections
+            .iter()
+            .map(|section| section.name.as_str())
+            .collect();
+        assert_eq!(sections, ["trading", "execution"]);
+        assert_eq!(skills[1].sections.len(), 1);
     }
 
     #[test]
     fn guard_json_covers_trading_selectors_only() {
         let skills = tool::WorldMarketsApp::default().skills();
-        let execution = skills
+        let trading = skills
             .iter()
-            .find(|skill| skill.id == "world-markets/execution")
+            .find(|skill| skill.id == "world-markets/trading")
             .unwrap();
-        let guard = execution.guard.as_ref().expect("execution guard");
-        assert_eq!(guard.id, "world-markets/execution");
+        let guard = trading.guard.as_ref().expect("trading guard");
+        assert_eq!(guard.id, "world-markets/trading");
         assert!(guard.svm.is_none());
         let evm = guard.evm.as_ref().expect("evm guard");
         assert_eq!(

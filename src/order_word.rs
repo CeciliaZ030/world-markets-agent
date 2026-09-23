@@ -8,6 +8,7 @@ use alloy_primitives::U256;
 use aomi_sdk::schemars::JsonSchema;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::{Value, json};
 use std::str::FromStr;
 
@@ -94,6 +95,7 @@ impl OrderWord {
         Ok(packed)
     }
 
+    #[cfg(test)]
     pub(crate) fn to_json(&self) -> Result<Value, String> {
         let word = self.pack()?;
         Ok(json!({

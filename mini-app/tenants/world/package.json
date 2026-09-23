@@ -1,0 +1,21 @@
+{
+  "name": "@aomi-telegram/tenant-world",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@aomi-telegram/core": "workspace:*",
+    "@wcm-inc/sdk": "0.0.9",
+    "bignumber.js": "9.2.1",
+    "ethers": "^6.17.0",
+    "undici": "^7.29.1",
+    "viem": "^2.56.3"
+  }
+}
