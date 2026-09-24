@@ -10,7 +10,7 @@ use crate::client::{Account, AccountAccess, Asset, WorldClient, asset_by_symbol}
 use crate::loans::LoanView;
 use crate::mandate::{Mandate, TradeFacts, Verdict, parse_decimal};
 use crate::order_intent::OrderIntent;
-use crate::order_word::{OrderType, OrderWord, quantity_raw};
+use crate::order_word::{LendOrderWord, OrderType, OrderWord, quantity_raw};
 use crate::pnl::PnlLedger;
 use crate::reporting::EffectPlan;
 use crate::size::{ResolvedSize, SizeInput};
@@ -133,13 +133,14 @@ pub(crate) struct CheckWorldMandate;
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(crate) struct WorldTradeArgs {
-    /// Product type: spot or perp.
+    /// Product type: spot, perp, or lend.
     pub(crate) product: String,
-    /// Trade side: buy or sell (long → buy, short → sell).
+    /// Spot/perp: buy or sell (long → buy, short → sell). Lend: lend (supply) or borrow.
     pub(crate) side: String,
     /// Base asset symbol.
     pub(crate) base_symbol: String,
-    /// Quote asset symbol.
+    /// Quote asset symbol. Required for spot and perp; a lend book has none (USDT is assumed).
+    #[serde(default)]
     pub(crate) quote_symbol: String,
     /// Human-readable base quantity, such as "0.25". Alias for size_base.
     #[serde(default)]
@@ -150,7 +151,7 @@ pub(crate) struct WorldTradeArgs {
     /// Base-asset size when the user named the asset unit.
     #[serde(default)]
     pub(crate) size_base: Option<String>,
-    /// Limit price. Omit for a market intent (a limit at the mark moved by `slippage`).
+    /// Limit price, or for lend the annual rate as a decimal fraction ("0.05" = 5% APR). Omit for a market intent (a limit at the mark or best book rate moved by `slippage`).
     #[serde(default)]
     pub(crate) price: Option<String>,
     /// `market` or `limit`. Inferred from `price` when omitted.
@@ -202,16 +203,21 @@ pub(crate) struct CancelWorldOrder;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct CancelWorldOrderArgs {
-    /// Product type: spot or perp.
+    /// Product type: spot, perp, or lend.
     pub(crate) product: String,
-    /// Side of the resting order: buy or sell (long → buy, short → sell).
+    /// Side of the resting order: buy or sell (long → buy, short → sell); lend or borrow on a lend book.
     pub(crate) side: String,
     /// Base asset symbol.
     pub(crate) base_symbol: String,
-    /// Quote asset symbol.
+    /// Quote asset symbol. Required for spot and perp; omitted for lend.
+    #[serde(default)]
     pub(crate) quote_symbol: String,
-    /// Resting order id, from `get_world_open_orders`.
-    pub(crate) order_id: u64,
+    /// Resting order id, from `get_world_open_orders`. Required for spot and perp.
+    #[serde(default)]
+    pub(crate) order_id: Option<u64>,
+    /// The resting lend/borrow order's annual rate as a decimal fraction ("0.05"). Required for lend; a lend order is identified by its rate.
+    #[serde(default)]
+    pub(crate) interest_rate: Option<String>,
     /// Optional World account ID. Handover account context is used when omitted.
     #[serde(default)]
     pub(crate) account_id: Option<u64>,
@@ -296,11 +302,11 @@ pub(crate) struct GetWorldAgentPermissionArgs {
     pub(crate) actor_address: Option<String>,
 }
 
-/// A preview either resolved a trade or stopped at sizing with the question or
-/// mismatch the tool result carries verbatim.
+/// A preview either resolved a trade or stopped with a complete tool result:
+/// a sizing question, a mismatch, or an asset World does not list.
 pub(crate) enum PreviewOutcome {
     Trade(Box<TradePreview>),
-    Sizing(Value),
+    Stopped(Value),
 }
 
 /// A gated read: `Ok(Ok(ready))` proceeds, `Ok(Err(value))` is a complete
@@ -321,7 +327,7 @@ impl PreviewOutcome {
     pub(crate) fn to_json(&self) -> Value {
         match self {
             Self::Trade(preview) => preview.to_json(),
-            Self::Sizing(value) => value.clone(),
+            Self::Stopped(value) => value.clone(),
         }
     }
 }
@@ -344,6 +350,10 @@ pub(crate) struct TradePreview {
     pub(crate) mark_price: String,
     pub(crate) mark_price_raw: u64,
     pub(crate) intent: OrderIntent,
+    /// Lend only: the best taker rate on the book the market intent moved from.
+    pub(crate) book_rate: Option<Decimal>,
+    /// Lend only: `intent.limit_price` (an APR fraction) in venue ticks.
+    pub(crate) rate_raw: Option<u16>,
     pub(crate) estimated_notional: Decimal,
     pub(crate) current_position_quantity: Decimal,
     pub(crate) verdict: Verdict,
@@ -359,7 +369,7 @@ impl TradePreview {
                 "position_decimals": asset.position_decimals,
             })
         };
-        json!({
+        let mut value = json!({
             "source": "world-markets-contract",
             "chain_id": self.chain_id,
             "exchange": self.exchange,
@@ -382,7 +392,6 @@ impl TradePreview {
                 "mark_price": self.mark_price,
                 "mark_price_raw": self.mark_price_raw,
                 "order_type": self.intent.order_type,
-                "limit_price": self.intent.limit_price.normalize().to_string(),
                 "slippage": self.intent.slippage.normalize().to_string(),
                 "estimated_notional": self.estimated_notional.normalize().to_string(),
                 "current_position_quantity": self.current_position_quantity.normalize().to_string(),
@@ -393,7 +402,30 @@ impl TradePreview {
                 },
                 "executable": false,
             },
-        })
+        });
+        // On a lend book the "price" is an annual rate; name it so the model
+        // never quotes a rate as a price.
+        let preview = value["preview"].as_object_mut().expect("preview object");
+        match self.rate_raw {
+            Some(raw) => {
+                preview.insert(
+                    "interest_rate".into(),
+                    json!(self.intent.limit_price.normalize().to_string()),
+                );
+                preview.insert("interest_rate_raw".into(), json!(raw));
+                preview.insert(
+                    "book_rate".into(),
+                    json!(self.book_rate.map(|rate| rate.normalize().to_string())),
+                );
+            }
+            None => {
+                preview.insert(
+                    "limit_price".into(),
+                    json!(self.intent.limit_price.normalize().to_string()),
+                );
+            }
+        }
+        value
     }
 }
 
@@ -546,19 +578,46 @@ impl WorldMarketsApp {
         match product.to_ascii_lowercase().as_str() {
             "spot" => Ok("spot"),
             "perp" | "perpetual" => Ok("perp"),
-            _ => Err("[world-markets] order tools support spot and perp only".to_string()),
+            "lend" | "lending" => Ok("lend"),
+            _ => Err("[world-markets] order tools support spot, perp, or lend".to_string()),
         }
     }
 
-    fn order_side(side: &str) -> Result<String, String> {
-        match side.trim().to_ascii_lowercase().as_str() {
-            "buy" | "long" => Ok("buy".to_string()),
-            "sell" | "short" => Ok("sell".to_string()),
-            _ => Err(
-                "[world-markets] side must be buy or sell (short→sell, long→buy). Resend with side set."
-                    .to_string(),
-            ),
-        }
+    /// `buy` / `sell` on a spot or perp book; `lend` / `borrow` on a lend book
+    /// (a lender is the book's seller, a borrower its buyer).
+    fn order_side(product: &str, side: &str) -> Result<String, String> {
+        let side = side.trim().to_ascii_lowercase();
+        let normalised = match (product, side.as_str()) {
+            ("lend", "lend" | "supply" | "sell") => "lend",
+            ("lend", "borrow" | "buy") => "borrow",
+            ("lend", _) => {
+                return Err(
+                    "[world-markets] side must be lend or borrow on a lend book. Resend with side set."
+                        .to_string(),
+                );
+            }
+            (_, "buy" | "long") => "buy",
+            (_, "sell" | "short") => "sell",
+            _ => {
+                return Err(
+                    "[world-markets] side must be buy or sell (short→sell, long→buy). Resend with side set."
+                        .to_string(),
+                );
+            }
+        };
+        Ok(normalised.to_string())
+    }
+
+    /// Lucas's CANT wall: a trade-shaped ask naming an asset World does not
+    /// list is an incapacity, never a question and never a symbol guess.
+    fn unknown_asset(symbol: &str) -> Value {
+        json!({
+            "error": "unknown_asset",
+            "asset": symbol,
+            "message": format!("I can't trade `{symbol}` — it isn't listed on World."),
+            "reply_verbatim": true,
+            "executable": false,
+        })
     }
 
     fn trade_preview(
@@ -567,7 +626,7 @@ impl WorldMarketsApp {
         ctx: &DynToolCallCtx,
     ) -> Result<PreviewOutcome, String> {
         let product = Self::order_product(&args.product)?;
-        let side = Self::order_side(&args.side)?;
+        let side = Self::order_side(product, &args.side)?;
 
         let client = self.client_for(ctx)?;
         let access = self.access(
@@ -577,11 +636,26 @@ impl WorldMarketsApp {
             ctx,
         )?;
         let (assets, account) = Self::live_account(&client, &access)?;
-        let base = asset_by_symbol(&assets, &args.base_symbol)?;
-        let quote = asset_by_symbol(&assets, &args.quote_symbol)?;
-        let market = client.market(product, base.clone(), Some(quote.clone()))?;
+        let Ok(base) = asset_by_symbol(&assets, &args.base_symbol) else {
+            return Ok(PreviewOutcome::Stopped(Self::unknown_asset(
+                &args.base_symbol,
+            )));
+        };
+        let quote_symbol = match (product, args.quote_symbol.trim()) {
+            ("lend", "") => "USDT",
+            (_, symbol) => symbol,
+        };
+        let Ok(quote) = asset_by_symbol(&assets, quote_symbol) else {
+            return Ok(PreviewOutcome::Stopped(Self::unknown_asset(quote_symbol)));
+        };
+        let market = client.market(
+            product,
+            base.clone(),
+            (product != "lend").then(|| quote.clone()),
+        )?;
         let mark_price = parse_decimal(&market.mark_price, "mark_price")
             .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        let current_position_quantity = account.position_quantity(product, &base.symbol)?;
 
         let quantity_arg = args.quantity.trim();
         let resolved = match (SizeInput {
@@ -590,11 +664,12 @@ impl WorldMarketsApp {
             size_base: args.size_base.as_deref(),
             quantity: (!quantity_arg.is_empty()).then_some(quantity_arg),
             instrument: Some(&base.symbol),
+            held: Some(current_position_quantity),
         })
         .resolve(mark_price)
         {
             Ok(resolved) => resolved,
-            Err(err) => return Ok(PreviewOutcome::Sizing(err.to_json())),
+            Err(err) => return Ok(PreviewOutcome::Stopped(err.to_json())),
         };
         let quantity_raw = quantity_raw(resolved.base_qty, base.position_decimals)?;
         if quantity_raw == 0 {
@@ -608,27 +683,63 @@ impl WorldMarketsApp {
         let quantity = Decimal::from(quantity_raw)
             / Decimal::from(10u64.pow(u32::from(base.position_decimals)));
 
-        let intent = OrderIntent::resolve(
-            args.order_type.as_deref(),
-            args.price
-                .as_deref()
-                .map(|raw| parse_decimal(raw, "price"))
-                .transpose()
-                .map_err(|verdict| {
-                    format!("[world-markets] {}: {}", verdict.rule, verdict.detail)
-                })?,
-            args.slippage
-                .as_deref()
-                .map(|raw| parse_decimal(raw, "slippage"))
-                .transpose()
-                .map_err(|verdict| {
-                    format!("[world-markets] {}: {}", verdict.rule, verdict.detail)
-                })?,
-            &side,
-            mark_price,
-        )?;
+        let price = args
+            .price
+            .as_deref()
+            .map(|raw| parse_decimal(raw, "price"))
+            .transpose()
+            .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        let slippage = args
+            .slippage
+            .as_deref()
+            .map(|raw| parse_decimal(raw, "slippage"))
+            .transpose()
+            .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        // On a lend book the order's "price" is an annual rate. A market
+        // intent moves from the best taker rate: a lender accepts a little
+        // less than the best borrow bid, a borrower pays a little more than
+        // the best lend ask.
+        let (intent, book_rate, rate_raw) = if product == "lend" {
+            let rates = client.lend_book_rates(base.token_id)?;
+            let book_rate = match side.as_str() {
+                "lend" => rates.lend_apr,
+                _ => rates.borrow_apr,
+            }
+            .map(|raw| parse_decimal(&raw, "book_rate"))
+            .transpose()
+            .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+            let Some(anchor) = book_rate.or(price) else {
+                return Ok(PreviewOutcome::Stopped(json!({
+                    "error": "empty_lend_book",
+                    "message": format!("The `{}` lend book has no resting rate to move from — name a rate to rest at.", base.symbol),
+                    "reply_verbatim": true,
+                    "executable": false,
+                })));
+            };
+            let direction = if side == "lend" { "sell" } else { "buy" };
+            let intent = OrderIntent::resolve(
+                args.order_type.as_deref(),
+                price,
+                slippage,
+                direction,
+                anchor,
+            )?;
+            let rate_raw = LendOrderWord::encode_rate(intent.limit_price)?;
+            (intent, book_rate, Some(rate_raw))
+        } else {
+            (
+                OrderIntent::resolve(
+                    args.order_type.as_deref(),
+                    price,
+                    slippage,
+                    &side,
+                    mark_price,
+                )?,
+                None,
+                None,
+            )
+        };
 
-        let current_position_quantity = account.position_quantity(product, &base.symbol)?;
         let rapv = parse_decimal(
             &account.risk_adjusted_portfolio_value,
             "risk_adjusted_portfolio_value",
@@ -686,6 +797,8 @@ impl WorldMarketsApp {
             mark_price: market.mark_price,
             mark_price_raw: market.mark_price_raw,
             intent,
+            book_rate,
+            rate_raw,
             estimated_notional,
             current_position_quantity,
             verdict,
@@ -703,14 +816,45 @@ impl WorldMarketsApp {
         } else {
             OrderType::FillPartialKillRest
         };
-        let word = OrderWord {
-            account_id: preview.access.account_id,
-            quantity_raw: preview.quantity_raw,
-            limit_price: preview.intent.limit_price,
-            order_type,
-            insertion_hint: 0,
-        }
-        .pack()?;
+        let (word, description) = match preview.rate_raw {
+            Some(rate_raw) => (
+                LendOrderWord {
+                    account_id: preview.access.account_id,
+                    quantity_raw: preview.quantity_raw,
+                    rate_raw,
+                    order_type,
+                }
+                .pack()?,
+                format!(
+                    "World {} {} {} at {} APR ({})",
+                    preview.side,
+                    preview.quantity.normalize(),
+                    preview.base.symbol,
+                    preview.intent.limit_price.normalize(),
+                    preview.intent.order_type
+                ),
+            ),
+            None => (
+                OrderWord {
+                    account_id: preview.access.account_id,
+                    quantity_raw: preview.quantity_raw,
+                    limit_price: preview.intent.limit_price,
+                    order_type,
+                    insertion_hint: 0,
+                }
+                .pack()?,
+                format!(
+                    "World {} {} {} {} at limit {} {} ({})",
+                    preview.product,
+                    preview.side,
+                    preview.quantity.normalize(),
+                    preview.base.symbol,
+                    preview.intent.limit_price.normalize(),
+                    preview.quote.symbol,
+                    preview.intent.order_type
+                ),
+            ),
+        };
         StagedCall::order(
             Venue {
                 exchange: preview.exchange.clone(),
@@ -721,16 +865,7 @@ impl WorldMarketsApp {
             &preview.side,
             book,
             word,
-            format!(
-                "World {} {} {} {} at limit {} {} ({})",
-                preview.product,
-                preview.side,
-                preview.quantity.normalize(),
-                preview.base.symbol,
-                preview.intent.limit_price.normalize(),
-                preview.quote.symbol,
-                preview.intent.order_type
-            ),
+            description,
         )
     }
 
@@ -742,7 +877,7 @@ impl WorldMarketsApp {
         ctx: &DynToolCallCtx,
     ) -> Gated<(Value, StagedCall)> {
         let product = Self::order_product(&args.product)?;
-        let side = Self::order_side(&args.side)?;
+        let side = Self::order_side(product, &args.side)?;
         let client = self.client_for(ctx)?;
         let access = self.access(
             &client,
@@ -763,27 +898,84 @@ impl WorldMarketsApp {
             return Ok(Err(Self::with_verdict(base_value, &verdict)));
         }
         let assets = client.assets()?;
-        let base = asset_by_symbol(&assets, &args.base_symbol)?;
-        let quote = asset_by_symbol(&assets, &args.quote_symbol)?;
+        let Ok(base) = asset_by_symbol(&assets, &args.base_symbol) else {
+            return Ok(Err(Self::unknown_asset(&args.base_symbol)));
+        };
+        if product == "lend" {
+            // A resting lend/borrow order is identified by its rate, not an id.
+            let Some(rate) = args
+                .interest_rate
+                .as_deref()
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+            else {
+                return Ok(Err(Self::with_error(
+                    base_value,
+                    "interest_rate_required",
+                    "a lend or borrow order is cancelled by its resting rate; pass interest_rate"
+                        .to_string(),
+                )));
+            };
+            let rate = parse_decimal(rate, "interest_rate").map_err(|verdict| {
+                format!("[world-markets] {}: {}", verdict.rule, verdict.detail)
+            })?;
+            let market = client.market(product, base.clone(), None)?;
+            let book = Address::from_str(&market.book)
+                .map_err(|e| format!("[world-markets] invalid order-book address: {e}"))?;
+            let word = LendOrderWord {
+                account_id: access.account_id,
+                quantity_raw: 0,
+                rate_raw: LendOrderWord::encode_rate(rate)?,
+                order_type: OrderType::Limit,
+            }
+            .pack()?;
+            let staged = StagedCall::order(
+                Venue::of(&client),
+                OrderAction::Cancel,
+                product,
+                &side,
+                book,
+                word,
+                format!(
+                    "Cancel World {side} order on {} at {} APR",
+                    base.symbol,
+                    rate.normalize()
+                ),
+            )?;
+            let mut value = base_value;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("order_book".into(), json!(market.book));
+                obj.insert("interest_rate".into(), json!(rate.normalize().to_string()));
+            }
+            return Ok(Ok((value, staged)));
+        }
+        let Ok(quote) = asset_by_symbol(&assets, &args.quote_symbol) else {
+            return Ok(Err(Self::unknown_asset(&args.quote_symbol)));
+        };
+        let Some(order_id) = args.order_id else {
+            return Ok(Err(Self::with_error(
+                base_value,
+                "order_id_required",
+                format!(
+                    "a {product} order is cancelled by its order_id from get_world_open_orders"
+                ),
+            )));
+        };
         let market = client.market(product, base.clone(), Some(quote.clone()))?;
         let open_orders = client.open_orders(&market, access.account_id)?;
         let Some(order) = open_orders
             .orders
             .iter()
-            .find(|order| order.order_id == args.order_id && order.side == side)
+            .find(|order| order.order_id == order_id && order.side == side)
         else {
-            let mut value = base_value;
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert("error".into(), json!("no_such_order"));
-                obj.insert(
-                    "detail".into(),
-                    json!(format!(
-                        "no resting {side} order {} on the {} {}/{} book",
-                        args.order_id, product, base.symbol, quote.symbol
-                    )),
-                );
-            }
-            return Ok(Err(value));
+            return Ok(Err(Self::with_error(
+                base_value,
+                "no_such_order",
+                format!(
+                    "no resting {side} order {order_id} on the {product} {}/{} book",
+                    base.symbol, quote.symbol
+                ),
+            )));
         };
         let price = parse_decimal(&order.price, "price")
             .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
@@ -974,8 +1166,13 @@ impl WorldMarketsApp {
         )?;
         let (assets, account) = Self::live_account(&client, &access)?;
         let block = client.block_number()?;
-        let base = asset_by_symbol(&assets, &args.base_symbol)?;
-        let quote = asset_by_symbol(&assets, &args.quote_symbol)?;
+        let Ok(base) = asset_by_symbol(&assets, &args.base_symbol) else {
+            return Ok(Err(Self::unknown_asset(&args.base_symbol)));
+        };
+        let Ok(quote) = asset_by_symbol(&assets, &args.quote_symbol) else {
+            return Ok(Err(Self::unknown_asset(&args.quote_symbol)));
+        };
+        let current_qty = account.position_quantity(product, &base.symbol)?;
 
         let mut missing_mark_symbols = Vec::new();
         let mark = client
@@ -991,6 +1188,7 @@ impl WorldMarketsApp {
             size_base: args.size_base.as_deref(),
             quantity: None,
             instrument: Some(&base.symbol),
+            held: Some(current_qty),
         })
         .resolve(mark.unwrap_or(Decimal::ONE))
         {
@@ -1002,7 +1200,6 @@ impl WorldMarketsApp {
             return Err("[world-markets] quantity must be greater than zero".to_string());
         }
 
-        let current_qty = account.position_quantity(product, &base.symbol)?;
         let after_qty = if matches!(side, "buy" | "borrow") {
             current_qty + quantity
         } else {
@@ -1715,6 +1912,8 @@ mod tests {
             mark_price: "2465.71".to_string(),
             mark_price_raw: 7890274,
             intent: OrderIntent::resolve(None, None, None, "sell", mark).unwrap(),
+            book_rate: None,
+            rate_raw: None,
             estimated_notional: quantity * mark,
             current_position_quantity: Decimal::from_str("0.05").unwrap(),
             verdict: Verdict {
@@ -1948,6 +2147,8 @@ mod tests {
                 mark,
             )
             .unwrap(),
+            book_rate: None,
+            rate_raw: None,
             estimated_notional: quantity * mark,
             current_position_quantity: Decimal::from_str("0.05").unwrap(),
             verdict: Verdict {
@@ -1956,6 +2157,60 @@ mod tests {
                 detail: "Mandate v1 permits spot sell 0.01 WETH.".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn unknown_asset_is_a_cant_wall_not_a_question() {
+        let value = WorldMarketsApp::unknown_asset("DOGE");
+        assert_eq!(value["error"], "unknown_asset");
+        assert_eq!(
+            value["message"],
+            "I can't trade `DOGE` — it isn't listed on World."
+        );
+        assert_eq!(value["reply_verbatim"], true);
+        assert_eq!(value["executable"], false);
+    }
+
+    #[test]
+    fn lend_side_and_product_normalise_and_a_lend_preview_stages_the_lend_word() {
+        assert_eq!(WorldMarketsApp::order_product("lending").unwrap(), "lend");
+        assert_eq!(
+            WorldMarketsApp::order_side("lend", "supply").unwrap(),
+            "lend"
+        );
+        assert_eq!(
+            WorldMarketsApp::order_side("lend", "buy").unwrap(),
+            "borrow"
+        );
+        assert!(WorldMarketsApp::order_side("lend", "long").is_err());
+        assert_eq!(
+            WorldMarketsApp::order_side("perp", "short").unwrap(),
+            "sell"
+        );
+
+        let mut preview = snapshot_preview("limit", Some("0.05"));
+        preview.product = "lend";
+        preview.side = "lend".to_string();
+        preview.rate_raw = Some(LendOrderWord::encode_rate(preview.intent.limit_price).unwrap());
+        preview.book_rate = Some(Decimal::from_str("0.052").unwrap());
+        let json = preview.to_json();
+        assert_eq!(json["preview"]["interest_rate"], "0.05");
+        assert_eq!(json["preview"]["interest_rate_raw"], 500);
+        assert_eq!(json["preview"]["book_rate"], "0.052");
+        assert!(json["preview"].get("limit_price").is_none());
+
+        let staged = WorldMarketsApp::stage_new_order(&preview).unwrap();
+        assert_eq!(staged.signature, "newLendOrder(address,uint256)");
+        let word = LendOrderWord {
+            account_id: 1577,
+            quantity_raw: 100,
+            rate_raw: 500,
+            order_type: OrderType::Limit,
+        }
+        .pack()
+        .unwrap();
+        assert_eq!(staged.args[1], format!("0x{word:064x}"));
+        assert!(staged.description.contains("lend 0.01 WETH at 0.05 APR"));
     }
 
     #[test]

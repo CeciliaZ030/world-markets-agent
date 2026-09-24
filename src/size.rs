@@ -15,6 +15,8 @@ use crate::lookups::format_money;
 pub(crate) enum SizeKind {
     Quote,
     Base,
+    /// A share of the position already held: "half", "all", "20%".
+    Fraction,
     Ambiguous,
     None,
 }
@@ -28,6 +30,18 @@ pub(crate) struct SizeSpan {
 }
 
 const MONEY_VERBS: &[&str] = &["put", "spend", "invest", "deploy"];
+const PERCENT_MARKERS: &[&str] = &["%", "percent", "pct"];
+/// Whole-position words and their share. "all" is only a fraction when the
+/// sentence carries no number, so "0.1 WETH all or nothing" stays a base size.
+const FRACTION_WORDS: &[(&str, &str)] = &[
+    ("half", "0.5"),
+    ("third", "0.3333333333333333"),
+    ("quarter", "0.25"),
+    ("all", "1"),
+    ("everything", "1"),
+    ("entire", "1"),
+    ("whole", "1"),
+];
 const CURRENCY_MARKERS: &[&str] = &["usd", "usdt", "dollar", "dollars", "worth", "bucks", "buck"];
 
 impl SizeSpan {
@@ -40,8 +54,13 @@ impl SizeSpan {
                 cur.push('.');
             } else if ch.is_ascii_alphanumeric() {
                 cur.push(ch);
-            } else if !cur.is_empty() {
-                tokens.push(std::mem::take(&mut cur));
+            } else {
+                if !cur.is_empty() {
+                    tokens.push(std::mem::take(&mut cur));
+                }
+                if ch == '%' {
+                    tokens.push("%".to_string());
+                }
             }
         }
         if !cur.is_empty() {
@@ -49,6 +68,18 @@ impl SizeSpan {
         }
 
         let Some(idx) = tokens.iter().position(|t| parse_amount_token(t).is_some()) else {
+            if let Some((word, share)) = tokens.iter().find_map(|t| {
+                FRACTION_WORDS
+                    .iter()
+                    .find(|(word, _)| *word == t.as_str())
+                    .copied()
+            }) {
+                return Self {
+                    kind: SizeKind::Fraction,
+                    surface: word.to_string(),
+                    amount: share.to_string(),
+                };
+            }
             return Self {
                 kind: SizeKind::None,
                 surface: String::new(),
@@ -57,6 +88,17 @@ impl SizeSpan {
         };
         let mut amount = parse_amount_token(&tokens[idx]).unwrap_or_else(|| tokens[idx].clone());
         let mut surface = tokens[idx].clone();
+        if let Some(marker) = tokens
+            .get(idx + 1)
+            .filter(|t| PERCENT_MARKERS.contains(&t.as_str()))
+            && let Ok(percent) = Decimal::from_str(&amount)
+        {
+            return Self {
+                kind: SizeKind::Fraction,
+                surface: format!("{amount}{}", if marker == "%" { "%" } else { " percent" }),
+                amount: (percent / Decimal::from(100)).normalize().to_string(),
+            };
+        }
         if tokens.get(idx + 1).map(String::as_str) == Some("hundred")
             && let Ok(n) = amount.parse::<i64>()
         {
@@ -182,6 +224,8 @@ pub(crate) fn parse_amount(raw: &str) -> Option<Decimal> {
 pub(crate) enum Size {
     Quote(Decimal),
     Base(Decimal),
+    /// A share of the held position, with the words the user used.
+    Fraction(Decimal, String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +247,10 @@ pub(crate) enum SizeError {
     Mismatch {
         sentence: String,
         size_usd: String,
+    },
+    /// A fraction was asked of a position the account does not hold.
+    NoPosition {
+        instrument: String,
     },
     Invalid(String),
 }
@@ -248,6 +296,12 @@ impl SizeError {
                 "detail": "sentence is quote-denominated; resend with size_usd, not size_base/quantity",
                 "executable": false,
             }),
+            SizeError::NoPosition { instrument } => json!({
+                "error": "size_no_position",
+                "message": format!("You have no open `{instrument}` position to size that against."),
+                "reply_verbatim": true,
+                "executable": false,
+            }),
             SizeError::Invalid(detail) => json!({
                 "error": "invalid_size",
                 "detail": detail,
@@ -264,6 +318,9 @@ pub(crate) struct SizeInput<'a> {
     pub size_base: Option<&'a str>,
     pub quantity: Option<&'a str>,
     pub instrument: Option<&'a str>,
+    /// The base quantity the account already holds in this product (signed
+    /// for perps). A fraction in the sentence is a share of this.
+    pub held: Option<Decimal>,
 }
 
 impl SizeInput<'_> {
@@ -313,6 +370,11 @@ impl SizeInput<'_> {
                         .or_else(|| parse_amount(&span.amount))
                         .ok_or_else(|| SizeError::Invalid("base size is not a number".into()))?;
                     return Ok(Size::Base(amount));
+                }
+                SizeKind::Fraction => {
+                    let share = parse_amount(&span.amount)
+                        .ok_or_else(|| SizeError::Invalid("fraction is not a number".into()))?;
+                    return Ok(Size::Fraction(share, span.surface.clone()));
                 }
                 SizeKind::Ambiguous => {
                     return Err(SizeError::Ambiguous {
@@ -377,6 +439,35 @@ impl SizeInput<'_> {
                     denomination: "base",
                     mark,
                     base_qty: qty,
+                    notional,
+                })
+            }
+            Size::Fraction(share, words) => {
+                let instrument = self.instrument.unwrap_or("").to_string();
+                let held = self
+                    .held
+                    .map(|held| held.abs())
+                    .filter(|held| !held.is_zero())
+                    .ok_or(SizeError::NoPosition {
+                        instrument: instrument.clone(),
+                    })?;
+                if share <= Decimal::ZERO || share > Decimal::ONE {
+                    return Err(SizeError::Invalid(format!(
+                        "a share of the position must be between 0 and 100%, not {}",
+                        share.normalize()
+                    )));
+                }
+                let base_qty = held
+                    .checked_mul(share)
+                    .ok_or_else(|| SizeError::Invalid("fraction exceeds numeric range".into()))?;
+                let notional = base_qty
+                    .checked_mul(mark)
+                    .ok_or_else(|| SizeError::Invalid("notional exceeds numeric range".into()))?;
+                Ok(ResolvedSize {
+                    input: format!("{words} of {} {instrument}", format_base_qty(held)),
+                    denomination: "fraction",
+                    mark,
+                    base_qty,
                     notional,
                 })
             }
@@ -458,6 +549,51 @@ mod tests {
         .classify()
         .unwrap();
         assert_eq!(size, Size::Base(Decimal::from(200)));
+    }
+
+    #[test]
+    fn fractions_are_shares_of_the_held_position() {
+        let held = Decimal::from_str("0.05").unwrap();
+        let resolve = |sentence: &str, held: Option<Decimal>| {
+            SizeInput {
+                sentence: Some(sentence),
+                instrument: Some("WETH"),
+                held,
+                ..SizeInput::default()
+            }
+            .resolve(mark())
+        };
+        let half = resolve("sell half my WETH", Some(held)).unwrap();
+        assert_eq!(half.denomination, "fraction");
+        assert_eq!(half.base_qty, Decimal::from_str("0.025").unwrap());
+        assert_eq!(half.input, "half of 0.05 WETH");
+        assert_eq!(
+            resolve("sell 20% of my weth", Some(held)).unwrap().base_qty,
+            Decimal::from_str("0.01").unwrap()
+        );
+        assert_eq!(
+            resolve("sell twenty percent of my weth", Some(held))
+                .unwrap()
+                .base_qty,
+            Decimal::from_str("0.01").unwrap()
+        );
+        // A short is negative; closing all of it is its absolute size.
+        let short = resolve("close all my WETH short", Some(-held)).unwrap();
+        assert_eq!(short.base_qty, held);
+        assert_eq!(short.input, "all of 0.05 WETH");
+        // A number in the sentence wins over "all" (fill-all-or-nothing wording).
+        assert_eq!(
+            resolve("buy 0.1 WETH all or nothing", Some(held))
+                .unwrap()
+                .denomination,
+            "base"
+        );
+        let none = resolve("sell half my WETH", Some(Decimal::ZERO)).unwrap_err();
+        assert_eq!(none.to_json()["error"], "size_no_position");
+        assert!(matches!(
+            resolve("sell 150% of my weth", Some(held)).unwrap_err(),
+            SizeError::Invalid(_)
+        ));
     }
 
     #[test]

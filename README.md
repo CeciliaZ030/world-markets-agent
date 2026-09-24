@@ -44,9 +44,12 @@ Actions (the app encodes the venue call; the host stages, simulates, and
 commits it atomically through a routed tool return):
 
 - `execute_world_order` — same arguments as the preview; evaluates the mandate
-  itself and, on allow, packs the order word and encodes `new*Order`
-- `cancel_world_order` — reads the resting order by id and encodes
-  `cancel*Order`
+  itself and, on allow, packs the order word and encodes `new*Order`. Spot and
+  perp orders carry a limit price; lend-book orders (`side: lend | borrow`)
+  carry an annual rate. Sizes come from the sentence: dollars, asset units, or a
+  fraction of the held position ("half my WETH", "20%", "all")
+- `cancel_world_order` — reads a spot or perp order by id, or a lend-book order
+  by its resting rate, and encodes `cancel*Order`
 - `renew_world_loan` / `pay_world_loan_interest` — one borrower loan per call,
   gated on a bound mandate, the floor, and liquidation eligibility
 
@@ -56,8 +59,8 @@ host follows: one `evm_stage_tx` with that exact calldata, then an enforced
 never types a selector, an order word, or a number between tools.
 `src/skill/guard.json` restricts staged calls to the exchange contract and the
 fourteen trading selectors (six `new*Order`, six `cancel*Order`, `renewLoan`,
-`payInterestAndFees`) on chain 2092151908; placing or cancelling lend/borrow
-orders has no action tool yet.
+`payInterestAndFees`) on chain 2092151908. An asset World does not list stops
+every action tool with a pasteable `unknown_asset` message rather than a guess.
 
 The mandate fails closed: without a bound handover mandate every verdict is
 `missing_mandate` and nothing is staged. The bound account comes from

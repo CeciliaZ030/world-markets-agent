@@ -19,6 +19,10 @@ sol! {
     function cancelSpotSellOrder(address book, uint256 word);
     function cancelPerpBuyOrder(address book, uint256 word);
     function cancelPerpSellOrder(address book, uint256 word);
+    function newLendOrder(address book, uint256 word);
+    function newBorrowOrder(address book, uint256 word);
+    function cancelLendOrder(address book, uint256 word);
+    function cancelBorrowOrder(address book, uint256 word);
     function renewLoan(uint64 user, uint64 userToPay, uint64 almostDueLendingId);
     function payInterestAndFees(uint64 positionId, uint64 reduceQuantity, bool extendPeriod);
 }
@@ -58,8 +62,9 @@ pub(crate) struct StagedCall {
 }
 
 impl StagedCall {
-    /// A `new*Order` / `cancel*Order(address,uint256)` call for a spot or perp
-    /// book. `side` is already normalised to `buy` / `sell`.
+    /// A `new*Order` / `cancel*Order(address,uint256)` call. `side` is already
+    /// normalised: `buy` / `sell` on a spot or perp book, `lend` / `borrow` on
+    /// a lend book.
     pub(crate) fn order(
         venue: Venue,
         action: OrderAction,
@@ -101,6 +106,22 @@ impl StagedCall {
             (OrderAction::Cancel, "perp", "sell") => (
                 "cancelPerpSellOrder(address,uint256)",
                 cancelPerpSellOrderCall { book, word }.abi_encode(),
+            ),
+            (OrderAction::New, "lend", "lend") => (
+                "newLendOrder(address,uint256)",
+                newLendOrderCall { book, word }.abi_encode(),
+            ),
+            (OrderAction::New, "lend", "borrow") => (
+                "newBorrowOrder(address,uint256)",
+                newBorrowOrderCall { book, word }.abi_encode(),
+            ),
+            (OrderAction::Cancel, "lend", "lend") => (
+                "cancelLendOrder(address,uint256)",
+                cancelLendOrderCall { book, word }.abi_encode(),
+            ),
+            (OrderAction::Cancel, "lend", "borrow") => (
+                "cancelBorrowOrder(address,uint256)",
+                cancelBorrowOrderCall { book, word }.abi_encode(),
             ),
             _ => {
                 return Err(format!(
@@ -278,6 +299,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cancel.signature, "cancelPerpBuyOrder(address,uint256)");
+        let lend = StagedCall::order(
+            venue(),
+            OrderAction::New,
+            "lend",
+            "borrow",
+            book(),
+            word,
+            String::new(),
+        )
+        .unwrap();
+        assert_eq!(lend.signature, "newBorrowOrder(address,uint256)");
+        assert_eq!(
+            StagedCall::order(
+                venue(),
+                OrderAction::Cancel,
+                "lend",
+                "lend",
+                book(),
+                word,
+                String::new()
+            )
+            .unwrap()
+            .signature,
+            "cancelLendOrder(address,uint256)"
+        );
         assert!(
             StagedCall::order(
                 venue(),

@@ -114,6 +114,9 @@ fn deny_codes_have_copy() {
         "no_such_order",
         "no_such_loan",
         "position_id_unavailable",
+        "unknown_asset",
+        "size_no_position",
+        "empty_lend_book",
     ] {
         assert!(reporting.contains(rule), "reporting.md must cover `{rule}`");
     }
@@ -143,6 +146,10 @@ fn execution_procedure_is_one_action_tool_then_the_host_chain() {
     let cancel = pos("`cancel_world_order`");
     assert!(pos("`get_world_open_orders`") < cancel);
     assert!(pos("`renew_world_loan") > cancel);
+    assert!(
+        procedure.contains("interest_rate"),
+        "lend orders are placed and cancelled by rate"
+    );
     assert!(pos("`pay_world_loan_interest") > cancel);
     for forbidden in [
         "batchCommands",
