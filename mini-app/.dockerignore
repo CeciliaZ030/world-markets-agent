@@ -1,0 +1,9 @@
+.git
+**/node_modules
+**/.next
+**/.next-production
+**/.vercel
+**/.env
+**/.env.*
+**/state
+**/*.tsbuildinfo

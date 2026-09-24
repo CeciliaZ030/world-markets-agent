@@ -144,9 +144,9 @@ dependencies = [
 
 [[package]]
 name = "aomi-sdk"
-version = "4.0.0"
+version = "5.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b294b880ac907c4fe962a2df8ad55ccef634a145949dd5c946595d9726626a28"
+checksum = "e71414aec48a59c1c6633353e498a948dbe28b218cdf96363856a1c0ed15ee78"
 dependencies = [
  "bs58",
  "eyre",
@@ -3256,7 +3256,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "world-markets"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",

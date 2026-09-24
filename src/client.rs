@@ -1,14 +1,18 @@
+use std::collections::BTreeMap;
 use std::{env, str::FromStr};
 
 use alloy_primitives::{Address, I256, U256, hex};
 use alloy_sol_types::{SolCall, sol};
-use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 
-const DEFAULT_RPC_URL: &str = "https://mainnet.megaeth.com/rpc";
-const DEFAULT_EXCHANGE: &str = "0x5e3Ae52EbA0F9740364Bd5dd39738e1336086A8b";
-pub(crate) const CHAIN_ID: u64 = 4326;
+use crate::rpc::{self, RpcTransport, jsonrpc};
+
+const DEFAULT_RPC_URL: &str = "https://testnet-unifi-rpc.puffer.fi/";
+const DEFAULT_EXCHANGE: &str = "0xf6b54e033bb45a583aa642924bcef78b804588ae";
+pub(crate) const CHAIN_ID: u64 = 2092151908;
+/// Quote token (USDT). On-chain `getMarkPrice` reverts for this id — treat as 1.0.
+pub(crate) const BASE_TOKEN_ID: u32 = 1;
 
 sol! {
     function getUserId(address userAddress) external view returns (uint64);
@@ -35,12 +39,19 @@ sol! {
         external view returns (uint256[] orders);
     function searchSellOrders(uint64 userId, uint32 maxDepth, uint32 maxOrders, uint64 restartPosition)
         external view returns (uint256[] orders);
+    function readFundingRateHistory_4648699482(uint64 startTime, uint64 endTime, uint32 tokenId)
+        external view returns (uint64[] rates);
+    function bestBidOffer() external view returns (uint256 packed);
+    function retrieveBuyDepthChart(uint32 maxDepth) external view returns (uint256[] levels);
+    function retrieveSellDepthChart(uint32 maxDepth) external view returns (uint256[] levels);
+    function readLenderPositions(uint64 userId, uint32 tokenId) external view returns (uint256[] positions);
+    function readBorrowerPositions(uint64 userId, uint32 tokenId) external view returns (uint256[] positions);
+    function readLendingPosition(uint64 positionId) external view returns (uint256 position);
 }
 
 #[derive(Clone)]
 pub(crate) struct WorldClient {
-    http: Client,
-    rpc_url: String,
+    rpc: RpcTransport,
     exchange: Address,
 }
 
@@ -86,12 +97,36 @@ pub(crate) struct Account {
     pub(crate) non_debt_token_ids: Vec<u32>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct AccountAccess {
-    pub(crate) account_id: u64,
-    pub(crate) owner: String,
-    pub(crate) actor: String,
-    pub(crate) authorization: String,
+impl Account {
+    /// Signed quantity held in `product` for `base_symbol`: perp position,
+    /// spot vault balance, or lent quantity. Zero when absent.
+    pub(crate) fn position_quantity(
+        &self,
+        product: &str,
+        base_symbol: &str,
+    ) -> Result<rust_decimal::Decimal, String> {
+        let value = match product {
+            "perp" => self
+                .perpetual_positions
+                .iter()
+                .find(|position| position.symbol.eq_ignore_ascii_case(base_symbol))
+                .map(|position| position.quantity.as_str()),
+            "spot" => self
+                .balances
+                .iter()
+                .find(|balance| balance.symbol.eq_ignore_ascii_case(base_symbol))
+                .map(|balance| balance.balance.as_str()),
+            "lend" => self
+                .lending_positions
+                .iter()
+                .find(|position| position.symbol.eq_ignore_ascii_case(base_symbol))
+                .map(|position| position.lender_quantity.as_str()),
+            _ => None,
+        }
+        .unwrap_or("0");
+        crate::mandate::parse_decimal(value, "current_position_quantity")
+            .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,6 +137,14 @@ pub(crate) struct AgentPermission {
     pub(crate) authorized: bool,
     pub(crate) authorization: String,
     pub(crate) permitted_traders: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AccountAccess {
+    pub(crate) account_id: u64,
+    pub(crate) owner: String,
+    pub(crate) actor: String,
+    pub(crate) authorization: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -166,18 +209,6 @@ pub(crate) struct OpenOrders {
     pub(crate) sell_cursor: String,
 }
 
-#[derive(Deserialize)]
-struct RpcResponse {
-    result: Option<String>,
-    error: Option<RpcError>,
-}
-
-#[derive(Deserialize)]
-struct RpcError {
-    code: i64,
-    message: String,
-}
-
 impl Default for WorldClient {
     fn default() -> Self {
         let rpc_url = env::var("WORLD_RPC_URL").unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
@@ -186,37 +217,317 @@ impl Default for WorldClient {
             .parse()
             .expect("WORLD_EXCHANGE_ADDRESS must be a valid EVM address");
         Self {
-            http: Client::new(),
-            rpc_url,
+            rpc: RpcTransport::http(rpc_url),
             exchange,
         }
     }
 }
 
 impl WorldClient {
+    #[cfg(test)]
+    pub(crate) fn with_rpc(rpc: RpcTransport) -> Self {
+        Self {
+            rpc,
+            exchange: DEFAULT_EXCHANGE.parse().unwrap(),
+        }
+    }
+
     pub(crate) fn exchange(&self) -> String {
         format!("{:#x}", self.exchange)
     }
 
+    /// The World chain this client reads. Every hosted call must arrive on it.
+    pub(crate) fn chain_id(&self) -> u64 {
+        CHAIN_ID
+    }
+
+    /// Same RPC transport and cache, a different exchange contract (the one a
+    /// handover was issued against).
+    pub(crate) fn with_exchange(&self, exchange: Address) -> Self {
+        Self {
+            rpc: self.rpc.clone(),
+            exchange,
+        }
+    }
+
+    pub(crate) fn rpc_stats(&self) -> rpc::RpcStats {
+        self.rpc.stats()
+    }
+
+    /// Attach the RPC call delta since `before` when `WORLD_RPC_TRACE` is set.
+    pub(crate) fn attach_rpc_trace(&self, before: rpc::RpcStats, value: &mut Value) {
+        if !rpc::trace_enabled() {
+            return;
+        }
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "rpc".to_string(),
+                json!(self.rpc_stats().saturating_sub(&before)),
+            );
+        }
+    }
+
+    /// Mark price for an asset, independent of a specific order book.
+    pub(crate) fn mark_price(&self, token_id: u32) -> Result<(u64, String), String> {
+        if token_id == BASE_TOKEN_ID {
+            // Quote token has no on-chain mark; USDT notionals are already in quote units.
+            const ONE_RAW: u64 = 1 << 5;
+            return Ok((ONE_RAW, decode_price(ONE_RAW)));
+        }
+        let prices = self.mark_prices([token_id])?;
+        prices
+            .get(&token_id)
+            .cloned()
+            .ok_or_else(|| format!("[world-markets] missing mark for token {token_id}"))
+    }
+
+    pub(crate) fn mark_prices(
+        &self,
+        token_ids: impl IntoIterator<Item = u32>,
+    ) -> Result<BTreeMap<u32, (u64, String)>, String> {
+        let mut ids: Vec<u32> = token_ids.into_iter().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut out = BTreeMap::new();
+        let mut pending = Vec::new();
+        for id in ids {
+            if id == BASE_TOKEN_ID {
+                const ONE_RAW: u64 = 1 << 5;
+                out.insert(id, (ONE_RAW, decode_price(ONE_RAW)));
+                continue;
+            }
+            pending.push(id);
+        }
+        let specs: Vec<(Address, String, &'static str)> = pending
+            .iter()
+            .map(|id| {
+                (
+                    self.exchange,
+                    encode_call(&getMarkPriceCall { tokenId: *id }),
+                    getMarkPriceCall::SIGNATURE,
+                )
+            })
+            .collect();
+        let raws = self.eth_call_many_hex(&specs)?;
+        for (id, raw) in pending.iter().zip(raws) {
+            let price = decode_hex_return::<getMarkPriceCall>(&raw)?.price;
+            out.insert(*id, (price, decode_price(price)));
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn block_timestamp(&self) -> Result<u64, String> {
+        let body = jsonrpc(1, "eth_getBlockByNumber", json!(["latest", false]));
+        let block = self.rpc.cached_value(
+            "eth_getBlockByNumber:latest:false",
+            "eth_getBlockByNumber",
+            rpc::DEFAULT_TTL,
+            body,
+        )?;
+        let timestamp = block
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "[world-markets] block payload missing timestamp".to_string())?;
+        u64::from_str_radix(timestamp.trim_start_matches("0x"), 16)
+            .map_err(|e| format!("[world-markets] invalid block timestamp: {e}"))
+    }
+
+    pub(crate) fn funding_rate_history(
+        &self,
+        from_sec: u64,
+        to_sec: u64,
+        token_id: u32,
+    ) -> Result<Vec<u64>, String> {
+        Ok(self
+            .call(&readFundingRateHistory_4648699482Call {
+                startTime: from_sec,
+                endTime: to_sec,
+                tokenId: token_id,
+            })?
+            .rates)
+    }
+
+    pub(crate) fn funding_rate_histories(
+        &self,
+        from_sec: u64,
+        to_sec: u64,
+        token_ids: &[u32],
+    ) -> Result<Vec<Vec<u64>>, String> {
+        let specs: Vec<(Address, String, &'static str)> = token_ids
+            .iter()
+            .map(|id| {
+                (
+                    self.exchange,
+                    encode_call(&readFundingRateHistory_4648699482Call {
+                        startTime: from_sec,
+                        endTime: to_sec,
+                        tokenId: *id,
+                    }),
+                    readFundingRateHistory_4648699482Call::SIGNATURE,
+                )
+            })
+            .collect();
+        let raws = self.eth_call_many_hex(&specs)?;
+        raws.iter()
+            .map(|raw| Ok(decode_hex_return::<readFundingRateHistory_4648699482Call>(raw)?.rates))
+            .collect()
+    }
+
+    pub(crate) fn current_funding_rate_8h(&self, token_id: u32) -> Result<Option<String>, String> {
+        if token_id == BASE_TOKEN_ID {
+            return Ok(None);
+        }
+        let now = self.block_timestamp()?;
+        self.current_funding_rate_at(token_id, now)
+    }
+
+    pub(crate) fn current_funding_rate_at(
+        &self,
+        token_id: u32,
+        now: u64,
+    ) -> Result<Option<String>, String> {
+        if token_id == BASE_TOKEN_ID {
+            return Ok(None);
+        }
+        let from = now.saturating_sub(8 * 3600);
+        let rates = self.funding_rate_history(from, now, token_id)?;
+        Ok(rates.last().copied().map(decode_funding_rate))
+    }
+
+    pub(crate) fn lend_book_rates(&self, token_id: u32) -> Result<LendBookRates, String> {
+        Ok(self
+            .lend_book_rates_many(&[token_id])?
+            .into_iter()
+            .next()
+            .unwrap_or_default())
+    }
+
+    pub(crate) fn lend_book_rates_many(
+        &self,
+        token_ids: &[u32],
+    ) -> Result<Vec<LendBookRates>, String> {
+        if token_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let book_specs: Vec<(Address, String, &'static str)> = token_ids
+            .iter()
+            .map(|id| {
+                (
+                    self.exchange,
+                    encode_call(&getLendOrderBookCall { tokenId: *id }),
+                    getLendOrderBookCall::SIGNATURE,
+                )
+            })
+            .collect();
+        let book_raws = self.eth_call_many_hex(&book_specs)?;
+        let books: Vec<Address> = book_raws
+            .iter()
+            .map(|raw| Ok(decode_hex_return::<getLendOrderBookCall>(raw)?.book))
+            .collect::<Result<_, String>>()?;
+
+        let mut bbo_specs = Vec::new();
+        let mut bbo_slots = Vec::new();
+        for (i, book) in books.iter().enumerate() {
+            if !book.is_zero() {
+                bbo_slots.push(i);
+                bbo_specs.push((
+                    *book,
+                    encode_call(&bestBidOfferCall {}),
+                    bestBidOfferCall::SIGNATURE,
+                ));
+            }
+        }
+        let bbo_raws = self.eth_call_many_hex_loose(&bbo_specs)?;
+        let mut out = vec![LendBookRates::default(); token_ids.len()];
+        for (slot, raw) in bbo_slots.iter().zip(bbo_raws) {
+            let book = books[*slot];
+            if let Ok(hex) = raw
+                && let Ok(ret) = decode_hex_return::<bestBidOfferCall>(&hex)
+            {
+                let packed = ret.packed;
+                let bid = decode_book_rate(field(packed, 0, 64));
+                let ask = decode_book_rate(field(packed, 128, 64));
+                if bid.is_some() || ask.is_some() {
+                    out[*slot] = LendBookRates {
+                        lend_apr: bid,
+                        borrow_apr: ask,
+                    };
+                    continue;
+                }
+            }
+            out[*slot] = self.lend_book_from_depth(book)?;
+        }
+        Ok(out)
+    }
+
+    fn lend_book_from_depth(&self, book: Address) -> Result<LendBookRates, String> {
+        let buys = self
+            .call_at(book, &retrieveBuyDepthChartCall { maxDepth: 8 })
+            .ok()
+            .and_then(|ret| first_depth_rate(&ret.levels));
+        let sells = self
+            .call_at(book, &retrieveSellDepthChartCall { maxDepth: 8 })
+            .ok()
+            .and_then(|ret| first_depth_rate(&ret.levels));
+        Ok(LendBookRates {
+            lend_apr: buys,
+            borrow_apr: sells,
+        })
+    }
+
+    pub(crate) fn lender_position_ids(
+        &self,
+        user_id: u64,
+        token_id: u32,
+    ) -> Result<Vec<u64>, String> {
+        let words = self
+            .call(&readLenderPositionsCall {
+                userId: user_id,
+                tokenId: token_id,
+            })?
+            .positions;
+        Ok(decode_position_ids(&words))
+    }
+
+    pub(crate) fn borrower_position_ids(
+        &self,
+        user_id: u64,
+        token_id: u32,
+    ) -> Result<Vec<u64>, String> {
+        let words = self
+            .call(&readBorrowerPositionsCall {
+                userId: user_id,
+                tokenId: token_id,
+            })?
+            .positions;
+        Ok(decode_position_ids(&words))
+    }
+
+    pub(crate) fn lending_position(&self, position_id: u64) -> Result<PackedLoan, String> {
+        let packed = self
+            .call(&readLendingPositionCall {
+                positionId: position_id,
+            })?
+            .position;
+        Ok(PackedLoan::decode(position_id, packed))
+    }
+
     pub(crate) fn block_number(&self) -> Result<u64, String> {
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_blockNumber",
-            "params": [],
-        });
-        let response = self.rpc(body)?;
-        let raw = response
-            .result
-            .ok_or_else(|| self.rpc_error("eth_blockNumber", response.error))?;
-        u64::from_str_radix(raw.trim_start_matches("0x"), 16)
+        let body = jsonrpc(1, "eth_blockNumber", json!([]));
+        let raw =
+            self.rpc
+                .cached_value("eth_blockNumber", "eth_blockNumber", rpc::DEFAULT_TTL, body)?;
+        let hex = raw
+            .as_str()
+            .ok_or_else(|| "[world-markets] RPC eth_blockNumber returned no result".to_string())?;
+        u64::from_str_radix(hex.trim_start_matches("0x"), 16)
             .map_err(|e| format!("[world-markets] invalid block number: {e}"))
     }
 
     pub(crate) fn assets(&self) -> Result<Vec<Asset>, String> {
         let returns = self.call(&bulkReadTokenConfigs_3423260018Call {})?;
         let mut assets = Vec::new();
-        for chunk in returns.configs.chunks_exact(3) {
+        for chunk in returns.configs.as_chunks::<3>().0 {
             if chunk[0].is_zero() {
                 break;
             }
@@ -234,7 +545,7 @@ impl WorldClient {
     }
 
     #[cfg(test)]
-    fn latest_account_id(&self) -> Result<u64, String> {
+    pub(crate) fn latest_account_id(&self) -> Result<u64, String> {
         Ok(self.call(&bulkReadMaxUserId_5445644137Call {})?.maxUserId)
     }
 
@@ -248,29 +559,111 @@ impl WorldClient {
             .traders)
     }
 
-    pub(crate) fn account(&self, account_id: u64, assets: &[Asset]) -> Result<Account, String> {
+    /// Whether `actor` may trade `account_id` right now: the owner, an
+    /// on-chain permitted trader, or nobody. Read fresh on every call, so a
+    /// revocation shows on the next check.
+    pub(crate) fn agent_permission(
+        &self,
+        account_id: u64,
+        actor: &str,
+    ) -> Result<AgentPermission, String> {
+        let actor = Address::from_str(actor)
+            .map_err(|e| format!("[world-markets] invalid actor address: {e}"))?;
         let owner = self.owner_for(account_id)?;
         if owner.is_zero() {
             return Err(format!(
                 "[world-markets] World account {account_id} does not exist"
             ));
         }
+        let traders = self.traders_for(account_id)?;
+        let authorization = if actor == owner {
+            "owner"
+        } else if traders.contains(&actor) {
+            "delegated_trader"
+        } else {
+            "none"
+        };
+        Ok(AgentPermission {
+            account_id,
+            owner: format!("{owner:#x}"),
+            actor: format!("{actor:#x}"),
+            authorized: authorization != "none",
+            authorization: authorization.to_string(),
+            permitted_traders: traders
+                .into_iter()
+                .map(|address| format!("{address:#x}"))
+                .collect(),
+        })
+    }
 
-        let risk_raw = self
-            .call(&riskAdjustedPortfolioValueCall { userId: account_id })?
-            ._0;
-        let bits = self.call(&userBitsCall { userId: account_id })?;
+    #[cfg(test)]
+    pub(crate) fn account(&self, account_id: u64, assets: &[Asset]) -> Result<Account, String> {
+        let owner = self.owner_for(account_id)?;
+        self.account_with_owner(account_id, owner, assets)
+    }
+
+    pub(crate) fn account_with_owner(
+        &self,
+        account_id: u64,
+        owner: Address,
+        assets: &[Asset],
+    ) -> Result<Account, String> {
+        if owner.is_zero() {
+            return Err(format!(
+                "[world-markets] World account {account_id} does not exist"
+            ));
+        }
+
+        let mut specs: Vec<(Address, String, &'static str)> = vec![
+            (
+                self.exchange,
+                encode_call(&riskAdjustedPortfolioValueCall { userId: account_id }),
+                riskAdjustedPortfolioValueCall::SIGNATURE,
+            ),
+            (
+                self.exchange,
+                encode_call(&userBitsCall { userId: account_id }),
+                userBitsCall::SIGNATURE,
+            ),
+        ];
+        for asset in assets {
+            specs.push((
+                self.exchange,
+                encode_call(&getBalanceCall {
+                    user: account_id,
+                    tokenId: asset.token_id,
+                }),
+                getBalanceCall::SIGNATURE,
+            ));
+            specs.push((
+                self.exchange,
+                encode_call(&readLendingAggregationCall {
+                    userId: account_id,
+                    tokenId: asset.token_id,
+                }),
+                readLendingAggregationCall::SIGNATURE,
+            ));
+            specs.push((
+                self.exchange,
+                encode_call(&readPerpAggPositionCall {
+                    userId: account_id,
+                    tokenId: asset.token_id,
+                }),
+                readPerpAggPositionCall::SIGNATURE,
+            ));
+        }
+        let raws = self.eth_call_many_hex(&specs)?;
+        let risk_raw = decode_hex_return::<riskAdjustedPortfolioValueCall>(&raws[0])?._0;
+        let bits = decode_hex_return::<userBitsCall>(&raws[1])?;
         let debt_token_ids = token_ids_from_bits(bits.debt);
         let non_debt_token_ids = token_ids_from_bits(bits.noDebt);
         let mut balances = Vec::new();
         let mut lending_positions = Vec::new();
         let mut perpetual_positions = Vec::new();
-
+        let mut offset = 2;
         for asset in assets {
-            let raw = self.call(&getBalanceCall {
-                user: account_id,
-                tokenId: asset.token_id,
-            })?;
+            let raw = decode_hex_return::<getBalanceCall>(&raws[offset])?;
+            offset += 1;
             if raw.balance != 0 || raw.spotLendSequestered != 0 || raw.perpSequestered != 0 {
                 let reserved_position_raw = u128::from(raw.spotLendSequestered)
                     .saturating_add(u128::from(raw.perpSequestered));
@@ -296,18 +689,14 @@ impl WorldClient {
                 });
             }
 
-            let lending = self.call(&readLendingAggregationCall {
-                userId: account_id,
-                tokenId: asset.token_id,
-            })?;
+            let lending = decode_hex_return::<readLendingAggregationCall>(&raws[offset])?;
+            offset += 1;
             if field(lending.position, 0, 64) != 0 || field(lending.position, 64, 64) != 0 {
                 lending_positions.push(LendingPosition::decode(asset, lending.position));
             }
 
-            let perpetual = self.call(&readPerpAggPositionCall {
-                userId: account_id,
-                tokenId: asset.token_id,
-            })?;
+            let perpetual = decode_hex_return::<readPerpAggPositionCall>(&raws[offset])?;
+            offset += 1;
             let perp_quantity = signed_field(perpetual.position, 64, 64)?;
             let perp_owed_nom = signed_field(perpetual.position, 128, 96)?;
             if perp_quantity != 0 || perp_owed_nom != 0 || perpetual.owedBase != I256::ZERO {
@@ -337,6 +726,20 @@ impl WorldClient {
             debt_token_ids,
             non_debt_token_ids,
         })
+    }
+
+    /// Local aomi-run stubs the acting wallet; with `WORLD_ACCOUNT_ID` set a
+    /// local build lets read-only account tools act as the on-chain owner.
+    /// A hosted build never does.
+    fn dev_owner_read_enabled() -> bool {
+        #[cfg(feature = "local-dev")]
+        {
+            std::env::var("WORLD_ACCOUNT_ID").is_ok()
+        }
+        #[cfg(not(feature = "local-dev"))]
+        {
+            false
+        }
     }
 
     pub(crate) fn resolve_account(
@@ -382,62 +785,77 @@ impl WorldClient {
             ));
         }
 
-        let actor = actor.or(owner_wallet).ok_or_else(|| {
-            "[world-markets] no acting wallet is bound; connect the owner wallet or use an active handover"
-                .to_string()
-        })?;
-        let (authorized, authorization) = if actor == owner {
-            (true, "owner")
+        let actor = actor.or(owner_wallet);
+        let (actor, authorization) = if let Some(actor) = actor {
+            let (authorized, authorization) = if actor == owner {
+                (true, "owner")
+            } else {
+                let traders = self.traders_for(id)?;
+                (traders.contains(&actor), "delegated_trader")
+            };
+            if !authorized {
+                return Err(format!(
+                    "[world-markets] actor {actor:#x} is neither the owner {owner:#x} nor a permitted trader for account {id}; the grant may be missing or revoked"
+                ));
+            }
+            (actor, authorization.to_string())
+        } else if account_id.is_some() && Self::dev_owner_read_enabled() {
+            // aomi-run stubs evm-core; WORLD_ACCOUNT_ID scopes read-only dev lookups.
+            (owner, "dev_owner_read".to_string())
         } else {
-            let traders = self.traders_for(id)?;
-            (traders.contains(&actor), "delegated_trader")
+            return Err(
+                "[world-markets] no acting wallet is bound; connect the owner wallet or use an active handover"
+                    .to_string(),
+            );
         };
-        if !authorized {
-            return Err(format!(
-                "[world-markets] actor {actor:#x} is neither the owner {owner:#x} nor a permitted trader for account {id}; the grant may be missing or revoked"
-            ));
-        }
 
         Ok(AccountAccess {
             account_id: id,
             owner: format!("{owner:#x}"),
             actor: format!("{actor:#x}"),
-            authorization: authorization.to_string(),
+            authorization,
         })
     }
 
-    pub(crate) fn agent_permission(
+    /// Book contract and its buy/pay token ids for a product and pair. A zero
+    /// address means the exchange lists no such book.
+    pub(crate) fn book(
         &self,
-        account_id: u64,
-        actor: &str,
-    ) -> Result<AgentPermission, String> {
-        let actor = Address::from_str(actor)
-            .map_err(|e| format!("[world-markets] invalid actor address: {e}"))?;
-        let owner = self.owner_for(account_id)?;
-        if owner.is_zero() {
-            return Err(format!(
-                "[world-markets] World account {account_id} does not exist"
-            ));
+        product: &str,
+        base_token_id: u32,
+        quote_token_id: Option<u32>,
+    ) -> Result<(Address, Option<u32>, Option<u32>), String> {
+        match product {
+            "spot" => {
+                let quote = quote_token_id.ok_or_else(|| {
+                    "[world-markets] quote_symbol is required for a spot market".to_string()
+                })?;
+                let result = self.call(&getSpotOrderBookCall {
+                    token1: base_token_id,
+                    token2: quote,
+                })?;
+                Ok((result.book, Some(result.buyToken), Some(result.payToken)))
+            }
+            "perp" | "perpetual" => {
+                let quote = quote_token_id.ok_or_else(|| {
+                    "[world-markets] quote_symbol is required for a perpetual market".to_string()
+                })?;
+                let result = self.call(&getPerpOrderBookCall {
+                    token1: base_token_id,
+                    token2: quote,
+                })?;
+                Ok((result.book, Some(result.buyToken), Some(result.payToken)))
+            }
+            "lend" | "lending" => {
+                let result = self.call(&getLendOrderBookCall {
+                    tokenId: base_token_id,
+                })?;
+                Ok((result.book, None, None))
+            }
+            other => Err(format!(
+                "[world-markets] unsupported product {other:?}; use spot, perp, or lend"
+            )),
         }
-        let traders = self.traders_for(account_id)?;
-        let authorization = if actor == owner {
-            "owner"
-        } else if traders.contains(&actor) {
-            "delegated_trader"
-        } else {
-            "none"
-        };
-        Ok(AgentPermission {
-            account_id,
-            owner: format!("{owner:#x}"),
-            actor: format!("{actor:#x}"),
-            authorized: authorization != "none",
-            authorization: authorization.to_string(),
-            permitted_traders: traders
-                .into_iter()
-                .map(|address| format!("{address:#x}"))
-                .collect(),
-        })
     }
 
     pub(crate) fn market(
@@ -446,39 +864,11 @@ impl WorldClient {
         base: Asset,
         quote: Option<Asset>,
     ) -> Result<Market, String> {
-        let (book, buy_token_id, pay_token_id) = match product {
-            "spot" => {
-                let quote = quote.as_ref().ok_or_else(|| {
-                    "[world-markets] quote_symbol is required for a spot market".to_string()
-                })?;
-                let result = self.call(&getSpotOrderBookCall {
-                    token1: base.token_id,
-                    token2: quote.token_id,
-                })?;
-                (result.book, Some(result.buyToken), Some(result.payToken))
-            }
-            "perp" | "perpetual" => {
-                let quote = quote.as_ref().ok_or_else(|| {
-                    "[world-markets] quote_symbol is required for a perpetual market".to_string()
-                })?;
-                let result = self.call(&getPerpOrderBookCall {
-                    token1: base.token_id,
-                    token2: quote.token_id,
-                })?;
-                (result.book, Some(result.buyToken), Some(result.payToken))
-            }
-            "lend" | "lending" => {
-                let result = self.call(&getLendOrderBookCall {
-                    tokenId: base.token_id,
-                })?;
-                (result.book, None, None)
-            }
-            other => {
-                return Err(format!(
-                    "[world-markets] unsupported product {other:?}; use spot, perp, or lend"
-                ));
-            }
-        };
+        let (book, buy_token_id, pay_token_id) = self.book(
+            product,
+            base.token_id,
+            quote.as_ref().map(|asset| asset.token_id),
+        )?;
         if book.is_zero() {
             let pair = quote
                 .as_ref()
@@ -489,11 +879,7 @@ impl WorldClient {
                 base.symbol
             ));
         }
-        let mark_price_raw = self
-            .call(&getMarkPriceCall {
-                tokenId: base.token_id,
-            })?
-            .price;
+        let (mark_price_raw, mark_price) = self.mark_price(base.token_id)?;
 
         Ok(Market {
             product: product.to_string(),
@@ -503,7 +889,7 @@ impl WorldClient {
             buy_token_id,
             pay_token_id,
             mark_price_raw,
-            mark_price: decode_price(mark_price_raw),
+            mark_price,
         })
     }
 
@@ -562,45 +948,102 @@ impl WorldClient {
     }
 
     fn call_at<C: SolCall>(&self, target: Address, call: &C) -> Result<C::Return, String> {
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_call",
-            "params": [{
-                "to": format!("{target:#x}"),
-                "data": format!("0x{}", hex::encode(call.abi_encode())),
-            }, "latest"],
-        });
-        let response = self.rpc(body)?;
-        let raw = response
-            .result
-            .ok_or_else(|| self.rpc_error(C::SIGNATURE, response.error))?;
-        let bytes = hex::decode(raw.trim_start_matches("0x"))
-            .map_err(|e| format!("[world-markets] invalid RPC hex for {}: {e}", C::SIGNATURE))?;
-        C::abi_decode_returns(&bytes, true)
-            .map_err(|e| format!("[world-markets] ABI decode for {}: {e}", C::SIGNATURE))
+        let data = encode_call(call);
+        let raw = self.eth_call_hex(target, &data, C::SIGNATURE)?;
+        decode_hex_return::<C>(&raw)
     }
 
-    fn rpc(&self, body: Value) -> Result<RpcResponse, String> {
-        self.http
-            .post(&self.rpc_url)
-            .json(&body)
-            .send()
-            .and_then(|response| response.error_for_status())
-            .map_err(|e| format!("[world-markets] MegaETH RPC request failed: {e}"))?
-            .json()
-            .map_err(|e| format!("[world-markets] MegaETH RPC response was invalid: {e}"))
+    fn eth_call_hex(&self, target: Address, data: &str, signature: &str) -> Result<String, String> {
+        let key = format!("eth_call:{target:#x}:{data}");
+        let body = jsonrpc(
+            1,
+            "eth_call",
+            json!([{ "to": format!("{target:#x}"), "data": data }, "latest"]),
+        );
+        hex_result(
+            self.rpc
+                .cached_value(&key, signature, rpc::ttl_for_signature(signature), body)?,
+            signature,
+        )
     }
 
-    fn rpc_error(&self, method: &str, error: Option<RpcError>) -> String {
-        match error {
-            Some(error) => format!(
-                "[world-markets] RPC {method} failed ({}): {}",
-                error.code, error.message
-            ),
-            None => format!("[world-markets] RPC {method} returned no result"),
-        }
+    fn eth_call_many_hex(
+        &self,
+        calls: &[(Address, String, &'static str)],
+    ) -> Result<Vec<String>, String> {
+        let items: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, (target, data, sig))| {
+                (
+                    format!("eth_call:{target:#x}:{data}"),
+                    (*sig).to_string(),
+                    rpc::ttl_for_signature(sig),
+                    jsonrpc(
+                        i as u64,
+                        "eth_call",
+                        json!([{ "to": format!("{target:#x}"), "data": data }, "latest"]),
+                    ),
+                )
+            })
+            .collect();
+        self.rpc
+            .cached_many(&items)?
+            .into_iter()
+            .enumerate()
+            .map(|(i, result)| hex_result(result?, calls[i].2))
+            .collect()
     }
+
+    fn eth_call_many_hex_loose(
+        &self,
+        calls: &[(Address, String, &'static str)],
+    ) -> Result<Vec<Result<String, String>>, String> {
+        let items: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, (target, data, sig))| {
+                (
+                    format!("eth_call:{target:#x}:{data}"),
+                    (*sig).to_string(),
+                    rpc::ttl_for_signature(sig),
+                    jsonrpc(
+                        i as u64,
+                        "eth_call",
+                        json!([{ "to": format!("{target:#x}"), "data": data }, "latest"]),
+                    ),
+                )
+            })
+            .collect();
+        Ok(self
+            .rpc
+            .cached_many(&items)?
+            .into_iter()
+            .enumerate()
+            .map(|(i, result)| match result {
+                Ok(value) => hex_result(value, calls[i].2),
+                Err(err) => Err(err),
+            })
+            .collect())
+    }
+}
+
+fn encode_call<C: SolCall>(call: &C) -> String {
+    format!("0x{}", hex::encode(call.abi_encode()))
+}
+
+fn decode_hex_return<C: SolCall>(raw: &str) -> Result<C::Return, String> {
+    let bytes = hex::decode(raw.trim_start_matches("0x"))
+        .map_err(|e| format!("[world-markets] invalid RPC hex for {}: {e}", C::SIGNATURE))?;
+    C::abi_decode_returns(&bytes, true)
+        .map_err(|e| format!("[world-markets] ABI decode for {}: {e}", C::SIGNATURE))
+}
+
+fn hex_result(value: Value, signature: &str) -> Result<String, String> {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .ok_or_else(|| format!("[world-markets] RPC {signature} returned a non-hex result"))
 }
 
 fn decode_open_orders(
@@ -697,6 +1140,99 @@ impl LendingPosition {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LendBookRates {
+    /// Best bid on this asset's lend book (taker-lend).
+    pub(crate) lend_apr: Option<String>,
+    /// Best ask on this asset's lend book (taker-borrow).
+    pub(crate) borrow_apr: Option<String>,
+}
+
+/// Individual lend/borrow position unpacked from `readLendingPosition`.
+/// Layout: bits 0–64 quantity, 64–64 counterparty user id, 128–16 interest
+/// (4 dp fraction), 144–32 start unix seconds, 176–1 do-not-return.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PackedLoan {
+    pub(crate) position_id: u64,
+    pub(crate) quantity_raw: u64,
+    pub(crate) counterparty_id: u64,
+    pub(crate) interest_rate: String,
+    pub(crate) started_at_unix: Option<u64>,
+    pub(crate) do_not_return: bool,
+}
+
+impl PackedLoan {
+    pub(crate) fn decode(position_id: u64, packed: U256) -> Self {
+        let quantity_raw = field(packed, 0, 64);
+        let counterparty_id = field(packed, 64, 64);
+        let rate_raw = field(packed, 128, 16) as u16;
+        let started = field(packed, 144, 32);
+        let started_at_unix = if (1_600_000_000..2_200_000_000).contains(&started) {
+            Some(started)
+        } else {
+            None
+        };
+        let do_not_return = field(packed, 176, 1) == 1;
+        Self {
+            position_id,
+            quantity_raw,
+            counterparty_id,
+            interest_rate: decimal(rate_raw, 4),
+            started_at_unix,
+            do_not_return,
+        }
+    }
+}
+
+fn decode_funding_rate(raw: u64) -> String {
+    decimal(raw, 7)
+}
+
+fn decode_book_rate(raw: u64) -> Option<String> {
+    if raw == 0 {
+        return None;
+    }
+    // Lend-book "price" is an APR. On UniFi it matches lending aggregation:
+    // 16-bit 4-decimal fraction (600 → 0.0600 = 6%). Packed-price encoding is
+    // the fallback for books that quote like spot.
+    if raw <= u64::from(u16::MAX) {
+        return Some(decimal(raw, 4));
+    }
+    let as_price = decode_price(raw);
+    if as_price != "0" {
+        return Some(as_price);
+    }
+    None
+}
+
+fn first_depth_rate(levels: &[U256]) -> Option<String> {
+    let word = levels.iter().find(|w| !w.is_zero())?;
+    decode_book_rate(field(*word, 0, 64)).or_else(|| decode_book_rate(field(*word, 64, 64)))
+}
+
+fn decode_position_ids(words: &[U256]) -> Vec<u64> {
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let returned = field(words[0], 0, 32) as usize;
+    if returned > 0 && returned < words.len() {
+        return words
+            .iter()
+            .skip(1)
+            .take(returned)
+            .filter(|w| !w.is_zero())
+            .map(|w| field(*w, 0, 64))
+            .filter(|id| *id != 0)
+            .collect();
+    }
+    words
+        .iter()
+        .filter(|w| !w.is_zero())
+        .filter(|w| w.bit_len() <= 64)
+        .map(|w| w.to::<u64>())
+        .collect()
+}
+
 impl PerpetualPosition {
     fn decode(asset: &Asset, packed: U256, owed_base: I256) -> Result<Self, String> {
         let entry_price_raw = field(packed, 0, 64);
@@ -790,7 +1326,7 @@ fn signed_decimal_i128(value: i128, decimals: u8) -> String {
     }
 }
 
-fn decimal_digits(mut digits: String, decimals: u8) -> String {
+pub(crate) fn decimal_digits(mut digits: String, decimals: u8) -> String {
     let decimals = usize::from(decimals);
     if decimals == 0 {
         return digits;
@@ -809,7 +1345,7 @@ fn decimal_digits(mut digits: String, decimals: u8) -> String {
     digits
 }
 
-fn decode_price(raw: u64) -> String {
+pub(crate) fn decode_price(raw: u64) -> String {
     let exponent = (raw & 0x1f) as u8;
     decimal_digits((raw >> 5).to_string(), exponent)
 }
@@ -817,15 +1353,31 @@ fn decode_price(raw: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        WorldClient, decimal_digits, decode_open_orders, decode_price, packed_string, signed_field,
+        BASE_TOKEN_ID, WorldClient, decimal_digits, decode_book_rate, decode_open_orders,
+        decode_price, packed_string, signed_field,
     };
     use alloy_primitives::U256;
+
+    #[test]
+    fn base_token_mark_price_is_one_without_rpc() {
+        let client = WorldClient::default();
+        let (raw, mark) = client.mark_price(BASE_TOKEN_ID).unwrap();
+        assert_eq!(raw, 1 << 5);
+        assert_eq!(mark, "1");
+    }
 
     #[test]
     fn formats_decimal_values() {
         assert_eq!(decimal_digits("123456".to_string(), 3), "123.456");
         assert_eq!(decimal_digits("5".to_string(), 6), "0.000005");
         assert_eq!(decimal_digits("1000".to_string(), 3), "1.0");
+    }
+
+    #[test]
+    fn decodes_lend_book_rate_as_four_decimal_fraction() {
+        assert_eq!(decode_book_rate(600).as_deref(), Some("0.06"));
+        assert_eq!(decode_book_rate(550).as_deref(), Some("0.055"));
+        assert_eq!(decode_book_rate(0), None);
     }
 
     #[test]
@@ -866,7 +1418,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires live MegaETH RPC"]
+    #[ignore = "requires live UniFi RPC"]
     fn reads_live_world_assets() {
         let client = WorldClient::default();
         let block = client.block_number().unwrap();
@@ -885,13 +1437,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires live MegaETH RPC"]
+    #[ignore = "requires live UniFi RPC"]
     fn reads_live_world_market_and_account() {
         let client = WorldClient::default();
         let assets = client.assets().unwrap();
         let weth = super::asset_by_symbol(&assets, "WETH").unwrap();
-        let usdm = super::asset_by_symbol(&assets, "USDm").unwrap();
-        let market = client.market("spot", weth, Some(usdm)).unwrap();
+        let usdt = super::asset_by_symbol(&assets, "USDT").unwrap();
+        let market = client.market("spot", weth, Some(usdt)).unwrap();
         let account_id = client.latest_account_id().unwrap();
         let account = client.account(account_id, &assets).unwrap();
         println!(
@@ -907,21 +1459,85 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires live MegaETH RPC"]
+    #[ignore = "requires live UniFi RPC"]
     fn reads_live_world_permissions_and_open_orders() {
         let client = WorldClient::default();
         let assets = client.assets().unwrap();
         let weth = super::asset_by_symbol(&assets, "WETH").unwrap();
-        let usdm = super::asset_by_symbol(&assets, "USDm").unwrap();
-        let market = client.market("perp", weth, Some(usdm)).unwrap();
+        let usdt = super::asset_by_symbol(&assets, "USDT").unwrap();
+        let market = client.market("perp", weth, Some(usdt)).unwrap();
         let account_id = client.latest_account_id().unwrap();
         let owner = client.owner_for(account_id).unwrap();
-        let permission = client
-            .agent_permission(account_id, &format!("{owner:#x}"))
+        let access = client
+            .resolve_account(Some(account_id), None, Some(&format!("{owner:#x}")))
             .unwrap();
         let orders = client.open_orders(&market, account_id).unwrap();
-        assert!(permission.authorized);
-        assert_eq!(permission.authorization, "owner");
+        assert_eq!(access.authorization, "owner");
         assert_eq!(orders.account_id, account_id);
+    }
+
+    #[test]
+    #[ignore = "requires live UniFi RPC"]
+    fn repeated_account_read_is_cached() {
+        let client = WorldClient::default();
+        let assets = client.assets().unwrap();
+        let account_id = client.latest_account_id().unwrap();
+        let before = client.rpc_stats();
+        let _ = client.account(account_id, &assets).unwrap();
+        let first = client.rpc_stats().saturating_sub(&before);
+        let before_again = client.rpc_stats();
+        let _ = client.account(account_id, &assets).unwrap();
+        let second = client.rpc_stats().saturating_sub(&before_again);
+        println!(
+            "first_posts={} second_posts={} first_hits={} second_hits={}",
+            first.posts, second.posts, first.hits, second.hits
+        );
+        assert!(first.posts >= 1, "first read must hit the RPC");
+        assert_eq!(second.posts, 0, "second read must be served from cache");
+    }
+
+    #[test]
+    #[ignore = "requires live UniFi RPC"]
+    fn reads_live_world_rates_and_loans() {
+        let client = WorldClient::default();
+        let assets = client.assets().unwrap();
+        let weth = super::asset_by_symbol(&assets, "WETH").unwrap();
+        let usdt = super::asset_by_symbol(&assets, "USDT").unwrap();
+        let funding = client.current_funding_rate_8h(weth.token_id);
+        let weth_book = client.lend_book_rates(weth.token_id);
+        let usdt_book = client.lend_book_rates(usdt.token_id);
+        funding.expect("funding read");
+        let weth_book = weth_book.expect("weth lend book");
+        let usdt_book = usdt_book.expect("usdt lend book");
+        assert!(
+            weth_book
+                .lend_apr
+                .as_deref()
+                .is_some_and(|r| r.starts_with("0.")),
+            "weth lend apr should be a decimal fraction, got {weth_book:?}"
+        );
+        assert!(
+            usdt_book
+                .borrow_apr
+                .as_deref()
+                .is_some_and(|r| r.starts_with("0.")),
+            "usdt borrow apr should be a decimal fraction, got {usdt_book:?}"
+        );
+
+        let rates = crate::rates::snapshot(&client, Some(&["WETH".to_string()])).unwrap();
+        assert_eq!(rates.source, "world-markets-contract");
+        assert!(!rates.executable);
+        let row = rates
+            .rates
+            .iter()
+            .find(|row| row.base_symbol == "WETH")
+            .expect("WETH rates row");
+        assert!(row.funding_rate_8h.is_some());
+        assert!(row.funding_annualized.is_some());
+        assert_eq!(row.lend_apr.as_deref(), weth_book.lend_apr.as_deref());
+        assert_eq!(row.borrow_apr.as_deref(), usdt_book.borrow_apr.as_deref());
+        assert_eq!(row.native_yield_source, "none");
+        assert!(row.yield_basis_spread_apr.is_none());
+        assert!(row.basis_spread_apr.is_some());
     }
 }

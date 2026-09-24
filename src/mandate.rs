@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{str::FromStr, time::UNIX_EPOCH};
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -8,14 +8,19 @@ use serde_json::Value;
 #[serde(deny_unknown_fields)]
 pub(crate) struct Mandate {
     pub(crate) version: u64,
+    /// Optional Unix deadline for the standing authority. Omission preserves
+    /// an explicitly non-expiring mandate; a present deadline fails closed.
+    #[serde(default)]
+    pub(crate) expires_at: Option<i64>,
     pub(crate) markets: Vec<MarketPermission>,
     pub(crate) max_position_notional: AmountLimit,
     pub(crate) max_leverage: String,
     pub(crate) min_risk_adjusted_portfolio_value: AmountLimit,
     pub(crate) halt_if_eligible_for_liquidation: bool,
     pub(crate) can_withdraw: bool,
-    /// Interim transport bridge until bot-core delivers the handover account
-    /// reference beside the mandate.
+    /// Account the mandate was issued for. Read by the app through the raw
+    /// handover attributes (`handover.mandate.account.id`) as the fallback
+    /// after `handover.account_ref`; declared here so parsing accepts it.
     #[serde(default, rename = "account")]
     pub(crate) _account: Option<MandateAccount>,
     /// Standing guidance is carried here only as an interim transport bridge.
@@ -89,34 +94,64 @@ impl Verdict {
     }
 }
 
+/// Canonical detail for the mandate-absent family. One string; the message
+/// layer renders it verbatim and does not choose among variants.
+pub(crate) const MANDATE_ABSENT_DETAIL: &str = "No mandate is bound to this account.";
+
+#[allow(dead_code)]
+pub(crate) const MANDATE_ABSENT_RULES: [&str; 4] = [
+    "missing_mandate",
+    "unknown_mandate_key",
+    "invalid_mandate",
+    "unsupported_mandate_version",
+];
+
+#[allow(dead_code)]
+pub(crate) fn is_mandate_absent(rule: &str) -> bool {
+    MANDATE_ABSENT_RULES.contains(&rule)
+}
+
+fn mandate_absent(rule: &'static str) -> Verdict {
+    Verdict::deny(rule, MANDATE_ABSENT_DETAIL)
+}
+
 impl Mandate {
+    /// The mandate bound to this thread, from `handover.mandate`. There is
+    /// no fallback: without a handover mandate every verdict is
+    /// `missing_mandate` and nothing is staged.
+    pub(crate) fn bound(handover: Option<&Value>) -> Result<Self, Verdict> {
+        Self::parse(handover)
+    }
+
     pub(crate) fn parse(value: Option<&Value>) -> Result<Self, Verdict> {
         let Some(value) = value else {
-            return Err(Verdict::deny(
-                "missing_mandate",
-                "No handover_mandate is bound to this turn.",
-            ));
+            return Err(mandate_absent("missing_mandate"));
         };
-        serde_json::from_value(value.clone()).map_err(|error| {
+        let mandate: Self = serde_json::from_value(value.clone()).map_err(|error| {
             let detail = error.to_string();
             let rule = if detail.contains("unknown field") {
                 "unknown_mandate_key"
             } else {
                 "invalid_mandate"
             };
-            Verdict::deny(rule, detail)
-        })
+            mandate_absent(rule)
+        })?;
+        let now = UNIX_EPOCH
+            .elapsed()
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or(i64::MAX);
+        if mandate.expires_at.is_some_and(|expiry| expiry <= now) {
+            return Err(Verdict::deny(
+                "expired_mandate",
+                "The signed World execution mandate has expired.",
+            ));
+        }
+        Ok(mandate)
     }
 
     pub(crate) fn evaluate(&self, facts: &TradeFacts<'_>) -> Verdict {
         if self.version != 1 {
-            return Verdict::deny(
-                "unsupported_mandate_version",
-                format!(
-                    "Mandate version {} is not supported; expected version 1.",
-                    self.version
-                ),
-            );
+            return mandate_absent("unsupported_mandate_version");
         }
         if self.can_withdraw {
             return Verdict::deny(
@@ -162,15 +197,15 @@ impl Mandate {
             );
         }
 
-        let signed_quantity = if facts.side.eq_ignore_ascii_case("buy") {
+        let signed_quantity = if is_long_side(facts.side) {
             facts.quantity
-        } else if facts.side.eq_ignore_ascii_case("sell") {
+        } else if is_short_side(facts.side) {
             -facts.quantity
         } else {
             return Verdict::deny(
                 "invalid_side",
                 format!(
-                    "Unsupported trade side {:?}; expected buy or sell.",
+                    "Unsupported trade side {:?}; expected buy/sell, long/short, or lend/borrow.",
                     facts.side
                 ),
             );
@@ -267,6 +302,22 @@ impl Mandate {
     }
 }
 
+impl Mandate {
+    /// The one number a block may cite: the signed RAPV floor, with the
+    /// engine rule that gated the intent.
+    pub(crate) fn floor_solution(&self, rule: &str) -> Result<Value, Verdict> {
+        let floor = parse_decimal(&self.min_risk_adjusted_portfolio_value.amount, "floor")?;
+        Ok(serde_json::json!({
+            "floor": {
+                "value": floor.normalize().to_string(),
+                "unit": self.min_risk_adjusted_portfolio_value.quote,
+                "is_estimate": false,
+            },
+            "rule": rule,
+        }))
+    }
+}
+
 pub(crate) fn parse_decimal(value: &str, field: &'static str) -> Result<Decimal, Verdict> {
     Decimal::from_str(value).map_err(|error| {
         Verdict::deny(
@@ -300,9 +351,24 @@ fn amount(limit: &AmountLimit, expected_quote: &str) -> Result<Decimal, Verdict>
     parse_positive(&limit.amount, "mandate amount")
 }
 
+fn is_long_side(side: &str) -> bool {
+    matches!(
+        side.to_ascii_lowercase().as_str(),
+        "buy" | "long" | "borrow"
+    )
+}
+
+fn is_short_side(side: &str) -> bool {
+    matches!(
+        side.to_ascii_lowercase().as_str(),
+        "sell" | "short" | "lend"
+    )
+}
+
 fn normalize_product(product: &str) -> &str {
     match product {
         "perpetual" => "perp",
+        "lending" => "lend",
         other => other,
     }
 }
@@ -315,10 +381,10 @@ mod tests {
     fn mandate() -> Mandate {
         Mandate::parse(Some(&json!({
             "version": 1,
-            "markets": [{ "product": "perp", "base": "WETH", "quote": "USDm" }],
-            "max_position_notional": { "amount": "25000", "quote": "USDm" },
+            "markets": [{ "product": "perp", "base": "WETH", "quote": "USDT" }],
+            "max_position_notional": { "amount": "25000", "quote": "USDT" },
             "max_leverage": "3",
-            "min_risk_adjusted_portfolio_value": { "amount": "5000", "quote": "USDm" },
+            "min_risk_adjusted_portfolio_value": { "amount": "5000", "quote": "USDT" },
             "halt_if_eligible_for_liquidation": true,
             "can_withdraw": false
         })))
@@ -330,7 +396,7 @@ mod tests {
             product: "perp",
             side: "buy",
             base: "WETH",
-            quote: "USDm",
+            quote: "USDT",
             quantity: Decimal::new(1, 0),
             mark_price: Decimal::new(2_000, 0),
             current_position_quantity: Decimal::ZERO,
@@ -346,13 +412,107 @@ mod tests {
     }
 
     #[test]
+    fn expired_mandate_fails_before_execution() {
+        let verdict = Mandate::parse(Some(&json!({
+            "version": 1,
+            "expires_at": 1,
+            "markets": [{ "product": "perp", "base": "WETH", "quote": "USDT" }],
+            "max_position_notional": { "amount": "25000", "quote": "USDT" },
+            "max_leverage": "3",
+            "min_risk_adjusted_portfolio_value": { "amount": "5000", "quote": "USDT" },
+            "halt_if_eligible_for_liquidation": true,
+            "can_withdraw": false
+        })))
+        .unwrap_err();
+        assert_eq!(verdict.rule, "expired_mandate");
+    }
+
+    #[test]
+    fn allows_long_and_borrow_side_aliases() {
+        let mut trade = facts();
+        trade.side = "long";
+        assert!(mandate().evaluate(&trade).is_allow());
+
+        let lend = Mandate::parse(Some(&json!({
+            "version": 1,
+            "markets": [{ "product": "lend", "base": "WETH", "quote": "USDT" }],
+            "max_position_notional": { "amount": "25000", "quote": "USDT" },
+            "max_leverage": "3",
+            "min_risk_adjusted_portfolio_value": { "amount": "5000", "quote": "USDT" },
+            "halt_if_eligible_for_liquidation": true,
+            "can_withdraw": false
+        })))
+        .unwrap();
+        let mut trade = facts();
+        trade.product = "lend";
+        trade.side = "borrow";
+        assert!(lend.evaluate(&trade).is_allow());
+    }
+
+    #[test]
+    fn bound_fails_closed_without_handover() {
+        let verdict = Mandate::bound(None).unwrap_err();
+        assert_eq!(verdict.rule, "missing_mandate");
+        assert_eq!(verdict.detail, MANDATE_ABSENT_DETAIL);
+    }
+
+    #[test]
+    fn floor_solution_cites_only_the_floor_and_rule() {
+        let value = mandate().floor_solution("portfolio_floor").unwrap();
+        assert_eq!(value["floor"]["value"], "5000");
+        assert_eq!(value["floor"]["unit"], "USDT");
+        assert_eq!(value["floor"]["is_estimate"], false);
+        assert_eq!(value["rule"], "portfolio_floor");
+        assert!(value.get("largest_compliant_size").is_none());
+    }
+
+    #[test]
+    fn mandate_absent_family_shares_canonical_detail() {
+        let missing = Mandate::parse(None).unwrap_err();
+        assert_eq!(missing.rule, "missing_mandate");
+        assert_eq!(missing.detail, MANDATE_ABSENT_DETAIL);
+
+        let unknown = Mandate::parse(Some(&json!({
+            "version": 1,
+            "markets": [],
+            "max_position_notional": { "amount": "25000", "quote": "USDT" },
+            "max_leverage": "3",
+            "min_risk_adjusted_portfolio_value": { "amount": "5000", "quote": "USDT" },
+            "halt_if_eligible_for_liquidation": true,
+            "can_withdraw": false,
+            "max_daily_loss": "10"
+        })))
+        .unwrap_err();
+        assert_eq!(unknown.rule, "unknown_mandate_key");
+        assert_eq!(unknown.detail, MANDATE_ABSENT_DETAIL);
+
+        let invalid = Mandate::parse(Some(&json!("nope"))).unwrap_err();
+        assert_eq!(invalid.rule, "invalid_mandate");
+        assert_eq!(invalid.detail, MANDATE_ABSENT_DETAIL);
+
+        let mut mandate = mandate();
+        mandate.version = 2;
+        let version = mandate.evaluate(&facts());
+        assert_eq!(version.rule, "unsupported_mandate_version");
+        assert_eq!(version.detail, MANDATE_ABSENT_DETAIL);
+
+        assert!(
+            !MANDATE_ABSENT_DETAIL.chars().any(|c| c.is_ascii_digit()),
+            "mandate-absent detail must carry zero numbers"
+        );
+        for rule in MANDATE_ABSENT_RULES {
+            assert!(is_mandate_absent(rule), "{rule}");
+        }
+    }
+
+    #[test]
     fn rejects_unknown_key() {
         let value = json!({
             "version": 1,
             "markets": [],
-            "max_position_notional": { "amount": "25000", "quote": "USDm" },
+            "max_position_notional": { "amount": "25000", "quote": "USDT" },
             "max_leverage": "3",
-            "min_risk_adjusted_portfolio_value": { "amount": "5000", "quote": "USDm" },
+            "min_risk_adjusted_portfolio_value": { "amount": "5000", "quote": "USDT" },
             "halt_if_eligible_for_liquidation": true,
             "can_withdraw": false,
             "max_daily_loss": "10"
@@ -390,6 +550,15 @@ mod tests {
     }
 
     #[test]
+    fn allows_when_post_trade_rapv_is_proven_and_clears_floor() {
+        let mut trade = facts();
+        trade.post_trade_risk_adjusted_portfolio_value = Some(Decimal::new(5_000, 0));
+        let verdict = mandate().evaluate(&trade);
+        assert!(verdict.is_allow(), "{}", verdict.detail);
+        assert_eq!(verdict.rule, "mandate_v1");
+    }
+
+    #[test]
     fn rejects_unlisted_market_liquidation_and_limits() {
         let mut trade = facts();
         trade.base = "BTC.b";
@@ -420,10 +589,10 @@ mod tests {
     fn interim_account_and_brief_are_transport_only() {
         let value = json!({
             "version": 1,
-            "markets": [{ "product": "perp", "base": "WETH", "quote": "USDm" }],
-            "max_position_notional": { "amount": "25000", "quote": "USDm" },
+            "markets": [{ "product": "perp", "base": "WETH", "quote": "USDT" }],
+            "max_position_notional": { "amount": "25000", "quote": "USDT" },
             "max_leverage": "3",
-            "min_risk_adjusted_portfolio_value": { "amount": "5000", "quote": "USDm" },
+            "min_risk_adjusted_portfolio_value": { "amount": "5000", "quote": "USDT" },
             "halt_if_eligible_for_liquidation": true,
             "can_withdraw": false,
             "account": { "id": 42 },

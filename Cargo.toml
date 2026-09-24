@@ -1,16 +1,21 @@
 [package]
 name = "world-markets"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Local aomi-run affordances (WORLD_ACCOUNT_ID account binding, dev owner
+# reads). Never enabled in a hosted build.
+local-dev = []
+
 [dependencies]
 alloy-primitives = "=0.8.25"
 alloy-sol-types = "=0.8.25"
-aomi-sdk = "=4.0.0"
+aomi-sdk = "=5.1.1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rust_decimal = "1.37"
 schemars = "1.0.4"

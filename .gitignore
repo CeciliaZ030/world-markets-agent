@@ -1,2 +1,17 @@
-/target/
+# Rust build output
+/target
+
+# Local-only editor and plan files — do not commit
+/.cursor/
+/dev_artifacts/
+/.hermes/plans/
+
+# Local secrets / dev-runtime env
+.env
+.env.*
+!.env.example
+
+# Local Aomi deployment lifecycle state
 /.aomi/deployment.json
+
+*.DS_Store
