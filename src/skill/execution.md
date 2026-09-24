@@ -2,7 +2,7 @@
 
 One action tool per instruction: it reads live state, evaluates the signed mandate, and on allow encodes the exact venue call and hands it to the host, which stages, simulates, and commits it atomically. That chain is host-enforced. Run it in silence; stop at the first failure.
 
-Every staged call goes `to` the exchange `0xf6b54e033bb45a583aa642924bcef78b804588ae` on chain 2092151908; the guard admits only the fourteen trading functions (spot, perp, and lend-book orders and cancels, `renewLoan`, `payInterestAndFees`).
+Every staged call goes `to` the exchange `0xf6b54e033bb45a583aa642924bcef78b804588ae` on chain 2092151908; the guard admits only the fourteen trading functions.
 
 ## New order (spot, perp, or lend book)
 

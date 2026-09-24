@@ -225,6 +225,45 @@ impl StagedCall {
         })
     }
 
+    /// Attach every call to `value` and route them in order: the host stages
+    /// each leg, and after the last must simulate the whole batch and commit
+    /// it once, stopping on any failure. One call is the single-leg route.
+    pub(crate) fn routed_batch(calls: Vec<StagedCall>, mut value: Value) -> ToolReturn {
+        if calls.len() <= 1 {
+            return match calls.into_iter().next() {
+                Some(call) => call.routed(value),
+                None => ToolReturn::value(value),
+            };
+        }
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "staged".to_string(),
+                Value::Array(calls.iter().map(StagedCall::to_json).collect()),
+            );
+            obj.insert("executable".to_string(), json!(true));
+        }
+        let total = calls.len();
+        let stages: Vec<Value> = calls.iter().map(StagedCall::stage_args).collect();
+        ToolReturn::route(value)
+            .next(|next| {
+                for (index, stage) in stages.into_iter().enumerate() {
+                    let step = next.add_named("evm_stage_tx", stage).note(format!(
+                        "Stage leg {} of {total} exactly as given, in this order. After the last leg the host simulates the whole batch and commits it atomically; never edit a field, never add a leg.",
+                        index + 1
+                    ));
+                    if index + 1 == total {
+                        step.enforce(EnforcementPolicy::Stop, |enforce| {
+                            enforce.add_named("simulate_batch", json!({}));
+                            enforce
+                                .add_named("evm_commit_txs", json!({}))
+                                .bind_as("transaction_hash");
+                        });
+                    }
+                }
+            })
+            .build()
+    }
+
     /// Attach this call to `value` and route it: the host stages it next,
     /// then must simulate the batch and commit it, stopping on any failure.
     pub(crate) fn routed(self, mut value: Value) -> ToolReturn {
@@ -356,6 +395,27 @@ mod tests {
         let pay = StagedCall::pay_interest(venue(), 42, 0, true, "".into());
         assert_eq!(pay.args, ["42", "0", "true"]);
         assert!(pay.calldata.ends_with(&format!("{:064x}", 1)));
+    }
+
+    #[test]
+    fn a_batch_stages_every_leg_in_order_and_enforces_once_after_the_last() {
+        let first = StagedCall::renew_loan(venue(), 1577, 42, "first".into());
+        let second = StagedCall::pay_interest(venue(), 43, 0, false, "second".into());
+        let routed = StagedCall::routed_batch(vec![first.clone(), second.clone()], json!({}));
+        assert_eq!(routed.value["staged"].as_array().unwrap().len(), 2);
+        assert_eq!(routed.value["executable"], true);
+        assert_eq!(routed.routes.len(), 2);
+        assert_eq!(routed.routes[0].args["data"]["raw"], first.calldata);
+        assert_eq!(routed.routes[1].args["data"]["raw"], second.calldata);
+        assert!(routed.routes[0].enforcement.is_none());
+        let enforcement = routed.routes[1].enforcement.as_ref().unwrap();
+        assert_eq!(enforcement.steps[0].tool, "simulate_batch");
+        assert_eq!(enforcement.steps[1].tool, "evm_commit_txs");
+        assert!(
+            StagedCall::routed_batch(vec![], json!({ "x": 1 }))
+                .routes
+                .is_empty()
+        );
     }
 
     #[test]

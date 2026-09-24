@@ -4,7 +4,12 @@
 use std::fs;
 use std::path::PathBuf;
 
-const SKILLS: [&str; 3] = ["trading.md", "execution.md", "reporting.md"];
+const SKILLS: [&str; 4] = [
+    "trading.md",
+    "execution.md",
+    "reporting.md",
+    "monitoring.md",
+];
 
 fn skill(path: &str) -> String {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/skill");
@@ -27,7 +32,6 @@ fn no_banned_vocabulary() {
         "Mini App",
         "mini app",
         "mini-app",
-        "watch",
         "skip_llm",
         "render_lookup",
         "brain",
@@ -36,7 +40,6 @@ fn no_banned_vocabulary() {
         "world_resolve_book",
         "get_world_tasks",
         "get_dollarpower",
-        "guardian",
         "amazing opportunity",
         "guaranteed",
     ];
@@ -81,6 +84,8 @@ fn every_kept_tool_is_named_in_the_skills() {
         "cancel_world_order",
         "renew_world_loan",
         "pay_world_loan_interest",
+        "guardian_unwind",
+        "acknowledge_guardian",
     ] {
         assert!(text.contains(tool), "skills must name `{tool}`");
     }
@@ -88,6 +93,60 @@ fn every_kept_tool_is_named_in_the_skills() {
         assert!(
             skill("execution.md").contains(host_tool),
             "execution.md must name `{host_tool}`"
+        );
+    }
+}
+
+#[test]
+fn monitoring_recipes_name_the_kernel_tools_and_exact_read_paths() {
+    let monitoring = skill("monitoring.md");
+    for tool in [
+        "wake_on_condition",
+        "schedule_cron",
+        "list_scheduled",
+        "cancel_scheduled",
+    ] {
+        assert!(
+            monitoring.contains(tool),
+            "monitoring.md must name `{tool}`"
+        );
+    }
+    for path in [
+        "market.mark_price",
+        "metrics.liquidation_risk",
+        "account.risk_adjusted_portfolio_value",
+    ] {
+        assert!(
+            monitoring.contains(path),
+            "monitoring.md must pin the read path `{path}`"
+        );
+    }
+    assert!(monitoring.contains("\"recurring\":true"));
+    assert!(monitoring.contains("rearm_value"));
+    assert!(monitoring.contains("That's already true"));
+    assert!(monitoring.contains("the second outranks the first"));
+    for section in [
+        "## WATCH",
+        "## STANDING",
+        "## FIRED",
+        "## TASKS",
+        "## GUARDIAN",
+    ] {
+        assert!(
+            monitoring.contains(section),
+            "monitoring.md must carry {section}"
+        );
+    }
+    // The clock watches; the model never loops or promises to.
+    assert!(monitoring.contains("Never poll in a loop yourself"));
+    // The guardian acts only on a breach and never widens the slippage limit.
+    assert!(monitoring.contains("`breach: false` stages nothing"));
+    assert!(monitoring.contains("Never widen the limit"));
+    // Only monitoring speaks of the kernel scheduling tools.
+    for path in ["trading.md", "execution.md", "reporting.md"] {
+        assert!(
+            !skill(path).contains("wake_on_condition"),
+            "{path} must leave scheduling recipes to monitoring.md"
         );
     }
 }
@@ -117,6 +176,8 @@ fn deny_codes_have_copy() {
         "unknown_asset",
         "size_no_position",
         "empty_lend_book",
+        "guardian_hold",
+        "not_risk_reducing",
     ] {
         assert!(reporting.contains(rule), "reporting.md must cover `{rule}`");
     }

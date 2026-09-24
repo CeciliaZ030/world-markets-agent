@@ -38,7 +38,6 @@ fn always_active_files_carry_no_removed_surfaces() {
             "sidecar",
             "Telegram",
             "Mini App",
-            "WATCH",
             "GUEST",
             "SHARE",
             "get_world_tasks",

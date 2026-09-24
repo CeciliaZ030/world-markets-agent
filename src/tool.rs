@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use std::str::FromStr;
 
 use crate::client::{Account, AccountAccess, Asset, WorldClient, asset_by_symbol};
+use crate::guardian::{GuardianPreference, GuardianStore, UnwindCandidate, UnwindPlan};
 use crate::loans::LoanView;
 use crate::mandate::{Mandate, TradeFacts, Verdict, parse_decimal};
 use crate::order_intent::OrderIntent;
@@ -21,6 +22,7 @@ pub(crate) struct WorldMarketsApp {
     client: WorldClient,
     pnl_ledger: PnlLedger,
     loan_origins: crate::loans::LoanOriginStore,
+    guardian: GuardianStore,
 }
 
 pub(crate) struct ListWorldAssets;
@@ -291,6 +293,43 @@ pub(crate) struct PreviewAccountEffectArgs {
 }
 
 pub(crate) struct GetWorldAgentPermission;
+
+/// The guardian: plan (and on a breach, stage) the cheapest unwind that
+/// brings the account back above its floor.
+pub(crate) struct GuardianUnwind;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct GuardianUnwindArgs {
+    /// `true` stages the plan when the account is below its floor or liquidation-eligible. `false` (default) only plans: a fire drill.
+    #[serde(default)]
+    pub(crate) execute: Option<bool>,
+    /// Standing preference from the user's brief: `cheapest_safe` (default) or `protect_eth`.
+    #[serde(default)]
+    pub(crate) preference: Option<String>,
+    /// Holdings the user asked never to touch, by symbol. A veto, never a candidate.
+    #[serde(default)]
+    pub(crate) protect: Option<Vec<String>>,
+    /// Optional World account ID. Handover account context is used when omitted.
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    /// Optional expected owner wallet.
+    #[serde(default)]
+    pub(crate) wallet_address: Option<String>,
+}
+
+/// The user checked in after a guardian event: release the hold on
+/// risk-adding orders.
+pub(crate) struct AcknowledgeGuardian;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct AcknowledgeGuardianArgs {
+    /// Optional World account ID. Handover account context is used when omitted.
+    #[serde(default)]
+    pub(crate) account_id: Option<u64>,
+    /// Optional expected owner wallet.
+    #[serde(default)]
+    pub(crate) wallet_address: Option<String>,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct GetWorldAgentPermissionArgs {
@@ -570,6 +609,17 @@ impl WorldMarketsApp {
             },
             "metrics": metrics,
             "lookups": lookups,
+            "guardian": {
+                "hold": self.guardian.status(access.account_id)?,
+            },
+            "mandate": Mandate::bound(ctx.attribute_path(&["handover", "mandate"]))
+                .ok()
+                .and_then(|mandate| {
+                    let quote = mandate.min_risk_adjusted_portfolio_value.quote.clone();
+                    mandate.floor(&quote).ok().map(|floor| {
+                        json!({ "floor": floor.normalize().to_string(), "quote": quote })
+                    })
+                }),
         });
         Ok((payload, account, access, client))
     }
@@ -776,6 +826,14 @@ impl WorldMarketsApp {
                 eligible_for_liquidation: account.eligible_for_liquidation,
             }),
             Err(verdict) => verdict,
+        };
+        // A guardian hold outranks an allow: after an unwind, nothing that
+        // lowers RAPV goes out until the user checks in.
+        let verdict = match self.guardian.status(access.account_id)? {
+            Some(hold) if verdict.is_allow() => {
+                hold.blocks(rapv, post_trade_rapv).unwrap_or(verdict)
+            }
+            _ => verdict,
         };
         let estimated_notional = quantity.checked_mul(mark_price).ok_or_else(|| {
             "[world-markets] estimated notional exceeds numeric range".to_string()
@@ -1665,6 +1723,210 @@ impl DynAomiTool for PreviewAccountEffect {
             "source": "world-markets-reporting",
             "account_effect": effect,
             "concern_line": effect.concern_line,
+            "executable": false,
+        }))
+    }
+}
+
+impl DynAomiTool for GuardianUnwind {
+    type App = WorldMarketsApp;
+    type Args = GuardianUnwindArgs;
+    const NAME: &'static str = "guardian_unwind";
+    const DESCRIPTION: &'static str = "The guardian. Ranks every closable leg by risk-adjusted value recovered per unit of exit cost and plans the cheapest set that brings the account back above its signed floor. With execute=false it is a fire drill: the plan only. With execute=true and the account below its floor or liquidation-eligible, it stages the ordered legs as one batch the host simulates and commits atomically, and holds all risk-adding orders until the user checks in (acknowledge_guardian). Never executes above the floor.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        Self::run_with_routes(app, args, ctx).map(|routed| routed.value)
+    }
+
+    fn run_with_routes(
+        app: &WorldMarketsApp,
+        args: Self::Args,
+        ctx: DynToolCallCtx,
+    ) -> Result<ToolReturn, String> {
+        let execute = args.execute.unwrap_or(false);
+        let preference = GuardianPreference::parse(args.preference.as_deref())?;
+        let protect = args.protect.unwrap_or_default();
+        let client = app.client_for(&ctx)?;
+        let access = app.access(
+            &client,
+            args.account_id,
+            args.wallet_address.as_deref(),
+            &ctx,
+        )?;
+        let mut value = json!({
+            "source": "world-markets-guardian",
+            "chain_id": client.chain_id(),
+            "exchange": client.exchange(),
+            "block_number": client.block_number()?,
+            "access": access,
+            "mode": if execute { "execute" } else { "drill" },
+            "executable": false,
+        });
+        let mandate = match Mandate::bound(ctx.attribute_path(&["handover", "mandate"])) {
+            Ok(mandate) => mandate,
+            Err(verdict) => {
+                return Ok(ToolReturn::value(WorldMarketsApp::with_verdict(
+                    value, &verdict,
+                )));
+            }
+        };
+        let (assets, account) = WorldMarketsApp::live_account(&client, &access)?;
+        let quote_symbol = mandate.min_risk_adjusted_portfolio_value.quote.clone();
+        let floor = match mandate.floor(&quote_symbol) {
+            Ok(floor) => floor,
+            Err(verdict) => {
+                return Ok(ToolReturn::value(WorldMarketsApp::with_verdict(
+                    value, &verdict,
+                )));
+            }
+        };
+        let rapv = parse_decimal(
+            &account.risk_adjusted_portfolio_value,
+            "risk_adjusted_portfolio_value",
+        )
+        .map_err(|verdict| format!("[world-markets] {}: {}", verdict.rule, verdict.detail))?;
+        let metrics = crate::liquidation_risk::compute_metrics(
+            &client,
+            &account,
+            &assets,
+            client.block_number()?,
+        )?;
+        let breach = account.eligible_for_liquidation || rapv < floor;
+        let candidates = UnwindCandidate::from_account(&client, &account, &assets, &protect)?;
+        let plan = UnwindPlan::cheapest_safe(&candidates, rapv, floor, preference);
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("breach".into(), json!(breach));
+            obj.insert(
+                "floor".into(),
+                json!({ "value": floor.normalize().to_string(), "quote": quote_symbol }),
+            );
+            obj.insert(
+                "risk_adjusted_portfolio_value".into(),
+                json!(rapv.normalize().to_string()),
+            );
+            obj.insert("liquidation_risk".into(), json!(metrics.liquidation_risk));
+            obj.insert(
+                "eligible_for_liquidation".into(),
+                json!(account.eligible_for_liquidation),
+            );
+            obj.insert("plan".into(), json!(plan));
+            obj.insert(
+                "hold".into(),
+                json!(app.guardian.status(access.account_id)?),
+            );
+        }
+        if !execute || !breach {
+            return Ok(ToolReturn::value(value));
+        }
+        if plan.steps.is_empty() {
+            return Ok(ToolReturn::value(WorldMarketsApp::with_error(
+                value,
+                "no_unwind_available",
+                "no closable leg raises risk-adjusted portfolio value; nothing was staged"
+                    .to_string(),
+            )));
+        }
+
+        // Every leg passes the guardian rule on its own projection before
+        // anything is staged; one denied leg stops the whole batch.
+        let mut calls = Vec::with_capacity(plan.steps.len());
+        for step in &plan.steps {
+            let leg = &step.leg;
+            let post = parse_decimal(&step.post_rapv, "post_rapv").map_err(|verdict| {
+                format!("[world-markets] {}: {}", verdict.rule, verdict.detail)
+            })?;
+            let verdict = mandate.evaluate_unwind(&TradeFacts {
+                product: leg.product,
+                side: leg.side,
+                base: &leg.base.symbol,
+                quote: &leg.quote.symbol,
+                quantity: leg.quantity,
+                mark_price: leg.mark,
+                current_position_quantity: account
+                    .position_quantity(leg.product, &leg.base.symbol)?,
+                risk_adjusted_portfolio_value: rapv,
+                post_trade_risk_adjusted_portfolio_value: Some(post),
+                eligible_for_liquidation: account.eligible_for_liquidation,
+            });
+            if !verdict.is_allow() {
+                let mut value = WorldMarketsApp::with_verdict(value, &verdict);
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("blocked_leg".into(), json!(step.label));
+                }
+                return Ok(ToolReturn::value(value));
+            }
+            let intent = OrderIntent::resolve(
+                Some("market"),
+                None,
+                Some(crate::guardian::EMERGENCY_SLIPPAGE),
+                leg.side,
+                leg.mark,
+            )?;
+            let raw = quantity_raw(leg.quantity, leg.base.position_decimals)?;
+            if raw == 0 {
+                continue;
+            }
+            let market = client.market(leg.product, leg.base.clone(), Some(leg.quote.clone()))?;
+            let book = Address::from_str(&market.book)
+                .map_err(|e| format!("[world-markets] invalid order-book address: {e}"))?;
+            let word = OrderWord {
+                account_id: access.account_id,
+                quantity_raw: raw,
+                limit_price: intent.limit_price,
+                order_type: OrderType::FillPartialKillRest,
+                insertion_hint: 0,
+            }
+            .pack()?;
+            calls.push(StagedCall::order(
+                Venue::of(&client),
+                OrderAction::New,
+                leg.product,
+                leg.side,
+                book,
+                word,
+                format!(
+                    "Guardian: {} at limit {}",
+                    step.label,
+                    intent.limit_price.normalize()
+                ),
+            )?);
+        }
+        let hold = app.guardian.hold(
+            access.account_id,
+            format!(
+                "floor {} {} breached at RAPV {}",
+                floor.normalize(),
+                quote_symbol,
+                rapv.normalize()
+            ),
+        )?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("hold".into(), json!(hold));
+        }
+        Ok(StagedCall::routed_batch(calls, value))
+    }
+}
+
+impl DynAomiTool for AcknowledgeGuardian {
+    type App = WorldMarketsApp;
+    type Args = AcknowledgeGuardianArgs;
+    const NAME: &'static str = "acknowledge_guardian";
+    const DESCRIPTION: &'static str = "Release the guardian's hold on risk-adding orders once the user has checked in after an unwind. Returns the hold it released, or none if nothing was held.";
+
+    fn run(app: &WorldMarketsApp, args: Self::Args, ctx: DynToolCallCtx) -> Result<Value, String> {
+        let client = app.client_for(&ctx)?;
+        let access = app.access(
+            &client,
+            args.account_id,
+            args.wallet_address.as_deref(),
+            &ctx,
+        )?;
+        let released = app.guardian.release(access.account_id)?;
+        Ok(json!({
+            "source": "world-markets-guardian",
+            "account_id": access.account_id,
+            "released": released.is_some(),
+            "hold": released,
             "executable": false,
         }))
     }

@@ -161,19 +161,8 @@ impl Mandate {
         }
 
         let product = normalize_product(facts.product);
-        let permitted = self.markets.iter().any(|market| {
-            normalize_product(&market.product) == product
-                && market.base.eq_ignore_ascii_case(facts.base)
-                && market.quote.eq_ignore_ascii_case(facts.quote)
-        });
-        if !permitted {
-            return Verdict::deny(
-                "market_not_permitted",
-                format!(
-                    "{product} {}/{} is not present in the mandate's markets.",
-                    facts.base, facts.quote
-                ),
-            );
+        if let Err(verdict) = self.market_permitted(product, facts.base, facts.quote) {
+            return verdict;
         }
 
         if facts.eligible_for_liquidation && self.halt_if_eligible_for_liquidation {
@@ -303,6 +292,82 @@ impl Mandate {
 }
 
 impl Mandate {
+    fn market_permitted(&self, product: &str, base: &str, quote: &str) -> Result<(), Verdict> {
+        let permitted = self.markets.iter().any(|market| {
+            normalize_product(&market.product) == product
+                && market.base.eq_ignore_ascii_case(base)
+                && market.quote.eq_ignore_ascii_case(quote)
+        });
+        if permitted {
+            Ok(())
+        } else {
+            Err(Verdict::deny(
+                "market_not_permitted",
+                format!("{product} {base}/{quote} is not present in the mandate's markets."),
+            ))
+        }
+    }
+
+    /// The signed floor in `quote` units.
+    pub(crate) fn floor(&self, quote: &str) -> Result<Decimal, Verdict> {
+        amount(&self.min_risk_adjusted_portfolio_value, quote)
+    }
+
+    /// A guardian leg: closing part of a position while the account is below
+    /// its floor or liquidation-eligible. The halt, floor, notional, and
+    /// leverage gates that stop an ordinary trade would stop the unwind too,
+    /// so a leg passes on one condition instead: it must provably raise the
+    /// risk-adjusted portfolio value. Market permission still applies.
+    pub(crate) fn evaluate_unwind(&self, facts: &TradeFacts<'_>) -> Verdict {
+        if self.version != 1 {
+            return mandate_absent("unsupported_mandate_version");
+        }
+        if self.can_withdraw {
+            return Verdict::deny(
+                "withdraw_not_supported",
+                "World delegated trading authority can never grant withdrawal permission.",
+            );
+        }
+        let product = normalize_product(facts.product);
+        if let Err(verdict) = self.market_permitted(product, facts.base, facts.quote) {
+            return verdict;
+        }
+        let Some(post_trade_rapv) = facts.post_trade_risk_adjusted_portfolio_value else {
+            return Verdict::deny(
+                "post_trade_risk_unavailable",
+                "The app cannot prove the post-unwind risk-adjusted portfolio value, so the guardian leg fails closed.",
+            );
+        };
+        if post_trade_rapv <= facts.risk_adjusted_portfolio_value {
+            return Verdict::deny(
+                "not_risk_reducing",
+                format!(
+                    "Closing {} {} {} would move risk-adjusted portfolio value from {} to {} {}; a guardian leg must raise it.",
+                    facts.quantity,
+                    facts.base,
+                    product,
+                    facts.risk_adjusted_portfolio_value,
+                    post_trade_rapv,
+                    facts.quote
+                ),
+            );
+        }
+        Verdict {
+            status: "allow",
+            rule: "guardian_unwind",
+            detail: format!(
+                "Guardian leg {} {} {} {} raises risk-adjusted portfolio value from {} to {} {}.",
+                facts.side,
+                facts.quantity,
+                facts.base,
+                product,
+                facts.risk_adjusted_portfolio_value,
+                post_trade_rapv,
+                facts.quote
+            ),
+        }
+    }
+
     /// The one number a block may cite: the signed RAPV floor, with the
     /// engine rule that gated the intent.
     pub(crate) fn floor_solution(&self, rule: &str) -> Result<Value, Verdict> {
