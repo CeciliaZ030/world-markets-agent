@@ -44,11 +44,34 @@ Actions (the app encodes the venue call; the host stages, simulates, and
 commits it atomically through a routed tool return):
 
 - `execute_world_order` — same arguments as the preview; evaluates the mandate
-  itself and, on allow, packs the order word and encodes `new*Order`
-- `cancel_world_order` — reads the resting order by id and encodes
-  `cancel*Order`
+  itself and, on allow, packs the order word and encodes `new*Order`. Spot and
+  perp orders carry a limit price; lend-book orders (`side: lend | borrow`)
+  carry an annual rate. Sizes come from the sentence: dollars, asset units, or a
+  fraction of the held position ("half my WETH", "20%", "all")
+- `cancel_world_order` — reads a spot or perp order by id, or a lend-book order
+  by its resting rate, and encodes `cancel*Order`
 - `renew_world_loan` / `pay_world_loan_interest` — one borrower loan per call,
   gated on a bound mandate, the floor, and liquidation eligibility
+
+Monitoring (no World code; the host's clock does the work): the app opts into
+the `aomi-core` namespace so the model can arm `wake_on_condition` over
+`get_world_market` / `get_world_account` reads (price watches, floor watches,
+standing level-buys) and `schedule_cron` for DCA and the weekly digest, and
+list or cancel them. The `world-markets/monitoring` skill holds the exact
+recipes and the copy for armed, fired, and listed jobs. A fired job runs in a
+child thread whose result the host delivers back to the chat.
+
+Guardian: `guardian_unwind` ranks every closable leg by risk-adjusted value
+recovered per unit of exit cost (from the same post-trade projection the
+mandate uses), plans the cheapest set that brings the account back above its
+signed floor, and on a breach stages those legs as one atomic batch. The
+mandate gates each leg on one rule, that it provably raises RAPV, since the
+ordinary halt and floor gates would block the unwind itself. After an unwind
+the account is held: every risk-adding order is refused (`guardian_hold`) until
+`acknowledge_guardian` records the user's check-in. Above the floor the tool
+is a fire drill and stages nothing. The trigger is an armed
+`wake_on_condition` on `account.risk_adjusted_portfolio_value` below
+`mandate.floor`.
 
 Each action tool returns `staged` (signature, args, calldata) and a route the
 host follows: one `evm_stage_tx` with that exact calldata, then an enforced
@@ -56,8 +79,8 @@ host follows: one `evm_stage_tx` with that exact calldata, then an enforced
 never types a selector, an order word, or a number between tools.
 `src/skill/guard.json` restricts staged calls to the exchange contract and the
 fourteen trading selectors (six `new*Order`, six `cancel*Order`, `renewLoan`,
-`payInterestAndFees`) on chain 2092151908; placing or cancelling lend/borrow
-orders has no action tool yet.
+`payInterestAndFees`) on chain 2092151908. An asset World does not list stops
+every action tool with a pasteable `unknown_asset` message rather than a guess.
 
 The mandate fails closed: without a bound handover mandate every verdict is
 `missing_mandate` and nothing is staged. The bound account comes from
@@ -106,7 +129,7 @@ live from the contract.
 ## Deploy
 
 This app requires Aomi SDK 5.1.1 in both `Cargo.toml` and `Cargo.lock`, matching the current backend host ABI and app-skill guard contract.
-Its hosted instructions are the two SDK 5 skills in `src/skill/` (trading + execution, reporting); each must
+Its hosted instructions are the three SDK 5 skills in `src/skill/` (trading + execution, reporting, monitoring); each must
 pass the 4,000-token validation limit. `cargo test --locked` checks the skills,
 the guard table, and every provider-facing tool schema before publication.
 

@@ -6,7 +6,7 @@
 
 use alloy_primitives::U256;
 use aomi_sdk::schemars::JsonSchema;
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::{Value, json};
@@ -107,6 +107,68 @@ impl OrderWord {
             "account_id": self.account_id,
             "insertion_hint": self.insertion_hint,
         }))
+    }
+}
+
+/// Annual rates on the lend book are 16-bit fractions with four decimals:
+/// `600` is 6.00% APR, and the tick is 0.01%.
+pub(crate) const INTEREST_DIVISOR: u64 = 10_000;
+
+/// The word a `newLendOrder` / `newBorrowOrder` / `cancel*Order(address,uint256)`
+/// call takes on the lend book: `[orderType 4 | accountId 44 | quantity 64 |
+/// interestRate 16]`, packed like the spot word but without a price or hint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LendOrderWord {
+    pub(crate) account_id: u64,
+    /// Quantity in position base units. Zero on a cancel.
+    pub(crate) quantity_raw: u64,
+    /// Annual rate in venue ticks (`rate × INTEREST_DIVISOR`).
+    pub(crate) rate_raw: u16,
+    pub(crate) order_type: OrderType,
+}
+
+impl LendOrderWord {
+    const LAYOUT: [usize; 4] = [4, 44, 64, 16];
+
+    /// Round an APR fraction such as `0.05` to venue ticks; the venue has no
+    /// rate below one tick and none above the 16-bit field.
+    pub(crate) fn encode_rate(rate: Decimal) -> Result<u16, String> {
+        if rate <= Decimal::ZERO {
+            return Err(format!(
+                "[world-markets] interest rate {rate} must be greater than zero"
+            ));
+        }
+        let ticks = (rate * Decimal::from(INTEREST_DIVISOR))
+            .round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero);
+        if ticks < Decimal::ONE {
+            return Err(format!(
+                "[world-markets] interest rate {rate} is below the 0.0001 lend tick"
+            ));
+        }
+        u16::from_str(&ticks.normalize().to_string()).map_err(|_| {
+            format!("[world-markets] interest rate {rate} exceeds the venue's 16-bit rate field")
+        })
+    }
+
+    pub(crate) fn pack(&self) -> Result<U256, String> {
+        if self.account_id >= 1 << 44 {
+            return Err(format!(
+                "[world-markets] account id {} does not fit the 44-bit order field",
+                self.account_id
+            ));
+        }
+        let fields = [
+            self.order_type.code(),
+            self.account_id,
+            self.quantity_raw,
+            u64::from(self.rate_raw),
+        ];
+        let mut packed = U256::ZERO;
+        for (value, bits) in fields.iter().zip(Self::LAYOUT) {
+            let mask = (U256::from(1u8) << bits) - U256::from(1u8);
+            packed = (packed << bits) | (U256::from(*value) & mask);
+        }
+        Ok(packed)
     }
 }
 
@@ -216,6 +278,55 @@ mod tests {
             word: "0x00000000000000000005200000000629000000000000012c0000000000000161",
         },
     ];
+
+    #[test]
+    fn lend_word_packs_type_account_quantity_and_rate_ticks() {
+        assert_eq!(LendOrderWord::encode_rate(d("0.05")).unwrap(), 500);
+        assert_eq!(LendOrderWord::encode_rate(d("0.00005")).unwrap(), 1);
+        assert!(LendOrderWord::encode_rate(d("0.00004")).is_err());
+        assert!(LendOrderWord::encode_rate(d("7")).is_err());
+        assert!(LendOrderWord::encode_rate(d("0")).is_err());
+
+        // Vectors from `pack(fields, [4, 44, 64, 16])` in @wcm-inc/tools 0.0.7,
+        // the packer the World SDK's LendOrderBook uses.
+        for (account, quantity_raw, rate_raw, order_type, word) in [
+            (
+                1577,
+                100_000_000,
+                500,
+                OrderType::Limit,
+                "0x000000000000000000000000000000000000000006290000000005f5e10001f4",
+            ),
+            (
+                1577,
+                0,
+                600,
+                OrderType::FillPartialKillRest,
+                "0x0000000000000000000000000000000030000000062900000000000000000258",
+            ),
+            (
+                19,
+                300,
+                1,
+                OrderType::Limit,
+                "0x00000000000000000000000000000000000000000013000000000000012c0001",
+            ),
+        ] {
+            let packed = LendOrderWord {
+                account_id: account,
+                quantity_raw,
+                rate_raw,
+                order_type,
+            }
+            .pack()
+            .unwrap();
+            assert_eq!(
+                format!("0x{packed:064x}"),
+                word,
+                "account {account} rate {rate_raw}"
+            );
+        }
+    }
 
     #[test]
     fn order_word_matches_ts_vectors() {

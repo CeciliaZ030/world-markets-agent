@@ -1,6 +1,7 @@
 use aomi_sdk::*;
 
 mod client;
+mod guardian;
 mod liquidation_risk;
 mod loans;
 mod lookups;
@@ -39,8 +40,10 @@ dyn_aomi_app!(
         tool::CancelWorldOrder,
         tool::RenewWorldLoan,
         tool::PayWorldLoanInterest,
+        tool::GuardianUnwind,
+        tool::AcknowledgeGuardian,
     ],
-    namespaces = ["evm-core"],
+    namespaces = ["evm-core", "aomi-core"],
     skills = [
         {
             id: "world-markets/trading",
@@ -55,6 +58,11 @@ dyn_aomi_app!(
             id: "world-markets/reporting",
             description: "World response formats: honest numbers, previews, receipts, simulations, deny copy per rule, the mandate-absent handshake, and trading safety.",
             sections: { reporting: "skill/reporting.md" },
+        },
+        {
+            id: "world-markets/monitoring",
+            description: "Watches, standing instructions, the weekly digest, and the ledger of armed jobs: exact wake_on_condition and schedule_cron recipes over World reads, plus what to say when armed, listed, cancelled, or woken by a fired job.",
+            sections: { monitoring: "skill/monitoring.md" },
         },
     ]
 );
@@ -198,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn preamble_keeps_safety_and_routes_to_the_two_skills() {
+    fn preamble_keeps_safety_and_routes_to_the_three_skills() {
         assert!(preamble::ROLE_HEADER_FOR_TEST.contains("precise financial operator"));
         let app = tool::WorldMarketsApp::default();
         for skill in app.skills() {
@@ -224,7 +232,11 @@ mod tests {
         assert!(preamble::COMPOSED.contains("one activate_skills call in the first pass"));
         assert!(
             preamble::COMPOSED
-                .contains("selecting world-markets/trading and world-markets/reporting together")
+                .contains("world-markets/trading and world-markets/reporting together")
+        );
+        assert!(
+            preamble::COMPOSED
+                .contains("world-markets/trading and world-markets/monitoring instead")
         );
         assert!(preamble::COMPOSED.contains("one call to its action tool"));
         assert!(preamble::COMPOSED.contains("never call evm_stage_tx with data you typed"));
@@ -246,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_lists_the_seventeen_tools_without_secrets() {
+    fn manifest_lists_the_nineteen_tools_without_secrets() {
         let app = tool::WorldMarketsApp::default();
         let manifest = app.manifest();
         let names: Vec<&str> = manifest.tools.iter().map(|t| t.name.as_str()).collect();
@@ -270,41 +282,56 @@ mod tests {
                 "cancel_world_order",
                 "renew_world_loan",
                 "pay_world_loan_interest",
+                "guardian_unwind",
+                "acknowledge_guardian",
             ]
         );
         assert!(app.secrets().is_none(), "the app declares no secrets");
-        assert_eq!(app.namespaces(), Some(vec!["evm-core".to_string()]));
+        assert_eq!(
+            app.namespaces(),
+            Some(vec!["evm-core".to_string(), "aomi-core".to_string()])
+        );
     }
 
     #[test]
-    fn the_skill_pair_fits_host_activation_budget() {
+    fn each_routed_skill_pair_fits_host_activation_budget() {
         let skills = tool::WorldMarketsApp::default().skills();
         // Match aomi-skills::estimate_activation_tokens: app skills have no
-        // Tools metadata and use render_sections as instruction_md.
-        let tokens: usize = skills
-            .iter()
-            .map(|skill| {
-                format!(
-                    "## Skill: {}\n\n{}",
-                    skill.id,
-                    skill.render_sections().trim_end()
-                )
-                .chars()
-                .count()
-                .div_ceil(4)
-            })
-            .sum();
-        assert!(
-            tokens <= 4000,
-            "trading + reporting use {tokens} activation tokens"
-        );
+        // Tools metadata and use render_sections as instruction_md. The host
+        // silently trims the second skill of a pair that overflows, so both
+        // pairs the preamble routes to must fit.
+        let tokens = |id: &str| {
+            let skill = skills.iter().find(|skill| skill.id == id).unwrap();
+            format!(
+                "## Skill: {}\n\n{}",
+                skill.id,
+                skill.render_sections().trim_end()
+            )
+            .chars()
+            .count()
+            .div_ceil(4)
+        };
+        for pair in [
+            ["world-markets/trading", "world-markets/reporting"],
+            ["world-markets/trading", "world-markets/monitoring"],
+        ] {
+            let total: usize = pair.iter().map(|id| tokens(id)).sum();
+            assert!(total <= 4000, "{pair:?} uses {total} activation tokens");
+        }
     }
 
     #[test]
     fn app_skills_are_valid_and_only_trading_carries_the_guard() {
         let skills = tool::WorldMarketsApp::default().skills();
         let ids: Vec<&str> = skills.iter().map(|skill| skill.id.as_str()).collect();
-        assert_eq!(ids, ["world-markets/trading", "world-markets/reporting"]);
+        assert_eq!(
+            ids,
+            [
+                "world-markets/trading",
+                "world-markets/reporting",
+                "world-markets/monitoring"
+            ]
+        );
         aomi_sdk::validate_app_skills("world-markets", &skills)
             .expect("all shipped skills must pass the same validation as the backend loader");
         for skill in &skills {
@@ -328,6 +355,7 @@ mod tests {
             .collect();
         assert_eq!(sections, ["trading", "execution"]);
         assert_eq!(skills[1].sections.len(), 1);
+        assert_eq!(skills[2].sections.len(), 1);
     }
 
     #[test]

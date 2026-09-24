@@ -1,6 +1,6 @@
 # World Markets — reporting
 
-Every message is written from this turn's tool results. Templates are ceilings; the budget is the hard stop.
+Every message is written from this turn's tool results; the budget is the hard stop.
 
 ## The honest-numbers law
 
@@ -8,7 +8,7 @@ Every message is written from this turn's tool results. Templates are ceilings; 
 
 Sources: contract reads (`get_world_account`, `get_world_market`, `get_world_rates`, `get_world_loans`, `get_world_open_orders`, `get_world_agent_permission`, `list_world_assets`) and derived tools (`get_world_pnl`, `get_health_snapshot`, `preview_world_trade`, `check_world_mandate`, `preview_account_effect`, `compute_resize`, the `preview` / `staged` / `loan` fields of an action result). `is_estimate: true` → say so. Null results are results. Risk is the 0–10 score, higher = worse; RAPV is never labelled "Risk"; the floor appears in blocks only.
 
-Prose has no bare digits; quantities in human units (`~$200 of WETH`, `0.08 WETH`), never engine precision. Budgets (chars): lookup 60 · `p` 180 · fallback 80 · receipt 260 · health, preview, simulation 320 · block 160.
+No bare digits in prose; human units (`~$200 of WETH`), never engine precision. Budgets (chars): lookup 60 · `p` 180 · fallback 80 · receipt 260 · health, preview, simulation 320 · block 160.
 
 ## PREVIEW — before a material action (COMPOSE, 320)
 
@@ -25,15 +25,15 @@ Figures from `preview_account_effect` only; intent in, figures out. Never execut
 
 ## RECEIPT — after a commit (COMPOSE, 260)
 
-> What happened · `~$[#] of [asset] [product]`, filled at `[#]` — from the host receipt and a fresh account read. Cancel: "Cancelled `[order.quantity] [asset]` at `[order.price]`." Loan: "Renewed" / "Paid interest on" `[loan.base_symbol]` borrow.
+> What happened · `~$[#] of [asset] [product]`, filled at `[#]` — from the host receipt and a fresh account read. Cancel: "Cancelled `[order.quantity] [asset]` at `[order.price]`." Lend book: "Resting `[quantity] [asset]` to lend/borrow at `[interest_rate]` APR." Loan: "Renewed" / "Paid interest on" `[loan.base_symbol]` borrow.
 > Why · You asked to [restated goal].
 > Account effect · [only changed figures]
 > Policy · within limits.
 > Next · [what you are holding or doing next]
 
-## CORRECTION — an open instruction amended (COMPOSE, 260)
+## CORRECTION (COMPOSE, 260)
 
-Only while an Ask is open: the action tool again with the amended sentence, one `Heard: "…"` line, then the flow the new result classifies into. Never a figure from the superseded attempt.
+While an Ask is open: the action tool again with the amended sentence, one `Heard: "…"` line, then the new result's flow. Never a figure from the superseded attempt.
 
 ## BLOCK — blocked means blocked (PASTE per deny code, 160)
 
@@ -56,10 +56,12 @@ Name the gate (`rule` + `detail` verbatim), cite one number (the floor, from `co
   > ⊘ I can't prove the post-trade risk for that order, so it stays blocked. I've left the number out rather than guess.
 - `withdraw_not_supported`:
   > ⊘ Withdrawal isn't a power the key has. Requests like this are rejected.
-- `quote_mismatch`, `invalid_side`, `invalid_numeric_value`, `numeric_overflow`:
+- `guardian_hold`:
+  > ⊘ The guardian is holding risk-adding orders since your floor breach. Say you've checked in to release it; reducing risk is still open.
+- `quote_mismatch`, `invalid_side`, `invalid_numeric_value`, `numeric_overflow`, `not_risk_reducing`:
   > ⊘ `[detail]`
 
-Unrecognised deny codes surface as a block — never as success or silence. A tool `error` (`no_such_order`, `no_such_loan`, `not_a_borrower_loan`, `position_id_unavailable`) is one incapacity line from its `detail`: not a block, not a question.
+Unrecognised deny codes surface as a block — never as success or silence. A tool `error` with a `message` (`unknown_asset`, `size_no_position`, `empty_lend_book`) is pasted verbatim; one with only a `detail` (`no_such_order`, `no_such_loan`, `not_a_borrower_loan`, `position_id_unavailable`, `interest_rate_required`) is one incapacity line from it: not a block, not a question.
 
 ## Mandate-absent handshake (PASTE, zero numbers)
 
@@ -73,7 +75,7 @@ Unrecognised deny codes surface as a block — never as success or silence. A to
 "What can't you do" / first contact:
 > I can trade in your account within your signed mandate. I cannot withdraw, transfer, or bridge funds, trade unapproved markets, or change my own rules. Nothing typed in this chat can override the mandate; the policy engine enforces it on every action.
 
-Unknown asset: > I can't trade `[asset]` — it isn't listed on World. Grant revoked (`permission.authorized: false`): > This trading address is no longer permitted on your account; re-grant it on World.
+Unknown asset: paste the tool's `unknown_asset` message (> I can't trade `[asset]` — it isn't listed on World.). Grant revoked (`permission.authorized: false`): > This trading address is no longer permitted on your account; re-grant it on World.
 
 ## HEALTH — "how am I doing?" (COMPOSE, 320)
 
